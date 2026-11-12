@@ -60,6 +60,13 @@ final class InboundTest extends TestCase
      */
     private array $acknowledgements = [];
 
+    /**
+     * What the stub source lists as pending.
+     *
+     * @var list<InboundReference>
+     */
+    public array $pendingReferences = [];
+
     /** @var list<string> */
     private array $fetched = [];
 
@@ -123,7 +130,7 @@ final class InboundTest extends TestCase
 
             public function pending(): array
             {
-                return [];
+                return $this->test->pendingReferences;
             }
 
             public function fetch(string $documentId): InboundDocument
@@ -203,7 +210,7 @@ final class InboundTest extends TestCase
         $fake->receive($this->document('in-1', envelope: true));
 
         $this->artisan('einvoicing:poll-inbound')
-            ->expectsOutputToContain('1 new, 0 already known')
+            ->expectsOutputToContain('1 new, 0 retried, 0 already known')
             ->assertSuccessful();
 
         $row = InboundMessage::query()->sole();
@@ -231,8 +238,8 @@ final class InboundTest extends TestCase
         $fake = EInvoicing::fake();
         $fake->receive($this->document('in-1'));
 
-        $this->artisan('einvoicing:poll-inbound')->expectsOutputToContain('1 new, 0 already known')->assertSuccessful();
-        $this->artisan('einvoicing:poll-inbound')->expectsOutputToContain('0 new, 1 already known')->assertSuccessful();
+        $this->artisan('einvoicing:poll-inbound')->expectsOutputToContain('1 new, 0 retried, 0 already known')->assertSuccessful();
+        $this->artisan('einvoicing:poll-inbound')->expectsOutputToContain('0 new, 0 retried, 1 already known')->assertSuccessful();
 
         // A duplicate job for the stored row neither stores again nor fires again.
         $row = InboundMessage::query()->sole();
@@ -478,7 +485,7 @@ final class InboundTest extends TestCase
         InboundMessage::query()->create(['transport' => 'recommand', 'provider_document_id' => 'in-2', 'state' => InboundState::Notified]);
 
         $this->artisan('einvoicing:poll-inbound', ['--transport' => 'recommand'])
-            ->expectsOutputToContain('2 new, 1 already known')
+            ->expectsOutputToContain('2 new, 1 retried, 0 already known')
             ->assertSuccessful();
 
         $this->assertSame(3, InboundMessage::query()->count());
@@ -557,5 +564,103 @@ final class InboundTest extends TestCase
         $this->app->make(InboundRecorder::class)->notify('recommand', 'in-9');
 
         $this->assertSame(InboundState::Acknowledged, InboundMessage::query()->sole()->state);
+    }
+
+    public function test_poll_retries_a_notified_row_left_by_a_failed_fetch(): void
+    {
+        Event::fake([DocumentReceived::class]);
+        $this->stubSource();
+        $this->pendingReferences = [$this->document('in-1')->reference];
+        $message = $this->notified();
+        $this->fetches = [new UnsafeXml('refused'), $this->document('in-1')];
+        $this->runFetch($message);
+        $this->assertSame(InboundState::Notified, $this->stored($message)->state);
+        Event::assertNotDispatched(DocumentReceived::class);
+
+        $this->pollWith();
+        $this->runPushedFetches();
+
+        $row = $this->stored($message);
+        $this->assertSame(InboundState::Acknowledged, $row->state);
+        $this->assertNull($row->last_error);
+        $this->assertSame(['in-1', 'in-1'], $this->fetched);
+        Event::assertDispatchedTimes(DocumentReceived::class, 1);
+    }
+
+    public function test_poll_retries_the_acknowledgement_of_a_fetched_row(): void
+    {
+        Event::fake([DocumentReceived::class]);
+        $this->stubSource();
+        $this->pendingReferences = [$this->document('in-1')->reference];
+        $message = $this->notified();
+        config()->set('einvoicing.queue.connection', 'sync');
+        $this->fetches = [$this->document('in-1')];
+        $this->acknowledgements = [new TransportUnavailable('down')];
+        $this->runFetch($message);
+        $this->assertSame(InboundState::Fetched, $this->stored($message)->state);
+
+        $this->pollWith();
+        $this->runPushedFetches();
+
+        $this->assertSame(InboundState::Acknowledged, $this->stored($message)->state);
+        $this->assertSame(['in-1'], $this->fetched);
+        $this->assertSame(['in-1'], $this->acknowledgedIds);
+        Event::assertDispatchedTimes(DocumentReceived::class, 1);
+    }
+
+    public function test_poll_does_not_redispatch_an_acknowledged_row(): void
+    {
+        $this->stubSource();
+        $this->pendingReferences = [$this->document('in-1')->reference];
+        $message = $this->notified();
+        $message->transition(InboundState::Notified, InboundState::Acknowledged, ['xml' => '<Invoice/>']);
+
+        $this->pollWith('0 new, 0 retried, 1 already known');
+
+        $this->assertSame([null], $this->pushedFetchDelays());
+    }
+
+    public function test_notify_survives_a_concurrent_insert(): void
+    {
+        $this->notified('other');
+        $inserted = false;
+        // The competing insert lands between the lookup and this process's insert.
+        DB::listen(function (QueryExecuted $query) use (&$inserted): void {
+            if (! $inserted && str_starts_with($query->sql, 'select') && str_contains($query->sql, 'einvoicing_inbound_documents')) {
+                $inserted = true;
+                DB::table('einvoicing_inbound_documents')->insert([
+                    'transport' => 'recommand',
+                    'provider_document_id' => 'in-1',
+                    'state' => InboundState::Notified->value,
+                    'fetch_attempts' => 0,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
+        });
+
+        $message = DB::transaction(fn (): InboundMessage => $this->app->make(InboundRecorder::class)->notify('recommand', 'in-1'));
+
+        $this->assertTrue($inserted);
+        $this->assertFalse($message->wasRecentlyCreated);
+        $this->assertSame('in-1', $message->provider_document_id);
+        $this->assertSame(1, InboundMessage::query()->where('provider_document_id', 'in-1')->count());
+        // Only the first notification queued a fetch; the race loser queued none.
+        Queue::assertPushed(FetchInboundDocument::class, 1);
+    }
+
+    private function pollWith(string $expected = '0 new, 1 retried, 0 already known'): void
+    {
+        $this->artisan('einvoicing:poll-inbound')->expectsOutputToContain($expected)->assertSuccessful()->run();
+    }
+
+    /**
+     * Runs the fetch jobs queued after the first one, against the stub source.
+     */
+    private function runPushedFetches(): void
+    {
+        foreach (Queue::pushed(FetchInboundDocument::class)->slice(1) as $job) {
+            $this->app->call([$job, 'handle']);
+        }
     }
 }
