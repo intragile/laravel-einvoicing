@@ -234,9 +234,12 @@ tedd sorba (`ShouldQueue`), és egyeztess a táblából: minden eltárolt dokume
 vagy `acknowledged` sor az XML-lel együtt.
 
 Az olvashatatlan dokumentum (DOCTYPE, hibás XML) `notified` állapotban marad a `last_error`
-oszlopban rögzített okkal, és nem kerül nyugtázásra. A sikertelen letöltést vagy nyugtázást a
-csomag a `sending.backoff` szerint, legfeljebb `sending.max_attempts` alkalommal próbálja újra;
-utána a következő lekérdezés veszi elő.
+oszlopban rögzített okkal, és nem kerül nyugtázásra. Mivel az access point továbbra is listázza,
+minden lekérdezés újra letölti; ilyen dokumentum átugrására egyelőre nincs parancs, ezért az
+access pointnál kell rendezni, vagy együtt kell élni az ismételt letöltéssel. Az újrapróbálható
+hibával elbukott letöltést vagy nyugtázást (és az ismeretlen kimenetelű nyugtázást) a csomag a
+`sending.backoff` szerint, legfeljebb `sending.max_attempts` alkalommal próbálja újra; minden más
+letöltési hiba, és ami az utolsó kísérlet után is megmaradt, a következő lekérdezésre vár.
 
 ### Lekérdezés
 
@@ -306,16 +309,26 @@ használj.**
   tovább fut a kapcsolat `retry_after` értékénél, egy másik worker újra lefoglalja, és mivel ezek
   a jobok sosem ismétlődnek, sikertelennek jelöli, miközben az első futás még sikerülhet. A
   doctor ezt is ellenőrzi.
-- **A workerek fussanak `pcntl`-lel** (a linuxos CLI buildekben általában elérhető; a PHP-t `--enable-pcntl` kapcsolóval kell fordítani), hogy az
-  időkorlátnál le tudják állítani a jobot. Az `einvoicing:resolve` erre építve tekinti
-  elhagyottnak a sokáig `sending` állapotú sort. Ha a `pcntl` nincs betöltve, a doctor szól.
+- **A workerek fussanak `pcntl`-lel** (a linuxos CLI buildekben általában elérhető; a PHP-t
+  `--enable-pcntl` kapcsolóval kell fordítani), hogy az időkorlátnál le tudják állítani a jobot.
+  Az `einvoicing:resolve` erre építve tekinti elhagyottnak a sokáig `sending` állapotú sort. Ha a
+  `pcntl` nincs betöltve, a doctor szól.
+- **Az Amazon SQS legfeljebb 900 másodperces késleltetést fogad el.** `sqs` kapcsolaton minden
+  késleltetés legfeljebb 900 másodperc, így a hosszabb backoff, státuszlekérdezési késleltetés
+  vagy `Retry-After` egyszerűen rövidebb várakozást jelent: az alapértelmezett `sending.backoff`
+  (legfeljebb 1800) és `status.delays` (legfeljebb 21600) esetén a csomag a beállítottnál
+  korábban kérdez le és próbálkozik újra. A foglalás lejárata (a küldő job időkorlátja plusz 30
+  másodperc, az alapértelmezett `http` beállításokkal 130) maradjon 900 alatt, különben a lassú
+  küldés még futás közben `unconfirmed` lesz. **Ne használj FIFO queue-t** (`.fifo`): figyelmen
+  kívül hagyja a jobonkénti késleltetést, így minden küldési foglalás azonnal lejárna. A doctor
+  figyelmeztet a 900 másodpercnél hosszabb késleltetésekre, FIFO queue-nál pedig hibát jelez.
 
 ## Saját driver
 
 ```php
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 
-EInvoicing::extend('my-ap', fn ($app, array $config) => new MyAccessPointTransport($config['token']));
+EInvoicing::extend('my-ap', fn ($app, #[\SensitiveParameter] array $config) => new MyAccessPointTransport($config['token']));
 ```
 
 ```php
@@ -337,7 +350,12 @@ csomagolja. A csomaggal szemben vállalt szerződése:
   duplikációt okozhat.
 - **A kivételüzenetek ne idézzenek hozzáférési adatot**, semmilyen formában (kódolva vagy
   URL-be ágyazva sem). Ezek a `failure_message` és `last_error` oszlopba kerülnek, a doctor pedig
-  csak a beépített kulcsneveket takarja ki.
+  csak a beépített kulcsneveket takarja ki. A factory `$config` paraméterét jelöld
+  `#[\SensitiveParameter]` attribútummal, hogy a hozzáférési adatok ne kerüljenek a stack trace-be.
+- **A `status()` pontosan arra a dokumentumazonosítóra válaszoljon, amelyet kapott**: a visszaadott
+  státusz `documentId` mezője egyezzen meg vele (szigorú stringegyezés). Ha a driver normalizálja
+  az azonosítót (kis- és nagybetű, előtag, szóköz), a válaszát a csomag figyelmen kívül hagyja,
+  és a dokumentum sosem zárul le.
 
 A felépített transportot a csomag név szerint gyorsítótárazza. Az `einvoicing.validation.enabled`
 futás közbeni átállítása nem csomagolja át a már felépített transportot; a konfigurációban
@@ -384,7 +402,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Parancs | Feladat |
 |---|---|
-| `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a táblákat, a queue drivert, a `pcntl`-t és a `retry_after`-t; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
+| `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a táblákat, a queue drivert, a `pcntl`-t, a `retry_after`-t és az SQS-késleltetéseket; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
 | `einvoicing:install-rules [--from=DIR]` | telepíti a Peppol BIS Billing validációs szabályokat |
 | `einvoicing:poll-inbound [--transport=]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd |
 | `einvoicing:resolve ID (--sent=DOKUMENTUM-ID \| --resend) [--force]` | rendez egy `unconfirmed` küldést, vagy újra sorba állít egy dokumentumot |

@@ -230,8 +230,12 @@ again. Make listeners that must not miss a document queued (`ShouldQueue`), and 
 the table: every stored document is a `fetched` or `acknowledged` row with its XML.
 
 A document that cannot be read (a DOCTYPE, broken XML) stays `notified` with `last_error` and
-is not acknowledged. A failed fetch or acknowledgement is retried after `sending.backoff` up to
-`sending.max_attempts`; after that, the next poll retries it.
+is not acknowledged. Because the access point keeps listing it, every poll fetches it again;
+there is no command yet to skip such a document, so fix it at the access point or live with
+the repeated fetch. A fetch or acknowledgement that failed with a retryable error (and an
+acknowledgement whose outcome is unknown) is retried after `sending.backoff`, up to
+`sending.max_attempts`; any other fetch error, and anything left after the last attempt, waits
+for the next poll.
 
 ### Polling
 
@@ -296,16 +300,25 @@ queue in production.**
   send job's timeout is 100 seconds and the inbound job's 170. If a job outlives the
   connection's `retry_after`, another worker reserves it again, and since these jobs are never
   retried it is marked failed while the first run may still succeed. The doctor checks this.
-- **Run workers with `pcntl`** (usually available in Linux CLI builds; it needs PHP built with `--enable-pcntl`), so a worker stops a job
-  at its timeout. `einvoicing:resolve` treats a long-`sending` row as abandoned on that
-  assumption. The doctor warns when `pcntl` is not loaded.
+- **Run workers with `pcntl`** (usually available in Linux CLI builds; it needs PHP built with
+  `--enable-pcntl`), so a worker stops a job at its timeout. `einvoicing:resolve` treats a
+  long-`sending` row as abandoned on that assumption. The doctor warns when `pcntl` is not
+  loaded.
+- **Amazon SQS accepts delays of at most 900 seconds.** On an `sqs` connection every delay is
+  capped at 900 seconds, so a longer backoff, status poll delay or `Retry-After` simply waits
+  less: the default `sending.backoff` (up to 1800) and `status.delays` (up to 21600) then poll
+  and retry earlier than configured. Keep the claim expiry (send job timeout plus 30 seconds,
+  130 with the default `http` settings) below 900, or a slow send is marked `unconfirmed` while
+  it still runs. **Do not use a FIFO queue** (`.fifo`): it ignores per-job delays, so every
+  sending claim would expire at once. The doctor warns about delays over 900 seconds and fails
+  on a FIFO queue.
 
 ## Custom drivers
 
 ```php
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 
-EInvoicing::extend('my-ap', fn ($app, array $config) => new MyAccessPointTransport($config['token']));
+EInvoicing::extend('my-ap', fn ($app, #[\SensitiveParameter] array $config) => new MyAccessPointTransport($config['token']));
 ```
 
 ```php
@@ -326,7 +339,11 @@ contract with this package:
   `failed`, so throwing it after the request risks a duplicate when the operator resends.
 - **Exception messages must not quote credentials**, in any form (encoded, inside a URL). They
   are stored in `failure_message` and `last_error`, and the doctor redacts only the built-in key
-  names.
+  names. Mark the factory's `$config` parameter `#[\SensitiveParameter]` so the credentials stay
+  out of stack traces.
+- **`status()` must answer for the exact document id it was given**: the returned status's
+  `documentId` must equal it (strict string equality). A driver that normalises ids (case,
+  prefixes, whitespace) has its answers ignored, and the document never settles.
 
 Transports are cached per name once built. Changing `einvoicing.validation.enabled` at runtime
 does not rewrap a transport that was already built; set it in the configuration, not in code.
@@ -372,7 +389,7 @@ configured secret while faked.
 
 | Command | Purpose |
 |---|---|
-| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, the queue driver, `pcntl` and `retry_after`; `--live` also calls each inbox once to check the credentials |
+| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
 | `einvoicing:install-rules [--from=DIR]` | install the Peppol BIS Billing validation rules |
 | `einvoicing:poll-inbound [--transport=]` | record waiting inbound documents and queue their intake; schedule it |
 | `einvoicing:resolve ID (--sent=DOCUMENT-ID \| --resend) [--force]` | resolve an `unconfirmed` send, or queue a document again |
