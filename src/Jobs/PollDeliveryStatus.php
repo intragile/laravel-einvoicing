@@ -28,6 +28,14 @@ final class PollDeliveryStatus extends MessageJob
     private const DEFAULT_MAX_CHECKS = 10;
 
     /**
+     * The longest configured wait between two status polls.
+     */
+    public static function longestDelay(): int
+    {
+        return self::longestDelayOf('status.delays', self::DEFAULT_DELAYS);
+    }
+
+    /**
      * Schedules the first poll for a document that has just become pending, unless polling is
      * disabled or the queue connection cannot delay jobs.
      */

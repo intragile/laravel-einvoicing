@@ -19,6 +19,7 @@ use IntrAgile\EInvoicing\Laravel\Events\DocumentSent;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentUnconfirmed;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Jobs\ExpireSendingClaim;
+use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
@@ -537,10 +538,16 @@ final class SendFailurePolicyTest extends TestCase
         $this->assertSame(OutboundState::Queued, $row->state);
         $this->assertSame(1, $row->attempts);
         $this->assertSame([], $this->fake->sent());
-        Queue::assertNothingPushed();
+        Queue::assertNotPushed(SendDocument::class);
+
+        // The expiry is scheduled before the claim; the stray one never matches a row in sending.
+        Queue::assertPushed(ExpireSendingClaim::class, 1);
+        (new ExpireSendingClaim($message->id, 1))->handle();
+        $this->assertSame(OutboundState::Queued, $this->stored($message)->state);
+        Event::assertNotDispatched(DocumentUnconfirmed::class);
     }
 
-    public function test_failed_expiry_dispatch_releases_the_claim_unsent(): void
+    public function test_failed_expiry_dispatch_leaves_the_row_unclaimed_and_unsent(): void
     {
         config()->set('queue.connections.broken', ['driver' => 'no-such-driver']);
         config()->set('einvoicing.queue.connection', 'broken');
@@ -552,9 +559,10 @@ final class SendFailurePolicyTest extends TestCase
         } catch (InvalidArgumentException) {
         }
 
+        // The expiry is scheduled before the claim, so a failure leaves the row as it was.
         $row = $this->stored($message);
         $this->assertSame(OutboundState::Queued, $row->state);
-        $this->assertSame(1, $row->attempts);
+        $this->assertSame(0, $row->attempts);
         $this->assertSame([], $this->fake->sent());
     }
 
@@ -678,5 +686,95 @@ final class SendFailurePolicyTest extends TestCase
         $this->assertNull($row->provider_document_id);
         Exceptions::assertReported(fn (RuntimeException $e): bool => str_contains($e->getMessage(), 'doc-11'));
         Event::assertNotDispatched(DocumentSent::class);
+    }
+
+    public function test_accepted_id_already_recorded_elsewhere_settles_unconfirmed_and_is_reported(): void
+    {
+        Queue::fake();
+        Exceptions::fake();
+        $other = $this->queued();
+        OutboundMessage::query()->whereKey($other->id)->update(['state' => OutboundState::Delivered->value, 'provider_document_id' => 'doc-dup']);
+        $message = $this->queued();
+        $manager = $this->transportThat(fn (): SendResult => new SendResult('doc-dup', DeliveryState::Pending));
+
+        $this->sendJob($message, $manager);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Unconfirmed, $row->state);
+        $this->assertSame(1, $row->attempts);
+        $this->assertNull($row->provider_document_id);
+        $this->assertStringContainsString('doc-dup', (string) $row->failure_message);
+        $this->assertNull($row->finished_at);
+        Exceptions::assertReported(fn (RuntimeException $e): bool => str_contains($e->getMessage(), 'doc-dup')
+            && ! str_contains($e->getMessage(), self::SECRET_MARK));
+        Event::assertDispatched(DocumentUnconfirmed::class, 1);
+        Event::assertNotDispatched(DocumentSent::class);
+        Queue::assertNotPushed(SendDocument::class);
+        $this->assertSame('doc-dup', $this->stored($other)->provider_document_id);
+    }
+
+    public function test_accepted_id_already_recorded_after_expired_claim_stays_unconfirmed(): void
+    {
+        Queue::fake();
+        Exceptions::fake();
+        $other = $this->queued();
+        OutboundMessage::query()->whereKey($other->id)->update(['state' => OutboundState::Delivered->value, 'provider_document_id' => 'doc-dup']);
+        $message = $this->queued();
+        $manager = $this->transportThat(function () use ($message): SendResult {
+            (new ExpireSendingClaim($message->id, 1))->handle();
+
+            return new SendResult('doc-dup', DeliveryState::Delivered);
+        });
+
+        $this->sendJob($message, $manager);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Unconfirmed, $row->state);
+        $this->assertNull($row->provider_document_id);
+        Exceptions::assertReported(fn (RuntimeException $e): bool => str_contains($e->getMessage(), 'doc-dup'));
+        Event::assertNotDispatched(DocumentSent::class);
+        Event::assertNotDispatched(DocumentDelivered::class);
+    }
+
+    private function useSqs(string $queue = 'einvoicing'): void
+    {
+        config()->set('queue.connections.sqs', ['driver' => 'sqs', 'queue' => $queue, 'region' => 'eu-west-1']);
+        config()->set('einvoicing.queue.connection', 'sqs');
+    }
+
+    public function test_delays_are_capped_at_the_sqs_maximum(): void
+    {
+        Queue::fake();
+        $this->useSqs();
+        config()->set('einvoicing.sending.backoff', [1800]);
+        $this->fake->willReturn(new TransportUnavailable('Connection refused.'), new RateLimited('Too many requests.', 3600));
+        $message = $this->queued();
+
+        $this->sendJob($message);
+        $this->sendJob($message);
+
+        $this->assertSame([900, 900], $this->pushedSendDelays());
+        $this->assertSame(OutboundState::Queued, $this->stored($message)->state);
+
+        PollDeliveryStatus::schedule($message->id, 21600, 2);
+        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->delay === 900);
+
+        // Shorter delays are left alone.
+        ExpireSendingClaim::schedule($message->id, 130, 2);
+        Queue::assertPushed(ExpireSendingClaim::class, fn (ExpireSendingClaim $job): bool => $job->delay === 130 && $job->attempt === 2);
+    }
+
+    public function test_delays_are_not_capped_on_other_drivers(): void
+    {
+        Queue::fake();
+        config()->set('einvoicing.sending.backoff', [1800]);
+        $this->fake->willReturn(new TransportUnavailable('Connection refused.'));
+        $message = $this->queued();
+
+        $this->sendJob($message);
+        PollDeliveryStatus::schedule($message->id, 21600, 1);
+
+        $this->assertSame([1800], $this->pushedSendDelays());
+        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->delay === 21600);
     }
 }

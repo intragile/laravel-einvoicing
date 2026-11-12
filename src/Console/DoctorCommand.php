@@ -17,6 +17,7 @@ use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
 use IntrAgile\EInvoicing\Validation\Validator;
 use InvalidArgumentException;
+use SensitiveParameter;
 use Throwable;
 
 /**
@@ -144,7 +145,7 @@ final class DoctorCommand extends Command
         $this->checkWebhook($name, $config);
     }
 
-    private function checkBaseUrl(string $name, mixed $baseUrl): void
+    private function checkBaseUrl(string $name, #[SensitiveParameter] mixed $baseUrl): void
     {
         $check = "transport {$name}: base URL";
         if ($baseUrl === null || $baseUrl === '') {
@@ -171,7 +172,7 @@ final class DoctorCommand extends Command
     /**
      * @param  array<array-key, mixed>  $config
      */
-    private function checkWebhook(string $name, array $config): void
+    private function checkWebhook(string $name, #[SensitiveParameter] array $config): void
     {
         $check = "transport {$name}: webhook";
         if (! self::filled($config['webhook_secret'] ?? null)) {
@@ -237,12 +238,9 @@ final class DoctorCommand extends Command
 
     private function checkQueue(): void
     {
-        $connection = config('einvoicing.queue.connection');
-        if (! is_string($connection) || $connection === '') {
-            $connection = config('queue.default');
-        }
-        $driver = is_string($connection) ? config("queue.connections.{$connection}.driver") : null;
-        if (! is_string($connection) || ! is_string($driver)) {
+        $connection = MessageJob::connectionName();
+        $driver = MessageJob::connectionDriver();
+        if ($connection === null || $driver === null) {
             $this->row('queue', self::FAIL, 'the queue connection is not configured in queue.connections');
 
             return;
@@ -270,6 +268,51 @@ final class DoctorCommand extends Command
             ));
 
         $this->checkRetryAfter($connection);
+        if ($driver === 'sqs') {
+            $this->checkSqs($connection);
+        }
+    }
+
+    /**
+     * Amazon SQS refuses delays over 900 seconds, so longer ones are capped and the job runs
+     * earlier; a FIFO queue supports no per-message delay at all, so a sending claim would
+     * expire as soon as it is taken.
+     */
+    private function checkSqs(string $connection): void
+    {
+        $queue = config('einvoicing.queue.name');
+        if (! is_string($queue) || $queue === '') {
+            $queue = config("queue.connections.{$connection}.queue");
+        }
+        if (is_string($queue) && str_ends_with($queue, '.fifo')) {
+            $this->row('queue fifo', self::FAIL, sprintf(
+                'the SQS queue %s is a FIFO queue, which ignores job delays: every sending claim would expire at once '
+                .'and turn each send unconfirmed; use a standard queue',
+                $queue,
+            ));
+        }
+
+        $delays = [
+            'einvoicing.sending.backoff (send and inbound retries)' => SendDocument::longestBackoff(),
+            'sending claim expiry (from einvoicing.http timeouts)' => SendDocument::claimLifetime(),
+        ];
+        if ((bool) config('einvoicing.status.poll', true)) {
+            $delays['einvoicing.status.delays'] = PollDeliveryStatus::longestDelay();
+        }
+        $over = array_filter($delays, static fn (int $delay): bool => $delay > MessageJob::SQS_MAX_DELAY);
+
+        $over === []
+            ? $this->row('queue delays', self::OK, sprintf('all within the SQS maximum of %d s', MessageJob::SQS_MAX_DELAY))
+            : $this->row('queue delays', self::WARN, sprintf(
+                'SQS accepts delays up to %d s; longer ones are capped at %d s, so those jobs run earlier: %s',
+                MessageJob::SQS_MAX_DELAY,
+                MessageJob::SQS_MAX_DELAY,
+                implode(', ', array_map(
+                    static fn (string $setting, int $delay): string => "{$setting} up to {$delay} s",
+                    array_keys($over),
+                    $over,
+                )),
+            ));
     }
 
     /**
@@ -375,7 +418,7 @@ final class DoctorCommand extends Command
     /**
      * @phpstan-assert-if-true non-empty-string $value
      */
-    private static function filled(mixed $value): bool
+    private static function filled(#[SensitiveParameter] mixed $value): bool
     {
         return is_string($value) && trim($value) !== '';
     }

@@ -28,6 +28,7 @@ use IntrAgile\EInvoicing\Transport\ValidatingTransport;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
 use IntrAgile\EInvoicing\Validation\Validator;
 use InvalidArgumentException;
+use SensitiveParameter;
 
 /**
  * Builds the transports named in the einvoicing configuration.
@@ -177,7 +178,9 @@ final class EInvoicingManager
 
     /**
      * Registers a driver. The factory receives the application and the transport's configuration
-     * array and returns the unvalidated transport; validation is added by the manager.
+     * array and returns the unvalidated transport; validation is added by the manager. Mark the
+     * factory's configuration parameter #[\SensitiveParameter] so its credentials stay out of
+     * stack traces.
      *
      * @param  Closure(Application, array<string, mixed>): Transport  $factory
      */
@@ -269,14 +272,7 @@ final class EInvoicingManager
         $driver = $config['driver'] ?? null;
 
         if (is_string($driver) && isset($this->drivers[$driver])) {
-            $transport = ($this->drivers[$driver])(($this->app)(), $config);
-            if (! $transport instanceof Transport) {
-                throw new ConfigurationException(sprintf(
-                    'The factory of the driver in einvoicing.transports.%s.driver must return a %s.',
-                    $name,
-                    Transport::class,
-                ));
-            }
+            $transport = $this->custom($name, $this->drivers[$driver], $config);
         } elseif ($driver === self::BUILT_IN_DRIVER) {
             $transport = $this->recommand($name, $config);
         } else {
@@ -291,11 +287,33 @@ final class EInvoicingManager
     }
 
     /**
+     * Builds a transport with a registered driver factory, whose return value is checked.
+     *
+     * @param  Closure(Application, array<string, mixed>): mixed  $factory
      * @param  array<string, mixed>  $config
      *
      * @throws ConfigurationException
      */
-    private function recommand(string $name, array $config): RecommandTransport
+    private function custom(string $name, Closure $factory, #[SensitiveParameter] array $config): Transport
+    {
+        $transport = $factory(($this->app)(), $config);
+        if (! $transport instanceof Transport) {
+            throw new ConfigurationException(sprintf(
+                'The factory of the driver in einvoicing.transports.%s.driver must return a %s.',
+                $name,
+                Transport::class,
+            ));
+        }
+
+        return $transport;
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException
+     */
+    private function recommand(string $name, #[SensitiveParameter] array $config): RecommandTransport
     {
         $apiKeyId = $this->requiredString($config, $name, 'api_key_id');
         $secret = $this->requiredString($config, $name, 'secret');
@@ -356,7 +374,7 @@ final class EInvoicingManager
      *
      * @throws ConfigurationException when the value is missing, not a string or blank
      */
-    private function requiredString(array $config, string $name, string $key): string
+    private function requiredString(#[SensitiveParameter] array $config, string $name, string $key): string
     {
         $value = $config[$key] ?? null;
         if (! is_string($value) || trim($value) === '') {

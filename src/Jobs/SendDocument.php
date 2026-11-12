@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Jobs;
 
+use Illuminate\Database\UniqueConstraintViolationException;
 use IntrAgile\EInvoicing\Exception\UnsafeXml;
 use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
@@ -56,6 +57,14 @@ final class SendDocument extends MessageJob
         return self::jobTimeout() + 30;
     }
 
+    /**
+     * The longest configured wait before a retried send.
+     */
+    public static function longestBackoff(): int
+    {
+        return self::longestDelayOf('sending.backoff', self::DEFAULT_BACKOFF);
+    }
+
     public function handle(EInvoicingManager $manager): void
     {
         $message = OutboundMessage::query()->find($this->messageId);
@@ -74,14 +83,18 @@ final class SendDocument extends MessageJob
             return;
         }
 
+        // The expiry is scheduled before the claim, so a worker killed right after claiming
+        // still leaves a job that ends the claim. It acts only on a row still sending under
+        // this claim, so the job left behind when the claim is lost below does nothing; and
+        // when it cannot be scheduled, the error propagates with the row still unclaimed.
         $claim = $message->attempts + 1;
-        if (! $message->transition(OutboundState::Queued, OutboundState::Sending, ['attempts' => $claim], ['attempts' => $claim - 1])) {
-            return;
-        }
-
         $synchronous = self::runsSynchronously();
         if (! $synchronous) {
-            $this->scheduleExpiry($message, $claim);
+            ExpireSendingClaim::schedule($message->id, self::claimLifetime(), $claim);
+        }
+
+        if (! $message->transition(OutboundState::Queued, OutboundState::Sending, ['attempts' => $claim], ['attempts' => $claim - 1])) {
+            return;
         }
 
         try {
@@ -98,21 +111,6 @@ final class SendDocument extends MessageJob
     }
 
     /**
-     * Schedules the end of the claim for a worker that dies mid-send. When that cannot be
-     * scheduled, nothing has been sent yet, so the claim is released and the error propagates.
-     */
-    private function scheduleExpiry(OutboundMessage $message, int $claim): void
-    {
-        try {
-            ExpireSendingClaim::schedule($message->id, self::claimLifetime(), $claim);
-        } catch (Throwable $e) {
-            $message->transition(OutboundState::Sending, OutboundState::Queued, [], ['attempts' => $claim]);
-
-            throw $e;
-        }
-    }
-
-    /**
      * Records the transport's answer and fires the events for the state it reached.
      */
     private function accepted(OutboundMessage $message, SendResult $result, int $claim): void
@@ -125,16 +123,22 @@ final class SendDocument extends MessageJob
         $failure = $result->failure;
         $now = now();
 
-        $recorded = $this->settle($message, $claim, $state, [
-            'provider_document_id' => $result->documentId,
-            'peppol_message_id' => $result->peppolMessageId,
-            'envelope_id' => $result->envelopeId,
-            'failure_category' => $state === OutboundState::Failed ? ($failure->category ?? FailureCategory::Other) : null,
-            'failure_message' => $state === OutboundState::Failed ? $failure?->message : null,
-            'provider_code' => $state === OutboundState::Failed ? $failure?->providerCode : null,
-            'sent_at' => $now,
-            'finished_at' => $state->isTerminal() ? $now : null,
-        ]);
+        try {
+            $recorded = $this->settle($message, $claim, $state, [
+                'provider_document_id' => $result->documentId,
+                'peppol_message_id' => $result->peppolMessageId,
+                'envelope_id' => $result->envelopeId,
+                'failure_category' => $state === OutboundState::Failed ? ($failure->category ?? FailureCategory::Other) : null,
+                'failure_message' => $state === OutboundState::Failed ? $failure?->message : null,
+                'provider_code' => $state === OutboundState::Failed ? $failure?->providerCode : null,
+                'sent_at' => $now,
+                'finished_at' => $state->isTerminal() ? $now : null,
+            ]);
+        } catch (UniqueConstraintViolationException) {
+            $this->duplicateDocumentId($message, $claim, $result->documentId);
+
+            return;
+        }
 
         if (! $recorded) {
             // The row was claimed again while this worker was sending: surface the accepted document.
@@ -155,6 +159,31 @@ final class SendDocument extends MessageJob
         } else {
             PollDeliveryStatus::start($message->id, $claim);
         }
+    }
+
+    /**
+     * Settles an accepted send whose provider document id is already recorded on another row of
+     * the same transport. The document may have been delivered, so the row becomes unconfirmed
+     * for an operator to reconcile, and the accepted id is reported rather than lost.
+     */
+    private function duplicateDocumentId(OutboundMessage $message, int $claim, string $documentId): void
+    {
+        $reason = sprintf(
+            'The transport accepted the document as %s, but that provider document id is already recorded on another outbound document; reconcile it manually.',
+            $documentId,
+        );
+        report(new RuntimeException(sprintf('Outbound document %d: %s', $message->id, $reason)));
+
+        // The failed update left the model filled with the rejected values.
+        $message->refresh();
+        if ($message->transition(OutboundState::Sending, OutboundState::Unconfirmed, ['failure_message' => $reason], ['attempts' => $claim])) {
+            event(new DocumentUnconfirmed($message));
+
+            return;
+        }
+
+        // The claim already expired into unconfirmed: keep the accepted id on the row.
+        $message->transition(OutboundState::Unconfirmed, OutboundState::Unconfirmed, ['failure_message' => $reason], ['attempts' => $claim]);
     }
 
     /**

@@ -132,6 +132,60 @@ final class DoctorCommandTest extends TestCase
         $this->assertRow($output, 'queue retry_after', 'ok');
     }
 
+    public function test_doctor_warns_when_sqs_delays_exceed_its_maximum(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('queue.connections.sqs', ['driver' => 'sqs', 'queue' => 'einvoicing', 'region' => 'eu-west-1']);
+        config()->set('einvoicing.queue.connection', 'sqs');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'queue delays', 'warn', 'capped at 900 s');
+        $this->assertStringContainsString('einvoicing.sending.backoff', $output);
+        $this->assertStringContainsString('einvoicing.status.delays', $output);
+
+        config()->set('einvoicing.sending.backoff', [30, 600]);
+        config()->set('einvoicing.status.delays', [60, 900]);
+        [, $output] = $this->doctor();
+
+        $this->assertRow($output, 'queue delays', 'ok');
+
+        // A long HTTP timeout pushes the sending claim's expiry over the limit.
+        config()->set('einvoicing.http.timeout', 900);
+        [, $output] = $this->doctor();
+
+        $this->assertRow($output, 'queue delays', 'warn', 'sending claim expiry');
+    }
+
+    public function test_doctor_fails_on_a_fifo_sqs_queue(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('queue.connections.sqs', ['driver' => 'sqs', 'queue' => 'default', 'region' => 'eu-west-1']);
+        config()->set('einvoicing.queue.connection', 'sqs');
+        config()->set('einvoicing.queue.name', 'einvoicing.fifo');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code, $output);
+        $this->assertRow($output, 'queue fifo', 'fail', 'einvoicing.fifo');
+    }
+
+    public function test_doctor_has_no_sqs_rows_on_other_drivers(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'x.fifo', 'retry_after' => 300]);
+        config()->set('queue.default', 'db');
+
+        [, $output] = $this->doctor();
+
+        $this->assertStringNotContainsString('queue delays', $output);
+        $this->assertStringNotContainsString('queue fifo', $output);
+    }
+
     public function test_doctor_fails_without_rules_and_tables(): void
     {
         $this->configureRecommand();

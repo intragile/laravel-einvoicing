@@ -218,6 +218,49 @@ final class ManagerTest extends TestCase
         self::assertStringContainsString('recommand', $dumps[1]);
     }
 
+    public function test_stack_frame_arguments_never_carry_secrets(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports.recommand.company_id', '');
+
+        try {
+            $this->freshManager()->transport();
+            self::fail('A missing company id must be refused.');
+        } catch (ConfigurationException $exception) {
+            $this->assertTraceHidesSecrets($exception);
+        }
+
+        config()->set('einvoicing.transports.custom', [
+            'driver' => 'failing',
+            'api_key_id' => 'key-'.self::SECRET_MARK,
+            'secret' => 'sec-'.self::SECRET_MARK,
+        ]);
+        $manager = $this->freshManager();
+        $manager->extend('failing', static fn (Application $app, #[\SensitiveParameter] array $config): Transport => throw new LogicException('Factory failed.'));
+
+        try {
+            $manager->transport('custom');
+            self::fail('The factory exception must propagate.');
+        } catch (LogicException $exception) {
+            $this->assertTraceHidesSecrets($exception);
+        }
+    }
+
+    private function assertTraceHidesSecrets(\Throwable $exception): void
+    {
+        $frames = 0;
+        foreach ($exception->getTrace() as $frame) {
+            foreach ($frame['args'] ?? [] as $argument) {
+                if (is_string($argument) || is_array($argument)) {
+                    $frames++;
+                    self::assertStringNotContainsString(self::SECRET_MARK, (string) json_encode($argument), $frame['function']);
+                }
+            }
+        }
+        self::assertGreaterThan(0, $frames, 'The trace must carry arguments for this check to mean anything.');
+    }
+
     public function test_rules_dir_defaults_to_storage(): void
     {
         config()->set('einvoicing.validation.rules_dir', null);

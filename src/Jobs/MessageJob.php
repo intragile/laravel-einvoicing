@@ -36,17 +36,25 @@ abstract class MessageJob implements ShouldQueue
         $this->timeout = static::jobTimeout();
     }
 
+    /** The longest delay, in seconds, that Amazon SQS accepts for a message. */
+    public const SQS_MAX_DELAY = 900;
+
     /**
      * Queues the job for a row after the given number of seconds.
      *
      * The job is dispatched after the open database transaction commits, so it never reads a
      * row that is not visible yet. The delay is never waited out here; on the sync connection,
-     * which ignores delays, callers decide whether delayed work makes sense at all.
+     * which ignores delays, callers decide whether delayed work makes sense at all. On Amazon
+     * SQS, which refuses longer delays, the delay is capped at SQS_MAX_DELAY, so the job simply
+     * runs earlier than configured.
      */
     public static function schedule(int $messageId, int $delay = 0, int $attempt = 0): void
     {
         $job = new static($messageId, $attempt);
         $job->afterCommit();
+        if (self::connectionDriver() === 'sqs') {
+            $delay = min($delay, self::SQS_MAX_DELAY);
+        }
         if ($delay > 0) {
             $job->delay($delay);
         }
@@ -63,13 +71,31 @@ abstract class MessageJob implements ShouldQueue
      */
     public static function runsSynchronously(): bool
     {
+        return in_array(self::connectionDriver(), self::SYNCHRONOUS_DRIVERS, true);
+    }
+
+    /**
+     * The name of the queue connection the jobs of this package use.
+     */
+    public static function connectionName(): ?string
+    {
         $connection = config('einvoicing.queue.connection');
         if (! is_string($connection) || $connection === '') {
             $connection = config('queue.default');
         }
 
-        return is_string($connection)
-            && in_array(config("queue.connections.{$connection}.driver"), self::SYNCHRONOUS_DRIVERS, true);
+        return is_string($connection) && $connection !== '' ? $connection : null;
+    }
+
+    /**
+     * The driver of the queue connection the jobs of this package use, when it is configured.
+     */
+    public static function connectionDriver(): ?string
+    {
+        $connection = self::connectionName();
+        $driver = $connection !== null ? config("queue.connections.{$connection}.driver") : null;
+
+        return is_string($driver) ? $driver : null;
     }
 
     protected static function jobTimeout(): ?int
@@ -96,14 +122,34 @@ abstract class MessageJob implements ShouldQueue
      */
     protected static function delayAt(string $key, array $default, int $index): int
     {
+        $delays = self::delays($key, $default);
+
+        return max(0, $delays[min(max($index, 0), count($delays) - 1)]);
+    }
+
+    /**
+     * The longest configured delay in seconds of a list of delays.
+     *
+     * @param  non-empty-list<int>  $default
+     */
+    protected static function longestDelayOf(string $key, array $default): int
+    {
+        return max(0, ...self::delays($key, $default));
+    }
+
+    /**
+     * The configured delays in seconds, rounded up; the default list when none is configured.
+     *
+     * @param  non-empty-list<int>  $default
+     * @return non-empty-list<int>
+     */
+    private static function delays(string $key, array $default): array
+    {
         $configured = config('einvoicing.'.$key);
         $delays = is_array($configured)
             ? array_values(array_map(static fn (mixed $delay): int => (int) ceil((float) $delay), array_filter($configured, is_numeric(...))))
             : [];
-        if ($delays === []) {
-            $delays = $default;
-        }
 
-        return max(0, $delays[min(max($index, 0), count($delays) - 1)]);
+        return $delays === [] ? $default : $delays;
     }
 }
