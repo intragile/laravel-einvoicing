@@ -11,6 +11,7 @@ use LogicException;
 
 /**
  * @method static \IntrAgile\EInvoicing\Transport\Transport transport(?string $name = null)
+ * @method static \IntrAgile\EInvoicing\Laravel\Models\OutboundMessage send(\IntrAgile\EInvoicing\Transport\OutboundDocument|\IntrAgile\EInvoicing\Model\Invoice|string $document, ?string $reference = null, ?string $transport = null)
  * @method static \IntrAgile\EInvoicing\Transport\InboundSource inbound(?string $name = null)
  * @method static \IntrAgile\EInvoicing\Transport\Recommand\RecommandWebhook webhook(string $name)
  * @method static void extend(string $driver, \Closure $factory)

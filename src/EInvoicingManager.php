@@ -9,10 +9,17 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Psr7\HttpFactory;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Contracts\Foundation\Application;
+use IntrAgile\EInvoicing\Exception\UnsafeXml;
+use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
+use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
+use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Transport\FakeTransport;
 use IntrAgile\EInvoicing\Transport\Http\HttpClient;
 use IntrAgile\EInvoicing\Transport\InboundSource;
+use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandTransport;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandWebhook;
@@ -75,6 +82,39 @@ final class EInvoicingManager
         }
 
         return $this->transports[$name];
+    }
+
+    /**
+     * Stores the document as queued and dispatches the job that sends it once the open database
+     * transaction, if any, commits. The returned message reflects the row as stored here; on the
+     * sync queue connection the send has already run, so refresh() it to see the outcome.
+     *
+     * @param  OutboundDocument|Invoice|string  $document  a routed document, an invoice written as UBL, or UBL XML
+     * @param  string|null  $reference  the application's own reference, e.g. the invoice number
+     * @param  string|null  $transport  the transport name; the default one when null
+     *
+     * @throws UnsafeXml when the XML carries a DOCTYPE declaration
+     * @throws UnsupportedDocument when the document is not a UBL Invoice or CreditNote or lacks an electronic address
+     * @throws InvalidArgumentException when the invoice cannot be written or an identifier is malformed
+     * @throws ConfigurationException when the transport is not configured
+     */
+    public function send(OutboundDocument|Invoice|string $document, ?string $reference = null, ?string $transport = null): OutboundMessage
+    {
+        $document = match (true) {
+            is_string($document) => OutboundDocument::fromXml($document),
+            $document instanceof Invoice => OutboundDocument::fromInvoice($document),
+            default => $document,
+        };
+        $transport ??= $this->defaultName();
+        $this->transportConfig($transport);
+
+        $message = OutboundMessage::fromDocument($document, $transport, $reference);
+        $message->state = OutboundState::Queued;
+        $message->save();
+
+        SendDocument::schedule($message->id);
+
+        return $message;
     }
 
     /**
