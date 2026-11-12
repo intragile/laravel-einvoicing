@@ -165,6 +165,30 @@ final class ManagerTest extends TestCase
         $this->manager()->webhook('inhouse');
     }
 
+    public function test_a_dotted_name_is_not_resolved_as_a_nested_key(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+
+        // "recommand.extra" must not reach einvoicing.transports.recommand.extra, nor a dotted
+        // name the nested recommand configuration.
+        config()->set('einvoicing.transports.recommand.extra', ['driver' => 'recommand', 'webhook_secret' => 'wh-'.self::SECRET_MARK]);
+        foreach (['recommand.extra', 'recommand.', '.recommand'] as $name) {
+            try {
+                $this->manager()->webhook($name);
+                self::fail(sprintf('"%s" is not a configured transport.', $name));
+            } catch (ConfigurationException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+
+        config()->set('einvoicing.transports', ['a.b' => ['driver' => 'recommand', 'webhook_secret' => 'wh-'.self::SECRET_MARK]]);
+        self::assertInstanceOf(RecommandWebhook::class, $this->manager()->webhook('a.b'), 'A configured name with a dot is found as is.');
+
+        $this->expectException(ConfigurationException::class);
+        $this->freshManager()->transport('recommand.extra');
+    }
+
     public function test_fake_replaces_every_transport_and_skips_validation(): void
     {
         config()->set('einvoicing.validation.enabled', true);

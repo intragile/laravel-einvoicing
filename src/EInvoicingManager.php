@@ -312,11 +312,15 @@ final class EInvoicingManager
     /**
      * @return array<string, mixed>
      *
+     * The name is looked up as an exact key of einvoicing.transports, never as a dotted path, so
+     * a name taken from a request cannot reach a nested configuration value.
+     *
      * @throws ConfigurationException when no transport with this name is configured
      */
     private function transportConfig(string $name): array
     {
-        $config = $this->config()->get('einvoicing.transports.'.$name);
+        $transports = $this->config()->get('einvoicing.transports');
+        $config = is_array($transports) && array_key_exists($name, $transports) ? $transports[$name] : null;
         if (! is_array($config)) {
             throw new ConfigurationException(sprintf('No transport is configured in einvoicing.transports.%s.', $name));
         }
