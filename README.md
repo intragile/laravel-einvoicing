@@ -251,10 +251,13 @@ webhooks.
 
 ### Webhooks
 
-For a transport with the `recommand` driver and a `webhook_secret`, the package registers
-`POST /einvoicing/webhooks/{transport}` (route name `einvoicing.webhook`). Setup:
+The package registers one route, `POST /einvoicing/webhooks/{transport}` (route name
+`einvoicing.webhook`), for every transport name. It accepts notifications only for a transport
+with the `recommand` driver and a `webhook_secret`; any other name gets `404`. Setup:
 
-1. Run `php artisan einvoicing:doctor`; the `webhook` row prints the full URL.
+1. Run `php artisan einvoicing:doctor`. The `transport <name>: webhook` row prints the full URL
+   when the transport has a webhook secret and a `company_id` and webhooks are enabled;
+   otherwise it shows a warning that says what is missing.
 2. Register that URL as a webhook in Recommand and put its signing secret into
    `RECOMMAND_WEBHOOK_SECRET`.
 3. Nothing else: the route does not run the `web` middleware group, so no CSRF token or
@@ -293,7 +296,7 @@ queue in production.**
   send job's timeout is 100 seconds and the inbound job's 170. If a job outlives the
   connection's `retry_after`, another worker reserves it again, and since these jobs are never
   retried it is marked failed while the first run may still succeed. The doctor checks this.
-- **Run workers with `pcntl`** (enabled by default in PHP CLI on Linux), so a worker stops a job
+- **Run workers with `pcntl`** (usually available in Linux CLI builds; it needs PHP built with `--enable-pcntl`), so a worker stops a job
   at its timeout. `einvoicing:resolve` treats a long-`sending` row as abandoned on that
   assumption. The doctor warns when `pcntl` is not loaded.
 
@@ -382,7 +385,7 @@ configured secret while faked.
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description | **Live transmission not verified** |
 
-The core requires `brick/math` ^0.14.2, which Laravel 13 also accepts.
+The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
 
 No test of this package makes a network call. The core has an opt-in `recommand-live` group
 for a Recommand playground team; see its

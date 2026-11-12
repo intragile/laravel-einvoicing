@@ -256,10 +256,14 @@ dokumentumokat is helyrehozza. Webhook mellett is érdemes ütemezni.
 
 ### Webhookok
 
-A `recommand` driverű, `webhook_secret`-tel rendelkező transportokhoz a csomag regisztrálja a
-`POST /einvoicing/webhooks/{transport}` útvonalat (neve: `einvoicing.webhook`). Beállítás:
+A csomag egyetlen útvonalat regisztrál minden transportnévhez:
+`POST /einvoicing/webhooks/{transport}` (neve: `einvoicing.webhook`). Értesítést csak `recommand`
+driverű, `webhook_secret`-tel rendelkező transporthoz fogad el; minden más név `404`-et kap.
+Beállítás:
 
-1. Futtasd a `php artisan einvoicing:doctor` parancsot; a `webhook` sor kiírja a teljes URL-t.
+1. Futtasd a `php artisan einvoicing:doctor` parancsot. A `transport <név>: webhook` sor akkor
+   írja ki a teljes URL-t, ha a transportnak van webhook secretje és `company_id`-ja, és a
+   webhookok be vannak kapcsolva; különben figyelmeztetést ad arról, mi hiányzik.
 2. Vedd fel ezt az URL-t webhookként a Recommandban, az aláíró kulcsot pedig írd a
    `RECOMMAND_WEBHOOK_SECRET` változóba.
 3. Más teendő nincs: az útvonal nem futtatja a `web` middleware-csoportot, így sem CSRF-token,
@@ -302,7 +306,7 @@ használj.**
   tovább fut a kapcsolat `retry_after` értékénél, egy másik worker újra lefoglalja, és mivel ezek
   a jobok sosem ismétlődnek, sikertelennek jelöli, miközben az első futás még sikerülhet. A
   doctor ezt is ellenőrzi.
-- **A workerek fussanak `pcntl`-lel** (Linuxon a PHP CLI-ben alapból be van kapcsolva), hogy az
+- **A workerek fussanak `pcntl`-lel** (a linuxos CLI buildekben általában elérhető; a PHP-t `--enable-pcntl` kapcsolóval kell fordítani), hogy az
   időkorlátnál le tudják állítani a jobot. Az `einvoicing:resolve` erre építve tekinti
   elhagyottnak a sokáig `sending` állapotú sort. Ha a `pcntl` nincs betöltve, a doctor szól.
 
@@ -393,7 +397,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
 
-A core `brick/math` ^0.14.2-t kér, ezt a Laravel 13 is elfogadja.
+A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
 
 A csomag egyik tesztje sem használ hálózatot. A core-ban van egy opcionális `recommand-live`
 csoport Recommand playground csapathoz; lásd a core

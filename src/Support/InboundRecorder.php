@@ -42,7 +42,8 @@ final class InboundRecorder
         } catch (UniqueConstraintViolationException $exception) {
             // Another process stored the same notification in the meantime. Inside an outer
             // transaction under REPEATABLE READ (the MySQL default) its row may not be visible
-            // yet; the violation is then rethrown and the caller's retry finds the row.
+            // yet; the violation is then rethrown, and the row is found on the next try: the
+            // provider re-sending the webhook after the 500 answer, or the next poll-inbound.
             return $this->find($transport, $documentId) ?? throw $exception;
         }
 
