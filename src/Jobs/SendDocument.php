@@ -9,21 +9,34 @@ use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentDelivered;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentFailed;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentSent;
+use IntrAgile\EInvoicing\Laravel\Events\DocumentUnconfirmed;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Transport\DeliveryState;
+use IntrAgile\EInvoicing\Transport\Exception\AuthenticationFailed;
+use IntrAgile\EInvoicing\Transport\Exception\DocumentRejected;
+use IntrAgile\EInvoicing\Transport\Exception\InvalidDocument;
+use IntrAgile\EInvoicing\Transport\Exception\RateLimited;
+use IntrAgile\EInvoicing\Transport\Exception\RecipientUnreachable;
+use IntrAgile\EInvoicing\Transport\Exception\TransportException;
 use IntrAgile\EInvoicing\Transport\FailureCategory;
 use IntrAgile\EInvoicing\Transport\SendResult;
 use InvalidArgumentException;
 use RuntimeException;
+use Throwable;
 
 /**
  * Hands a queued document to its transport at most once per claim.
  *
  * The row is claimed atomically (queued to sending, conditional on its attempt count) before the
  * transport is called, so a duplicate job or a second worker finds it claimed and does nothing.
+ * A failure is retried only when the transport reports that the document was definitely not
+ * accepted and that trying again may help; a send whose outcome is not known becomes unconfirmed
+ * and is never sent again automatically.
  */
 final class SendDocument extends MessageJob
 {
+    private const DEFAULT_BACKOFF = [30, 120, 600, 1800];
+
     /**
      * One request with its connect and response timeouts, plus local work such as validation.
      */
@@ -55,7 +68,37 @@ final class SendDocument extends MessageJob
             return;
         }
 
-        $this->accepted($message, $transport->send($document), $claim);
+        $synchronous = self::runsSynchronously();
+        if (! $synchronous) {
+            $this->scheduleExpiry($message, $claim);
+        }
+
+        try {
+            $result = $transport->send($document);
+        } catch (Throwable $e) {
+            $this->sendFailed($message, $e, $claim, $synchronous);
+
+            return;
+        }
+
+        // Outside the try block: a failure to record an accepted send must never look like a
+        // failed send, which could be retried.
+        $this->accepted($message, $result, $claim);
+    }
+
+    /**
+     * Schedules the end of the claim for a worker that dies mid-send. When that cannot be
+     * scheduled, nothing has been sent yet, so the claim is released and the error propagates.
+     */
+    private function scheduleExpiry(OutboundMessage $message, int $claim): void
+    {
+        try {
+            ExpireSendingClaim::schedule($message->id, self::jobTimeout() + 30, $claim);
+        } catch (Throwable $e) {
+            $message->transition(OutboundState::Sending, OutboundState::Queued, [], ['attempts' => $claim]);
+
+            throw $e;
+        }
     }
 
     /**
@@ -71,7 +114,7 @@ final class SendDocument extends MessageJob
         $failure = $result->failure;
         $now = now();
 
-        $recorded = $message->transition(OutboundState::Sending, $state, [
+        $recorded = $this->settle($message, $claim, $state, [
             'provider_document_id' => $result->documentId,
             'peppol_message_id' => $result->peppolMessageId,
             'envelope_id' => $result->envelopeId,
@@ -80,10 +123,10 @@ final class SendDocument extends MessageJob
             'provider_code' => $state === OutboundState::Failed ? $failure?->providerCode : null,
             'sent_at' => $now,
             'finished_at' => $state->isTerminal() ? $now : null,
-        ], ['attempts' => $claim]);
+        ]);
 
         if (! $recorded) {
-            // The claim was taken over while this worker was sending: surface the accepted document.
+            // The row was claimed again while this worker was sending: surface the accepted document.
             report(new RuntimeException(sprintf(
                 'Outbound document %d was accepted by its transport as %s after its sending claim ended; reconcile it manually.',
                 $message->id,
@@ -99,6 +142,128 @@ final class SendDocument extends MessageJob
         } elseif ($state === OutboundState::Failed) {
             event(new DocumentFailed($message));
         }
+    }
+
+    /**
+     * Applies the send policy to an exception thrown by the transport.
+     */
+    private function sendFailed(OutboundMessage $message, Throwable $e, int $claim, bool $synchronous): void
+    {
+        // Definitely not accepted, and trying again would not help.
+        $category = match (true) {
+            $e instanceof InvalidDocument, $e instanceof DocumentRejected => FailureCategory::Validation,
+            $e instanceof RecipientUnreachable => $e->category,
+            $e instanceof AuthenticationFailed, $e instanceof InvalidArgumentException => FailureCategory::Other,
+            default => null,
+        };
+        if ($category !== null) {
+            $this->failSend($message, $claim, $category, $e->getMessage(), true);
+
+            return;
+        }
+
+        // Definitely not accepted, and trying again later may help.
+        if ($e instanceof TransportException && $e->isRetryable()) {
+            if ($synchronous) {
+                $this->failSend($message, $claim, FailureCategory::Transport, sprintf(
+                    '%s The send was not retried: retries need an asynchronous queue connection.',
+                    $e->getMessage(),
+                ), false);
+            } elseif ($claim < self::setting('sending.max_attempts', 5)) {
+                $this->requeue($message, $claim, $e);
+            } else {
+                $this->failSend($message, $claim, FailureCategory::Transport, $e->getMessage(), false);
+            }
+
+            return;
+        }
+
+        // The document may have been accepted.
+        if ($e instanceof TransportException) {
+            $this->unconfirmed($message, $claim, $e->getMessage());
+
+            return;
+        }
+
+        report($e);
+        $this->unconfirmed($message, $claim, sprintf(
+            'The send ended with an unexpected %s; check the access point before resending.',
+            $e::class,
+        ));
+    }
+
+    /**
+     * Fails a document the transport did not accept. A definite answer also settles a row whose
+     * claim already expired into unconfirmed; a retryable one does not, since it would otherwise
+     * have been retried and an operator now owns the row.
+     */
+    private function failSend(OutboundMessage $message, int $claim, FailureCategory $category, string $reason, bool $definite): void
+    {
+        $attributes = [
+            'failure_category' => $category,
+            'failure_message' => $reason,
+            'provider_code' => null,
+            'finished_at' => now(),
+        ];
+        $recorded = $definite
+            ? $this->settle($message, $claim, OutboundState::Failed, $attributes)
+            : $message->transition(OutboundState::Sending, OutboundState::Failed, $attributes, ['attempts' => $claim]);
+
+        if ($recorded) {
+            event(new DocumentFailed($message));
+        }
+    }
+
+    /**
+     * Returns the claim to the queue and schedules the next attempt.
+     */
+    private function requeue(OutboundMessage $message, int $claim, TransportException $e): void
+    {
+        if (! $message->transition(OutboundState::Sending, OutboundState::Queued, ['failure_message' => $e->getMessage()], ['attempts' => $claim])) {
+            return;
+        }
+
+        $delay = $e instanceof RateLimited && $e->retryAfterSeconds !== null
+            ? $e->retryAfterSeconds
+            : self::retryDelay($claim);
+
+        self::schedule($message->id, max(0, $delay));
+    }
+
+    private function unconfirmed(OutboundMessage $message, int $claim, string $reason): void
+    {
+        if ($message->transition(OutboundState::Sending, OutboundState::Unconfirmed, ['failure_message' => $reason], ['attempts' => $claim])) {
+            event(new DocumentUnconfirmed($message));
+        }
+    }
+
+    /**
+     * Moves the row out of this worker's claim: from sending, or from unconfirmed when the claim
+     * expired while the request was in flight. Either way only while the row still carries the
+     * claim's attempt count, so a newer claim is never overwritten.
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    private function settle(OutboundMessage $message, int $claim, OutboundState $to, array $attributes): bool
+    {
+        return $message->transition(OutboundState::Sending, $to, $attributes, ['attempts' => $claim])
+            || $message->transition(OutboundState::Unconfirmed, $to, $attributes, ['attempts' => $claim]);
+    }
+
+    /**
+     * Seconds to wait before the attempt after the given one; the last configured delay repeats.
+     */
+    private static function retryDelay(int $attempt): int
+    {
+        $configured = config('einvoicing.sending.backoff');
+        $delays = is_array($configured)
+            ? array_values(array_map(static fn (mixed $delay): int => (int) ceil((float) $delay), array_filter($configured, is_numeric(...))))
+            : [];
+        if ($delays === []) {
+            $delays = self::DEFAULT_BACKOFF;
+        }
+
+        return $delays[min(max($attempt - 1, 0), count($delays) - 1)];
     }
 
     /**
