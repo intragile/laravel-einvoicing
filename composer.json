@@ -1,15 +1,16 @@
 {
     "name": "intragile/laravel-einvoicing",
-    "description": "Laravel bridge for intragile/php-einvoicing: configured Peppol transports, queued sending with a guarded delivery state machine, inbound documents and signed webhooks.",
+    "description": "Laravel bridge for intragile/php-einvoicing: send and receive EN 16931 invoices over Peppol, with configured transports, queued sending under a guarded delivery state machine, inbound documents and signed Recommand webhooks.",
     "keywords": [
         "laravel",
-        "en16931",
         "e-invoicing",
         "einvoice",
         "peppol",
+        "en16931",
         "ubl",
-        "invoice",
-        "webhook"
+        "recommand",
+        "webhook",
+        "queue"
     ],
     "type": "library",
     "license": "MIT",

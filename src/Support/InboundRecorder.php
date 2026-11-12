@@ -40,7 +40,9 @@ final class InboundRecorder
                 ...self::referenceAttributes($reference),
             ]));
         } catch (UniqueConstraintViolationException $exception) {
-            // Another process stored the same notification in the meantime.
+            // Another process stored the same notification in the meantime. Inside an outer
+            // transaction under REPEATABLE READ (the MySQL default) its row may not be visible
+            // yet; the violation is then rethrown and the caller's retry finds the row.
             return $this->find($transport, $documentId) ?? throw $exception;
         }
 
