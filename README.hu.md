@@ -389,13 +389,11 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Terület | Hogyan | Állapot |
 |---|---|---|
-| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal, PHP 8.3, 8.4, 8.5 × Laravel 12 alatt | Minden tesztfuttatáskor |
+| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 157 teszt, 965 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
 
-**A Laravel 13 egyelőre nem telepíthető:** a jelenlegi core `brick/math` 0.12-t vagy 0.13-at
-kér, a Laravel 13 pedig legalább 0.14.2-t. A Laravel 13 támogatása akkor jön, amikor a core
-engedi az újabb `brick/math`-ot.
+A core `brick/math` ^0.14.2-t kér, ezt a Laravel 13 is elfogadja.
 
 A csomag egyik tesztje sem használ hálózatot. A core-ban van egy opcionális `recommand-live`
 csoport Recommand playground csapathoz; lásd a core
@@ -416,4 +414,4 @@ MIT. Lásd: [LICENSE](LICENSE).
 
 ---
 
-Fejlesztő és karbantartó: [IntrAgile Kft.](https://intragile.eu)
+Fejlesztő és karbantartó: [IntrAgile Kft.](https://intragile.eu).

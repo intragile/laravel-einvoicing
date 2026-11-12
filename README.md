@@ -378,13 +378,11 @@ configured secret while faked.
 
 | Area | How | Status |
 |---|---|---|
-| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports, on PHP 8.3, 8.4, 8.5 × Laravel 12 | Run on every test run |
+| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 157 tests, 965 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description | **Live transmission not verified** |
 
-**Laravel 13 cannot be installed yet:** the current core requires `brick/math` 0.12 or 0.13,
-and Laravel 13 requires 0.14.2 or later. Laravel 13 support follows once the core allows the
-newer `brick/math`.
+The core requires `brick/math` ^0.14.2, which Laravel 13 also accepts.
 
 No test of this package makes a network call. The core has an opt-in `recommand-live` group
 for a Recommand playground team; see its
