@@ -47,6 +47,15 @@ final class SendDocument extends MessageJob
         return self::setting('http.timeout', 60) + self::setting('http.connect_timeout', 10) + 30;
     }
 
+    /**
+     * Seconds after which a sending claim is over: the job's timeout plus a margin. A row still
+     * sending after that has lost its worker.
+     */
+    public static function claimLifetime(): int
+    {
+        return self::jobTimeout() + 30;
+    }
+
     public function handle(EInvoicingManager $manager): void
     {
         $message = OutboundMessage::query()->find($this->messageId);
@@ -95,7 +104,7 @@ final class SendDocument extends MessageJob
     private function scheduleExpiry(OutboundMessage $message, int $claim): void
     {
         try {
-            ExpireSendingClaim::schedule($message->id, self::jobTimeout() + 30, $claim);
+            ExpireSendingClaim::schedule($message->id, self::claimLifetime(), $claim);
         } catch (Throwable $e) {
             $message->transition(OutboundState::Sending, OutboundState::Queued, [], ['attempts' => $claim]);
 
@@ -143,6 +152,8 @@ final class SendDocument extends MessageJob
             event(new DocumentDelivered($message));
         } elseif ($state === OutboundState::Failed) {
             event(new DocumentFailed($message));
+        } else {
+            PollDeliveryStatus::start($message->id);
         }
     }
 
@@ -259,15 +270,7 @@ final class SendDocument extends MessageJob
      */
     private static function retryDelay(int $attempt): int
     {
-        $configured = config('einvoicing.sending.backoff');
-        $delays = is_array($configured)
-            ? array_values(array_map(static fn (mixed $delay): int => (int) ceil((float) $delay), array_filter($configured, is_numeric(...))))
-            : [];
-        if ($delays === []) {
-            $delays = self::DEFAULT_BACKOFF;
-        }
-
-        return $delays[min(max($attempt - 1, 0), count($delays) - 1)];
+        return self::delayAt('sending.backoff', self::DEFAULT_BACKOFF, $attempt - 1);
     }
 
     /**

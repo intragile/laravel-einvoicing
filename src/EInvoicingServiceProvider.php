@@ -6,6 +6,7 @@ namespace IntrAgile\EInvoicing\Laravel;
 
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Support\ServiceProvider;
+use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
 
 final class EInvoicingServiceProvider extends ServiceProvider
 {
@@ -26,6 +27,7 @@ final class EInvoicingServiceProvider extends ServiceProvider
         $this->loadMigrationsFrom(self::MIGRATION);
 
         if ($this->app->runningInConsole()) {
+            $this->commands([ResolveCommand::class]);
             $this->publishes([self::CONFIG => $this->app->configPath('einvoicing.php')], 'einvoicing-config');
             $this->publishes([
                 self::MIGRATION => $this->app->databasePath('migrations/'.date('Y_m_d_His').'_create_einvoicing_tables.php'),

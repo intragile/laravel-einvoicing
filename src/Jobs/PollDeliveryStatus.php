@@ -1,0 +1,94 @@
+<?php
+
+declare(strict_types=1);
+
+namespace IntrAgile\EInvoicing\Laravel\Jobs;
+
+use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
+use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
+use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\DeliveryRecorder;
+use IntrAgile\EInvoicing\Transport\Exception\TransportException;
+
+/**
+ * Asks the transport whether a pending document has been delivered, and asks again later while
+ * it has not.
+ *
+ * Every poll, including one that fails with a transport error, counts against the configured
+ * number of checks; once they are used up polling stops silently and the row stays pending, so a
+ * notification can still finish it. The check counter is claimed with a conditional update, so a
+ * duplicate job for the same check does nothing.
+ */
+final class PollDeliveryStatus extends MessageJob
+{
+    private const DEFAULT_DELAYS = [60, 300, 900, 3600, 21600];
+
+    private const DEFAULT_MAX_CHECKS = 10;
+
+    /**
+     * Schedules the first poll for a document that has just become pending, unless polling is
+     * disabled or the queue connection cannot delay jobs.
+     */
+    public static function start(int $messageId): void
+    {
+        if (! config('einvoicing.status.poll', true) || self::runsSynchronously()) {
+            return;
+        }
+
+        self::schedule($messageId, self::delayAt('status.delays', self::DEFAULT_DELAYS, 0));
+    }
+
+    /**
+     * One request with its connect and response timeouts, plus a margin.
+     */
+    protected static function jobTimeout(): int
+    {
+        return self::setting('http.timeout', 60) + self::setting('http.connect_timeout', 10) + 30;
+    }
+
+    public function handle(EInvoicingManager $manager, DeliveryRecorder $recorder): void
+    {
+        $message = OutboundMessage::query()->find($this->messageId);
+        if ($message === null || $message->state !== OutboundState::Pending || $message->provider_document_id === null) {
+            return;
+        }
+
+        $maxChecks = self::setting('status.max_attempts', self::DEFAULT_MAX_CHECKS);
+        $checks = $message->status_checks;
+        if ($checks >= $maxChecks) {
+            return;
+        }
+
+        // A configuration problem propagates before the check is counted.
+        $transport = $manager->transport($message->transport);
+
+        if (! $message->transition(OutboundState::Pending, OutboundState::Pending, ['status_checks' => $checks + 1], ['status_checks' => $checks])) {
+            return;
+        }
+        $checks++;
+
+        try {
+            $status = $transport->status($message->provider_document_id);
+        } catch (TransportException) {
+            $this->again($message, $checks, $maxChecks);
+
+            return;
+        }
+
+        if (! $recorder->record($message, $status->state, $status->failure)) {
+            $this->again($message, $checks, $maxChecks);
+        }
+    }
+
+    /**
+     * Schedules the next poll while the row is still pending and checks remain.
+     */
+    private function again(OutboundMessage $message, int $checks, int $maxChecks): void
+    {
+        if ($message->state !== OutboundState::Pending || $checks >= $maxChecks || self::runsSynchronously()) {
+            return;
+        }
+
+        self::schedule($message->id, self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks));
+    }
+}

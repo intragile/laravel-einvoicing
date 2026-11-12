@@ -87,4 +87,23 @@ abstract class MessageJob implements ShouldQueue
 
         return is_numeric($value) ? (int) ceil((float) $value) : $default;
     }
+
+    /**
+     * The configured delay in seconds at the given position of a list of delays; the last delay
+     * repeats, and the default list applies when none is configured.
+     *
+     * @param  non-empty-list<int>  $default
+     */
+    protected static function delayAt(string $key, array $default, int $index): int
+    {
+        $configured = config('einvoicing.'.$key);
+        $delays = is_array($configured)
+            ? array_values(array_map(static fn (mixed $delay): int => (int) ceil((float) $delay), array_filter($configured, is_numeric(...))))
+            : [];
+        if ($delays === []) {
+            $delays = $default;
+        }
+
+        return max(0, $delays[min(max($index, 0), count($delays) - 1)]);
+    }
 }
