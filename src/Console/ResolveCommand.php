@@ -101,7 +101,7 @@ final class ResolveCommand extends Command
         }
 
         event(new DocumentSent($message));
-        PollDeliveryStatus::start($message->id);
+        PollDeliveryStatus::start($message->id, $message->attempts);
 
         $this->components->info(sprintf('Outbound document %d is now pending as %s.', $message->id, $documentId));
 
@@ -131,7 +131,12 @@ final class ResolveCommand extends Command
             return $this->wrongState($message, 'only an unconfirmed, failed or queued document can be queued again');
         }
 
+        // The earlier send is cleared, so a late notification for it no longer finds this row.
         if (! $message->transition($from, OutboundState::Queued, [
+            'provider_document_id' => null,
+            'peppol_message_id' => null,
+            'envelope_id' => null,
+            'sent_at' => null,
             'status_checks' => 0,
             'failure_category' => null,
             'failure_message' => null,

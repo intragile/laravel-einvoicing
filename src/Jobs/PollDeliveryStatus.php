@@ -17,7 +17,9 @@ use IntrAgile\EInvoicing\Transport\Exception\TransportException;
  * Every poll, including one that fails with a transport error, counts against the configured
  * number of checks; once they are used up polling stops silently and the row stays pending, so a
  * notification can still finish it. The check counter is claimed with a conditional update, so a
- * duplicate job for the same check does nothing.
+ * duplicate job for the same check does nothing. A job belongs to one send, identified by the
+ * row's attempt count when it was scheduled; once the row has been sent again, the job and the
+ * polls it would schedule do nothing.
  */
 final class PollDeliveryStatus extends MessageJob
 {
@@ -29,13 +31,13 @@ final class PollDeliveryStatus extends MessageJob
      * Schedules the first poll for a document that has just become pending, unless polling is
      * disabled or the queue connection cannot delay jobs.
      */
-    public static function start(int $messageId): void
+    public static function start(int $messageId, int $attempts): void
     {
         if (! config('einvoicing.status.poll', true) || self::runsSynchronously()) {
             return;
         }
 
-        self::schedule($messageId, self::delayAt('status.delays', self::DEFAULT_DELAYS, 0));
+        self::schedule($messageId, self::delayAt('status.delays', self::DEFAULT_DELAYS, 0), $attempts);
     }
 
     /**
@@ -49,9 +51,13 @@ final class PollDeliveryStatus extends MessageJob
     public function handle(EInvoicingManager $manager, DeliveryRecorder $recorder): void
     {
         $message = OutboundMessage::query()->find($this->messageId);
-        if ($message === null || $message->state !== OutboundState::Pending || $message->provider_document_id === null) {
+        if ($message === null
+            || $message->state !== OutboundState::Pending
+            || $message->attempts !== $this->attempt
+            || $message->provider_document_id === null) {
             return;
         }
+        $documentId = $message->provider_document_id;
 
         $maxChecks = self::setting('status.max_attempts', self::DEFAULT_MAX_CHECKS);
         $checks = $message->status_checks;
@@ -62,20 +68,26 @@ final class PollDeliveryStatus extends MessageJob
         // A configuration problem propagates before the check is counted.
         $transport = $manager->transport($message->transport);
 
-        if (! $message->transition(OutboundState::Pending, OutboundState::Pending, ['status_checks' => $checks + 1], ['status_checks' => $checks])) {
+        if (! $message->transition(OutboundState::Pending, OutboundState::Pending, ['status_checks' => $checks + 1], [
+            'status_checks' => $checks,
+            'attempts' => $this->attempt,
+            'provider_document_id' => $documentId,
+        ])) {
             return;
         }
         $checks++;
 
         try {
-            $status = $transport->status($message->provider_document_id);
+            $status = $transport->status($documentId);
         } catch (TransportException) {
             $this->again($message, $checks, $maxChecks);
 
             return;
         }
 
-        if (! $recorder->record($message, $status->state, $status->failure)) {
+        // A status about another document says nothing about this one.
+        if ($status->documentId !== $documentId
+            || ! $recorder->record($message, $status->state, $status->failure, $documentId)) {
             $this->again($message, $checks, $maxChecks);
         }
     }
@@ -89,6 +101,6 @@ final class PollDeliveryStatus extends MessageJob
             return;
         }
 
-        self::schedule($message->id, self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks));
+        self::schedule($message->id, self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks), $this->attempt);
     }
 }

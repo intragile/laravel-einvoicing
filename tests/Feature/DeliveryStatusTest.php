@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
+use Closure;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -38,6 +39,9 @@ final class DeliveryStatusTest extends TestCase
 
     /** @var list<string> */
     private array $queried = [];
+
+    /** Runs inside status(), to change the row while the request is in flight. */
+    private ?Closure $duringStatus = null;
 
     protected function defineEnvironment($app): void
     {
@@ -85,6 +89,9 @@ final class DeliveryStatusTest extends TestCase
     public function nextStatus(string $documentId): DeliveryStatus
     {
         $this->queried[] = $documentId;
+        if ($this->duringStatus !== null) {
+            ($this->duringStatus)();
+        }
         $next = array_shift($this->statuses) ?? throw new LogicException('No status scripted.');
         if ($next instanceof TransportException) {
             throw $next;
@@ -115,7 +122,7 @@ final class DeliveryStatusTest extends TestCase
 
     private function poll(OutboundMessage $message): void
     {
-        $this->app->call([new PollDeliveryStatus($message->id), 'handle']);
+        $this->app->call([new PollDeliveryStatus($message->id, $message->attempts), 'handle']);
     }
 
     /**
@@ -294,6 +301,106 @@ final class DeliveryStatusTest extends TestCase
         $this->assertSame([], $this->queried);
     }
 
+    public function test_status_is_not_applied_to_a_row_resent_meanwhile(): void
+    {
+        $this->scriptedTransport();
+        $this->statuses = [new DeliveryStatus('doc-1', DeliveryState::Delivered)];
+        $message = $this->message(OutboundState::Pending);
+        // While doc-1 is queried, the row is resent and accepted again as doc-2.
+        $this->duringStatus = fn () => OutboundMessage::query()->whereKey($message->id)->update(['provider_document_id' => 'doc-2']);
+
+        $this->poll($message);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Pending, $row->state);
+        $this->assertSame('doc-2', $row->provider_document_id);
+        $this->assertNull($row->finished_at);
+        Event::assertNotDispatched(DocumentDelivered::class);
+    }
+
+    public function test_recorder_only_changes_the_document_it_was_told_about(): void
+    {
+        $recorder = new DeliveryRecorder;
+        $message = $this->message(OutboundState::Pending, 'doc-1');
+        OutboundMessage::query()->whereKey($message->id)->update(['provider_document_id' => 'doc-2']);
+
+        // The in-memory model still carries doc-1, the id the status was fetched for.
+        $this->assertFalse($recorder->record($message, DeliveryState::Failed, new DeliveryFailure(FailureCategory::Other)));
+        $this->assertFalse($recorder->record($this->stored($message), DeliveryState::Delivered, null, 'doc-1'));
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Pending, $row->state);
+        $this->assertNull($row->failure_category);
+        Event::assertNotDispatched(DocumentDelivered::class);
+        Event::assertNotDispatched(DocumentFailed::class);
+
+        $this->assertTrue($recorder->record($this->stored($message), DeliveryState::Delivered, null, 'doc-2'));
+        Event::assertDispatched(DocumentDelivered::class, 1);
+    }
+
+    public function test_status_for_another_document_is_ignored(): void
+    {
+        $this->scriptedTransport();
+        $this->statuses = [new DeliveryStatus('doc-other', DeliveryState::Delivered)];
+        $message = $this->message(OutboundState::Pending);
+
+        $this->poll($message);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Pending, $row->state);
+        $this->assertSame(1, $row->status_checks);
+        $this->assertSame([300], $this->pushedPollDelays());
+        Event::assertNotDispatched(DocumentDelivered::class);
+    }
+
+    public function test_poll_from_an_earlier_send_does_nothing(): void
+    {
+        $this->scriptedTransport();
+        $message = $this->message(OutboundState::Pending);
+        $message->attempts = 2;
+        $message->save();
+
+        // Scheduled for the first send (attempt 1); the row has been sent again since.
+        $this->app->call([new PollDeliveryStatus($message->id, 1), 'handle']);
+
+        $this->assertSame([], $this->queried);
+        $this->assertSame(0, $this->stored($message)->status_checks);
+        Queue::assertNotPushed(PollDeliveryStatus::class);
+    }
+
+    public function test_rescheduled_poll_keeps_its_send(): void
+    {
+        $this->scriptedTransport();
+        $this->statuses = [new DeliveryStatus('doc-1', DeliveryState::Pending)];
+        $message = $this->message(OutboundState::Pending);
+
+        $this->poll($message);
+
+        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->attempt === 1);
+    }
+
+    public function test_duplicate_poll_for_the_same_check_does_nothing(): void
+    {
+        $this->scriptedTransport();
+        $this->statuses = [new DeliveryStatus('doc-1', DeliveryState::Pending)];
+        $message = $this->message(OutboundState::Pending);
+
+        // Another job claims the same check between this job's read and its claim.
+        $claimed = false;
+        OutboundMessage::retrieved(function (OutboundMessage $row) use (&$claimed): void {
+            if (! $claimed) {
+                $claimed = true;
+                OutboundMessage::query()->whereKey($row->id)->update(['status_checks' => 1]);
+            }
+        });
+
+        $this->poll($message);
+
+        $this->assertSame([], $this->queried);
+        $this->assertSame(1, $this->stored($message)->status_checks);
+        Queue::assertNotPushed(PollDeliveryStatus::class);
+    }
+
     public function test_recorder_keeps_open_states_open(): void
     {
         $recorder = new DeliveryRecorder;
@@ -331,7 +438,7 @@ final class DeliveryStatusTest extends TestCase
 
         $this->assertSame(OutboundState::Pending, $this->stored($message)->state);
         $this->assertSame([60], $this->pushedPollDelays());
-        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->messageId === $message->id);
+        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->messageId === $message->id && $job->attempt === 2);
     }
 
     public function test_delivered_send_schedules_no_poll(): void

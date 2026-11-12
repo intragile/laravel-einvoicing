@@ -82,7 +82,7 @@ final class ResolveCommandTest extends TestCase
         $this->assertNull($row->failure_message);
         $this->assertNotNull($row->sent_at);
         Event::assertDispatched(DocumentSent::class, fn (DocumentSent $e): bool => $e->message->id === $message->id);
-        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->messageId === $message->id && $job->delay === 60);
+        Queue::assertPushed(PollDeliveryStatus::class, fn (PollDeliveryStatus $job): bool => $job->messageId === $message->id && $job->delay === 60 && $job->attempt === 2);
         Queue::assertNotPushed(SendDocument::class);
     }
 
@@ -168,6 +168,77 @@ final class ResolveCommandTest extends TestCase
         $this->assertNull($row->failure_message);
         $this->assertNull($row->finished_at);
         Queue::assertPushed(SendDocument::class, fn (SendDocument $job): bool => $job->messageId === $message->id);
+    }
+
+    public function test_resend_clears_the_previous_send(): void
+    {
+        $message = $this->message(OutboundState::Failed, 2, 'doc-1');
+        $message->forceFill([
+            'peppol_message_id' => 'pm-1',
+            'envelope_id' => 'env-1',
+            'provider_code' => 'E1',
+            'status_checks' => 4,
+            'sent_at' => now(),
+        ])->save();
+
+        $this->artisan('einvoicing:resolve', ['id' => $message->id, '--resend' => true])->assertExitCode(Command::SUCCESS);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Queued, $row->state);
+        $this->assertSame(2, $row->attempts);
+        $this->assertNull($row->provider_document_id);
+        $this->assertNull($row->peppol_message_id);
+        $this->assertNull($row->envelope_id);
+        $this->assertNull($row->provider_code);
+        $this->assertNull($row->sent_at);
+        $this->assertSame(0, $row->status_checks);
+        // A notification for the earlier document no longer finds this row.
+        $this->assertFalse(OutboundMessage::query()->where('provider_document_id', 'doc-1')->exists());
+    }
+
+    /**
+     * Makes the row look as if another worker claimed it again right after the command read it.
+     */
+    private function claimedAgainAfterRead(OutboundMessage $message): void
+    {
+        $done = false;
+        OutboundMessage::retrieved(function (OutboundMessage $row) use ($message, &$done): void {
+            if (! $done && $row->id === $message->id) {
+                $done = true;
+                OutboundMessage::query()->whereKey($row->id)->increment('attempts');
+            }
+        });
+    }
+
+    public function test_resend_of_a_row_changed_meanwhile_does_nothing(): void
+    {
+        $message = $this->message(OutboundState::Failed, 2);
+        $this->claimedAgainAfterRead($message);
+
+        $this->artisan('einvoicing:resolve', ['id' => $message->id, '--resend' => true])
+            ->expectsOutputToContain('changed while it was being resolved')
+            ->assertExitCode(Command::FAILURE);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertSame(3, $row->attempts);
+        Queue::assertNothingPushed();
+    }
+
+    public function test_sent_on_a_row_changed_meanwhile_does_nothing(): void
+    {
+        $message = $this->message(OutboundState::Unconfirmed, 2);
+        $this->claimedAgainAfterRead($message);
+
+        $this->artisan('einvoicing:resolve', ['id' => $message->id, '--sent' => 'doc-9'])
+            ->expectsOutputToContain('changed while it was being resolved')
+            ->assertExitCode(Command::FAILURE);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Unconfirmed, $row->state);
+        $this->assertNull($row->provider_document_id);
+        Queue::assertNothingPushed();
+        Event::assertNotDispatched(DocumentSent::class);
     }
 
     public function test_resolve_resend_queued_dispatches_again(): void

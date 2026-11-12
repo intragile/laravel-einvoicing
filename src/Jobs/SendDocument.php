@@ -153,7 +153,7 @@ final class SendDocument extends MessageJob
         } elseif ($state === OutboundState::Failed) {
             event(new DocumentFailed($message));
         } else {
-            PollDeliveryStatus::start($message->id);
+            PollDeliveryStatus::start($message->id, $claim);
         }
     }
 
