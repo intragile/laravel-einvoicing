@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Jobs;
 
+use IntrAgile\EInvoicing\Exception\UnsafeXml;
+use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentDelivered;
@@ -149,9 +151,11 @@ final class SendDocument extends MessageJob
      */
     private function sendFailed(OutboundMessage $message, Throwable $e, int $claim, bool $synchronous): void
     {
-        // Definitely not accepted, and trying again would not help.
+        // Definitely not accepted, and trying again would not help. A document that cannot be
+        // read is refused by validation before any request is made.
         $category = match (true) {
-            $e instanceof InvalidDocument, $e instanceof DocumentRejected => FailureCategory::Validation,
+            $e instanceof InvalidDocument, $e instanceof DocumentRejected,
+            $e instanceof UnsupportedDocument, $e instanceof UnsafeXml => FailureCategory::Validation,
             $e instanceof RecipientUnreachable => $e->category,
             $e instanceof AuthenticationFailed, $e instanceof InvalidArgumentException => FailureCategory::Other,
             default => null,

@@ -9,6 +9,8 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Queue;
+use IntrAgile\EInvoicing\Exception\UnsafeXml;
+use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentDelivered;
@@ -383,6 +385,63 @@ final class SendFailurePolicyTest extends TestCase
         $this->assertStringContainsString('retries need an asynchronous queue connection', (string) $row->failure_message);
         Queue::assertNothingPushed();
         Event::assertDispatched(DocumentFailed::class);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function synchronousDrivers(): array
+    {
+        return [
+            'deferred' => ['deferred'],
+            'background' => ['background'],
+        ];
+    }
+
+    #[DataProvider('synchronousDrivers')]
+    public function test_drivers_that_ignore_delays_do_not_retry(string $driver): void
+    {
+        Queue::fake();
+        config()->set('queue.connections.einvoicing-'.$driver, ['driver' => $driver]);
+        config()->set('einvoicing.queue.connection', 'einvoicing-'.$driver);
+        $this->fake->willReturn(new TransportUnavailable('Connection refused.'));
+        $message = $this->queued();
+
+        $this->sendJob($message);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertStringContainsString('retries need an asynchronous queue connection', (string) $row->failure_message);
+        Queue::assertNothingPushed();
+    }
+
+    /**
+     * @return array<string, array{RuntimeException}>
+     */
+    public static function documentErrors(): array
+    {
+        return [
+            'unsupported document' => [new UnsupportedDocument('The document is not well-formed XML.')],
+            'unsafe xml' => [new UnsafeXml('The document declares a DOCTYPE.')],
+        ];
+    }
+
+    #[DataProvider('documentErrors')]
+    public function test_document_errors_before_the_request_fail_as_validation(RuntimeException $error): void
+    {
+        Queue::fake();
+        $message = $this->queued();
+        $manager = $this->transportThat(fn (): SendResult => throw $error);
+
+        $this->sendJob($message, $manager);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertSame(FailureCategory::Validation, $row->failure_category);
+        $this->assertSame($error->getMessage(), $row->failure_message);
+        Queue::assertNotPushed(SendDocument::class);
+        Event::assertDispatched(DocumentFailed::class);
+        Event::assertNotDispatched(DocumentUnconfirmed::class);
     }
 
     public function test_expired_claim_becomes_unconfirmed(): void

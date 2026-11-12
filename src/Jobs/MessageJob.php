@@ -54,18 +54,22 @@ abstract class MessageJob implements ShouldQueue
         dispatch($job);
     }
 
+    /** Queue drivers that run a job in the current process and ignore its delay. */
+    private const SYNCHRONOUS_DRIVERS = ['sync', 'deferred', 'background'];
+
     /**
-     * Whether jobs of this package run on a connection with the sync driver, which runs them
-     * immediately and ignores delays.
+     * Whether jobs of this package run on a connection whose driver runs them in the current
+     * process and ignores delays, so no delayed work can be scheduled.
      */
-    protected static function runsSynchronously(): bool
+    public static function runsSynchronously(): bool
     {
         $connection = config('einvoicing.queue.connection');
         if (! is_string($connection) || $connection === '') {
             $connection = config('queue.default');
         }
 
-        return is_string($connection) && config("queue.connections.{$connection}.driver") === 'sync';
+        return is_string($connection)
+            && in_array(config("queue.connections.{$connection}.driver"), self::SYNCHRONOUS_DRIVERS, true);
     }
 
     protected static function jobTimeout(): ?int
