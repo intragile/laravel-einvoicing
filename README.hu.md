@@ -411,7 +411,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Terület | Hogyan | Állapot |
 |---|---|---|
-| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 157 teszt, 965 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
+| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 165 teszt, 1022 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
 
