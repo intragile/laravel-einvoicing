@@ -162,6 +162,20 @@ final class EInvoicingManager
     }
 
     /**
+     * The company id configured for the transport with this name, or null when there is none.
+     */
+    public function companyId(string $name): ?string
+    {
+        try {
+            $companyId = $this->transportConfig($name)['company_id'] ?? null;
+        } catch (ConfigurationException) {
+            return null;
+        }
+
+        return is_string($companyId) && trim($companyId) !== '' ? $companyId : null;
+    }
+
+    /**
      * Registers a driver. The factory receives the application and the transport's configuration
      * array and returns the unvalidated transport; validation is added by the manager.
      *

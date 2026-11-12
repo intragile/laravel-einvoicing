@@ -15,6 +15,8 @@ final class EInvoicingServiceProvider extends ServiceProvider
 
     private const MIGRATION = __DIR__.'/../database/migrations/create_einvoicing_tables.php';
 
+    private const ROUTES = __DIR__.'/../routes/webhooks.php';
+
     public function register(): void
     {
         $this->mergeConfigFrom(self::CONFIG, 'einvoicing');
@@ -26,6 +28,11 @@ final class EInvoicingServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $this->loadMigrationsFrom(self::MIGRATION);
+
+        // Registering the route reads configuration only; transports are built per request.
+        if ((bool) $this->app->make('config')->get('einvoicing.webhooks.enabled', true)) {
+            $this->loadRoutesFrom(self::ROUTES);
+        }
 
         if ($this->app->runningInConsole()) {
             $this->commands([PollInboundCommand::class, ResolveCommand::class]);
