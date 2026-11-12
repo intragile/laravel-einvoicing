@@ -11,6 +11,8 @@ final class EInvoicingServiceProvider extends ServiceProvider
 {
     private const CONFIG = __DIR__.'/../config/einvoicing.php';
 
+    private const MIGRATION = __DIR__.'/../database/migrations/create_einvoicing_tables.php';
+
     public function register(): void
     {
         $this->mergeConfigFrom(self::CONFIG, 'einvoicing');
@@ -21,8 +23,13 @@ final class EInvoicingServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        $this->loadMigrationsFrom(self::MIGRATION);
+
         if ($this->app->runningInConsole()) {
             $this->publishes([self::CONFIG => $this->app->configPath('einvoicing.php')], 'einvoicing-config');
+            $this->publishes([
+                self::MIGRATION => $this->app->databasePath('migrations/'.date('Y_m_d_His').'_create_einvoicing_tables.php'),
+            ], 'einvoicing-migrations');
         }
     }
 }
