@@ -189,6 +189,14 @@ final class EInvoicingManager
     }
 
     /**
+     * Whether a transport can be built with this driver: the built-in one or a registered one.
+     */
+    public function hasDriver(string $driver): bool
+    {
+        return $driver === self::BUILT_IN_DRIVER || isset($this->drivers[$driver]);
+    }
+
+    /**
      * Replaces every transport with one in-memory fake, without validation, and returns it.
      */
     public function fake(): FakeTransport

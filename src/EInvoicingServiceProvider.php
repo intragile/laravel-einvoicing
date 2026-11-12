@@ -6,6 +6,8 @@ namespace IntrAgile\EInvoicing\Laravel;
 
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Support\ServiceProvider;
+use IntrAgile\EInvoicing\Laravel\Console\DoctorCommand;
+use IntrAgile\EInvoicing\Laravel\Console\InstallRulesCommand;
 use IntrAgile\EInvoicing\Laravel\Console\PollInboundCommand;
 use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
 
@@ -35,7 +37,7 @@ final class EInvoicingServiceProvider extends ServiceProvider
         }
 
         if ($this->app->runningInConsole()) {
-            $this->commands([PollInboundCommand::class, ResolveCommand::class]);
+            $this->commands([DoctorCommand::class, InstallRulesCommand::class, PollInboundCommand::class, ResolveCommand::class]);
             $this->publishes([self::CONFIG => $this->app->configPath('einvoicing.php')], 'einvoicing-config');
             $this->publishes([
                 self::MIGRATION => $this->app->databasePath('migrations/'.date('Y_m_d_His').'_create_einvoicing_tables.php'),

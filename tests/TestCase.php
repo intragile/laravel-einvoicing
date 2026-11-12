@@ -23,13 +23,30 @@ abstract class TestCase extends Orchestra
     protected function tearDown(): void
     {
         foreach ($this->tempDirs as $dir) {
-            if (is_dir($dir)) {
-                rmdir($dir);
-            }
+            self::removeTree($dir);
         }
         $this->tempDirs = [];
 
         parent::tearDown();
+    }
+
+    /**
+     * Removes a directory with everything in it; symbolic links are removed, never followed.
+     */
+    private static function removeTree(string $path): void
+    {
+        if (is_link($path) || is_file($path)) {
+            unlink($path);
+
+            return;
+        }
+        if (! is_dir($path)) {
+            return;
+        }
+        foreach (array_diff((array) scandir($path), ['.', '..']) as $entry) {
+            self::removeTree($path.'/'.$entry);
+        }
+        rmdir($path);
     }
 
     /**
