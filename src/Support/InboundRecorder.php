@@ -70,7 +70,7 @@ final class InboundRecorder
 
     private function find(string $transport, string $documentId): ?InboundMessage
     {
-        return InboundMessage::query()
+        return InboundMessage::queryWithoutXml()
             ->where('transport', $transport)
             ->where('provider_document_id', $documentId)
             ->first();

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
@@ -52,6 +53,20 @@ class InboundMessage extends Model
             'fetched_at' => 'datetime',
             'acknowledged_at' => 'datetime',
         ];
+    }
+
+    /**
+     * A query for messages that leaves out the potentially large XML column.
+     *
+     * @return Builder<static>
+     */
+    public static function queryWithoutXml(): Builder
+    {
+        return static::query()->select([
+            'id', 'transport', 'provider_document_id', 'sender', 'receiver', 'document_type', 'received_at',
+            'state', 'envelope_id', 'fetch_attempts', 'last_error', 'fetched_at', 'acknowledged_at',
+            'created_at', 'updated_at',
+        ]);
     }
 
     /**

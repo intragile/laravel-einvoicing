@@ -30,14 +30,17 @@ use Throwable;
  * because an earlier acknowledgement failed, is acknowledged without being fetched or announced
  * again.
  *
- * A failed fetch is counted and recorded on the row, which stays notified; a failed
- * acknowledgement is recorded and the row stays fetched. Either is queued again after the
- * configured sending backoff when it is safe to repeat, unless the queue connection runs jobs
- * synchronously and cannot delay them.
+ * A failed fetch or acknowledgement is counted in fetch_attempts and recorded on the row, which
+ * stays notified or fetched. Either is queued again after the configured sending backoff when it
+ * is safe to repeat, while fewer than sending.max_attempts have failed and unless the queue
+ * connection runs jobs synchronously and cannot delay them; beyond that the next poll of the
+ * inbound source retries it.
  */
 final class FetchInboundDocument extends MessageJob
 {
     private const DEFAULT_BACKOFF = [30, 120, 600, 1800];
+
+    private const DEFAULT_MAX_ATTEMPTS = 5;
 
     /**
      * Two requests, each with its connect and response timeouts, plus a margin.
@@ -49,7 +52,8 @@ final class FetchInboundDocument extends MessageJob
 
     public function handle(EInvoicingManager $manager): void
     {
-        $message = InboundMessage::query()->find($this->messageId);
+        // The stored XML is never needed here.
+        $message = InboundMessage::queryWithoutXml()->find($this->messageId);
         if ($message === null || $message->state === InboundState::Acknowledged) {
             return;
         }
@@ -121,8 +125,8 @@ final class FetchInboundDocument extends MessageJob
             'last_error' => self::describe($exception),
         ], ['fetch_attempts' => $attempts]);
 
-        if ($recorded && $exception instanceof TransportException && $exception->isRetryable() && ! self::runsSynchronously()) {
-            self::schedule($message->id, self::delayAt('sending.backoff', self::DEFAULT_BACKOFF, $attempts));
+        if ($recorded && $exception instanceof TransportException && $exception->isRetryable()) {
+            self::retry($message->id, $attempts);
         }
 
         // A document that cannot be read is left for an operator; anything else is a defect.
@@ -143,12 +147,16 @@ final class FetchInboundDocument extends MessageJob
         try {
             $source->acknowledge($message->provider_document_id);
         } catch (TransportException $exception) {
-            $message->transition(InboundState::Fetched, InboundState::Fetched, ['last_error' => self::describe($exception)]);
+            $attempts = $message->fetch_attempts;
+            $recorded = $message->transition(InboundState::Fetched, InboundState::Fetched, [
+                'fetch_attempts' => $attempts + 1,
+                'last_error' => self::describe($exception),
+            ], ['fetch_attempts' => $attempts]);
 
             // Acknowledging is idempotent, so an acknowledgement whose outcome is unknown is
-            // repeated as well.
-            if (($exception->isRetryable() || $exception instanceof OutcomeUnknown) && ! self::runsSynchronously()) {
-                self::schedule($message->id, self::delayAt('sending.backoff', self::DEFAULT_BACKOFF, $this->attempt), $this->attempt + 1);
+            // repeated as well. A lost update means another job has moved the row on.
+            if ($recorded && ($exception->isRetryable() || $exception instanceof OutcomeUnknown)) {
+                self::retry($message->id, $attempts);
             }
 
             return;
@@ -158,6 +166,22 @@ final class FetchInboundDocument extends MessageJob
             'acknowledged_at' => now(),
             'last_error' => null,
         ]);
+    }
+
+    /**
+     * Queues the job again after the backoff for the failed attempt, while attempts remain and
+     * the connection can delay jobs. Once they are used up, only the next poll of the inbound
+     * source queues the document again, one job per poll.
+     *
+     * @param  int  $attempts  the failed attempts recorded before this one
+     */
+    private static function retry(int $messageId, int $attempts): void
+    {
+        if ($attempts + 1 >= self::setting('sending.max_attempts', self::DEFAULT_MAX_ATTEMPTS) || self::runsSynchronously()) {
+            return;
+        }
+
+        self::schedule($messageId, self::delayAt('sending.backoff', self::DEFAULT_BACKOFF, $attempts), $attempts + 1);
     }
 
     private static function describe(Throwable $exception): string

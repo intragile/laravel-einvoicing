@@ -73,6 +73,19 @@ final class InboundTest extends TestCase
     /** @var list<string> */
     private array $acknowledgedIds = [];
 
+    /** The transaction level of the test itself (RefreshDatabase), where nothing is pending. */
+    private int $baselineLevel = 0;
+
+    /** Fetch jobs already run by runPushedFetches(), the first one never. */
+    private int $ranJobs = 1;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->baselineLevel = DB::transactionLevel();
+    }
+
     protected function defineEnvironment($app): void
     {
         $app['config']->set('queue.default', 'sync');
@@ -164,6 +177,8 @@ final class InboundTest extends TestCase
      */
     public function nextAcknowledge(string $documentId): void
     {
+        // The transport is told only once the stored document is committed.
+        $this->assertSame($this->baselineLevel, DB::transactionLevel(), 'Acknowledged inside an open transaction.');
         $next = array_shift($this->acknowledgements);
         if ($next instanceof Throwable) {
             throw $next;
@@ -277,6 +292,7 @@ final class InboundTest extends TestCase
             $this->assertSame(InboundState::Fetched, $row->state);
             $this->assertSame($this->document('in-1')->xml, $row->xml);
             $this->assertSame([], $fake->acknowledged());
+            $this->assertSame($this->baselineLevel, DB::transactionLevel(), 'Announced inside an open transaction.');
             $seen[] = $row->id;
         });
 
@@ -566,6 +582,128 @@ final class InboundTest extends TestCase
         $this->assertSame(InboundState::Acknowledged, InboundMessage::query()->sole()->state);
     }
 
+    public function test_outer_transaction_rollback_stores_and_acknowledges_nothing(): void
+    {
+        $this->stubSource();
+        $message = $this->notified();
+        Event::fake([DocumentReceived::class]);
+        $this->fetches = [$this->document('in-1')];
+
+        DB::beginTransaction();
+        $this->runFetch($message);
+        $this->assertSame([], $this->acknowledgedIds);
+        Event::assertNotDispatched(DocumentReceived::class);
+        DB::rollBack();
+
+        $row = $this->stored($message);
+        $this->assertSame(InboundState::Notified, $row->state);
+        $this->assertNull($row->xml);
+        $this->assertSame([], $this->acknowledgedIds);
+        Event::assertNotDispatched(DocumentReceived::class);
+    }
+
+    public function test_fetch_retries_stop_at_max_attempts(): void
+    {
+        config()->set('einvoicing.sending.max_attempts', 2);
+        $this->stubSource();
+        $message = $this->notified();
+        $this->fetches = [new TransportUnavailable('down'), new TransportUnavailable('down')];
+
+        $this->runFetch($message);
+        $this->runFetch($message, 1);
+
+        $row = $this->stored($message);
+        $this->assertSame(2, $row->fetch_attempts);
+        $this->assertSame(InboundState::Notified, $row->state);
+        $this->assertSame(TransportUnavailable::class.': down', $row->last_error);
+        $this->assertSame([null, 30], $this->pushedFetchDelays());
+    }
+
+    public function test_ack_retries_stop_at_max_attempts_and_count_as_attempts(): void
+    {
+        config()->set('einvoicing.sending.max_attempts', 2);
+        $this->stubSource();
+        $message = $this->notified();
+        Event::fake([DocumentReceived::class]);
+        $this->fetches = [$this->document('in-1')];
+        $this->acknowledgements = [new TransportUnavailable('down'), new OutcomeUnknown('no answer')];
+
+        $this->runFetch($message);
+        $this->runFetch($message, 1);
+
+        $row = $this->stored($message);
+        $this->assertSame(2, $row->fetch_attempts);
+        $this->assertSame(InboundState::Fetched, $row->state);
+        $this->assertSame(OutcomeUnknown::class.': no answer', $row->last_error);
+        $this->assertSame([null, 30], $this->pushedFetchDelays());
+    }
+
+    public function test_ack_failure_after_another_job_acknowledged_is_not_rescheduled(): void
+    {
+        $this->stubSource();
+        $message = $this->notified();
+        Event::fake([DocumentReceived::class]);
+        $this->fetches = [$this->document('in-1')];
+        $this->runFetch($message);
+        $this->assertSame(InboundState::Acknowledged, $this->stored($message)->state);
+
+        // A stale job that read the row as fetched loses the guarded update after its failure.
+        $stale = InboundMessage::queryWithoutXml()->findOrFail($message->id);
+        $stale->state = InboundState::Fetched;
+        $stale->syncOriginal();
+        $this->acknowledgements = [new TransportUnavailable('down')];
+        $job = new FetchInboundDocument($message->id);
+        $acknowledge = new \ReflectionMethod($job, 'acknowledge');
+        $acknowledge->invoke($job, $this->app->make(EInvoicingManager::class)->inbound(), $stale);
+
+        $row = $this->stored($message);
+        $this->assertSame(InboundState::Acknowledged, $row->state);
+        $this->assertNull($row->last_error);
+        $this->assertSame([null], $this->pushedFetchDelays());
+    }
+
+    public function test_polls_during_an_outage_push_one_job_each(): void
+    {
+        $this->stubSource();
+        $this->pendingReferences = [$this->document('in-1')->reference];
+        $message = $this->notified();
+        $message->transition(InboundState::Notified, InboundState::Notified, ['fetch_attempts' => 5]);
+        $this->fetches = [new TransportUnavailable('down'), new TransportUnavailable('down')];
+
+        $this->pollWith();
+        $this->runPushedFetches();
+        $this->pollWith();
+        $this->runPushedFetches();
+
+        // The first notification, then exactly one job per poll; the failing jobs add none.
+        $this->assertSame([null, null, null], $this->pushedFetchDelays());
+        $this->assertSame(7, $this->stored($message)->fetch_attempts);
+        $this->assertSame(['in-1', 'in-1'], $this->fetched);
+    }
+
+    public function test_lookups_leave_out_the_xml(): void
+    {
+        $this->stubSource();
+        $message = $this->notified();
+        $message->transition(InboundState::Notified, InboundState::Fetched, ['xml' => '<Invoice/>']);
+        $queries = [];
+        DB::listen(function (QueryExecuted $query) use (&$queries): void {
+            if (str_starts_with($query->sql, 'select')) {
+                $queries[] = $query->sql;
+            }
+        });
+
+        $this->app->make(InboundRecorder::class)->notify('recommand', 'in-1');
+        config()->set('einvoicing.inbound.acknowledge', false);
+        $this->runFetch($message);
+
+        $this->assertCount(2, $queries);
+        foreach ($queries as $sql) {
+            $this->assertStringNotContainsString('*', $sql);
+            $this->assertStringNotContainsString('"xml"', $sql);
+        }
+    }
+
     public function test_poll_retries_a_notified_row_left_by_a_failed_fetch(): void
     {
         Event::fake([DocumentReceived::class]);
@@ -655,12 +793,13 @@ final class InboundTest extends TestCase
     }
 
     /**
-     * Runs the fetch jobs queued after the first one, against the stub source.
+     * Runs the fetch jobs queued after the first one and not run yet, against the stub source.
      */
     private function runPushedFetches(): void
     {
-        foreach (Queue::pushed(FetchInboundDocument::class)->slice(1) as $job) {
-            $this->app->call([$job, 'handle']);
+        $jobs = Queue::pushed(FetchInboundDocument::class)->values();
+        while ($this->ranJobs < $jobs->count()) {
+            $this->app->call([$jobs[$this->ranJobs++], 'handle']);
         }
     }
 }
