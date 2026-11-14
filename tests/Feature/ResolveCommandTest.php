@@ -261,6 +261,25 @@ final class ResolveCommandTest extends TestCase
         Queue::assertNothingPushed();
     }
 
+    public function test_sent_with_an_invalid_job_setting_changes_nothing(): void
+    {
+        $message = $this->message(OutboundState::Unconfirmed, 2);
+        $before = $this->stored($message)->getAttributes();
+        config()->set('einvoicing.http.timeout', 'soon');
+
+        try {
+            Artisan::call('einvoicing:resolve', ['id' => $message->id, '--sent' => 'doc-9', '--no-interaction' => true]);
+            $this->fail('A --sent with a non-numeric job setting was accepted.');
+        } catch (ConfigurationException $exception) {
+            $this->assertStringContainsString('einvoicing.http.timeout', $exception->getMessage());
+        }
+
+        // Checked before the row becomes pending, so no pending row is left without a status poll.
+        $this->assertSame($before, $this->stored($message)->getAttributes());
+        Queue::assertNothingPushed();
+        Event::assertNotDispatched(DocumentSent::class);
+    }
+
     public function test_resolve_resend_queued_dispatches_again(): void
     {
         $message = $this->message(OutboundState::Queued, 0);

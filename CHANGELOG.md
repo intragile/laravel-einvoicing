@@ -72,6 +72,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- `einvoicing:resolve --sent` checks the job settings before the row becomes pending, so an
+  invalid setting no longer leaves a pending row without a status poll.
 - A Recommand credential that is too short is reported as such, naming the key, instead of as an
   invalid base URL.
 - A "not accepted" answer that cannot be recorded because another worker changed the row is

@@ -86,6 +86,9 @@ final class ResolveCommand extends Command
             return $this->idInUse($message, $documentId);
         }
 
+        // Before the row becomes pending, so an invalid setting leaves no pending row without a poll.
+        PollDeliveryStatus::assertSettings();
+
         try {
             $moved = $message->transition($from, OutboundState::Pending, [
                 'provider_document_id' => $documentId,
