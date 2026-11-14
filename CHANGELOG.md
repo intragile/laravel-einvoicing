@@ -10,6 +10,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Drivers:** the built-in `b2brouter` (B2Brouter) and `einvoicebe` (e-invoice.be) drivers,
+  with their webhook parsers, account filters and doctor rows (B2Brouter sandbox-key warning;
+  e-invoice.be local-only acknowledgement). Their config blocks ship **commented out** in
+  `config/einvoicing.php`, because `einvoicing:doctor` checks every listed transport: uncomment
+  the ones you use. New keys: `api_key`, `account_id`, `document_type_codes` and
+  `webhook_tolerance` (B2Brouter); `api_key`, `tenant_id`, `inbound_lookback_days` and
+  `inbound_max_pages` (e-invoice.be). Storecove is planned for 1.0.0. No driver is live-tested
+  yet.
+- **Webhooks:** provider-neutral webhooks on the core's `Transport\Webhook\WebhookParser`;
+  `EInvoicing::extendWebhook($driver, $factory)` registers the parser of a custom driver (or
+  replaces a built-in one), so the webhook route accepts it.
+- **Facade:** `EInvoicing::accountId()`, `EInvoicing::extendWebhook()` and
+  `EInvoicing::hasDriver()` in the facade's method list.
+- **Documentation:** a driver table and per-driver webhook setup in the README.
 - **Validation:** `EInvoicing::xrechnung()` and `EInvoicing::facturx()` return the core
   XRechnung and Factur-X validators; `EInvoicing::validator()` returns the validator the send job
   uses: a `DocumentValidator` bound in the container, or else the core `PeppolPayloadValidator`
@@ -37,14 +51,31 @@ All notable changes to this project are documented here. The format follows
   `DocumentDelivered`, `DocumentFailed` and `DocumentUnconfirmed`.
 - Inbound documents in `einvoicing_inbound_documents`: fetched, stored, announced once with
   `DocumentReceived`, then acknowledged.
-- Signed Recommand webhooks on `POST {prefix}/{transport}`, verified on the raw body, outside
-  the `web` middleware group, with the `WebhookReceived` event.
+- Signed webhooks on `POST {prefix}/{transport}`, verified on the raw body, outside the `web`
+  middleware group, with the `WebhookReceived` event.
 - Artisan commands `einvoicing:doctor`, `einvoicing:install-rules`, `einvoicing:poll-inbound`
   and `einvoicing:resolve`.
 - `EInvoicing::fake()` for application tests.
 
 ### Changed
 
+- **Webhooks (public API):** `EInvoicingManager::webhook()` (and `EInvoicing::webhook()`) returns
+  the core `WebhookParser` instead of `RecommandWebhook`; `companyId()` is replaced by
+  `accountId()`, which returns the Recommand company id, the B2Brouter account id or the
+  e-invoice.be tenant id; `WebhookReceived::$event` is the core `Transport\Webhook\WebhookEvent`
+  instead of `Recommand\WebhookEvent` (`deduplicationKey` replaces `idempotencyKey`, `accountId`
+  replaces `companyId`, `kind` is new).
+- **Webhooks (behaviour change):** a notification that reports a delivery change without a state
+  (e-invoice.be `document.sent.failed`, or a Recommand event of a non-Peppol channel) now queues a
+  status poll for each `pending` document it names, for every driver. It shares the
+  `status.max_attempts` budget with the regular polls; after that the row stays `pending`, and
+  `einvoicing:resolve` does not handle it.
+- **Webhooks (behaviour change):** a notification is ignored as foreign only when both its account
+  id and the configured one are set and differ; an event that names an account is no longer
+  dropped when no account is configured. Notifications are routed by kind, so a Recommand event of
+  an unknown type that carries a `deliveryStatus` is no longer recorded.
+- **Doctor:** treats `api_key` as a secret, lists every missing required key per driver, and
+  checks each built-in driver's settings through the core configuration.
 - **Validation (behaviour change):** the `SendDocument` job validates the document before it
   claims the row. An invalid document ends as `failed` with category `validation` and
   `attempts` 0; a missing rule set leaves the row `queued` and fails the job with the reason.

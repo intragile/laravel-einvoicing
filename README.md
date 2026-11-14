@@ -12,10 +12,11 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 
 [Magyar nyelvű leírás → README.hu.md](README.hu.md)
 
-- **Configured transports.** Named connections in `config/einvoicing.php`; the built-in
-  `recommand` driver talks to the [Recommand](https://recommand.eu) access point, and
-  `EInvoicing::extend()` adds your own. Recommand is the available driver; Storecove,
-  e-invoice.be and B2Brouter are planned for 1.0.0.
+- **Configured transports.** Named connections in `config/einvoicing.php`; the built-in drivers
+  `recommand`, `b2brouter` and `einvoicebe` talk to the [Recommand](https://recommand.eu),
+  [B2Brouter](https://www.b2brouter.net) and [e-invoice.be](https://e-invoice.be) access points,
+  and `EInvoicing::extend()` adds your own. Storecove is planned for 1.0.0 (follow-up); see
+  [Drivers](#drivers).
 - **Validation before every send**, on by default: Peppol BIS documents with the official rules,
   installed by one artisan command, and XRechnung documents with the KoSIT rules.
 - **Queued sending with a guarded state machine.** A send is claimed with a conditional update,
@@ -27,14 +28,33 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 - **Signed webhooks** verified on the raw request body, without the `web` middleware group.
 - `EInvoicing::fake()` for your tests, and `einvoicing:doctor` to check an installation.
 
-> **Live transmission through Recommand is not verified yet.** Everything is tested offline;
-> see [What is verified](#what-is-verified).
+> **No driver is live-tested yet.** Everything is tested offline; see
+> [Drivers](#drivers) and [What is verified](#what-is-verified).
 
 ## Requirements
 
 - PHP 8.3+ with `dom`, `libxml`, `mbstring`
 - Laravel 12 or 13
 - A queue worker for production use (see [Queues](#queues))
+
+## Drivers
+
+Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is planned for 1.0.0
+(follow-up).
+
+| Driver | Peppol test network | Provider sandbox | Status at release |
+|---|---|---|---|
+| Recommand (`recommand`) | yes (playground team with `useTestNetwork`) | yes | not live-tested (offline contract tests from the public API docs) |
+| B2Brouter (`b2brouter`) | no (the sandbox simulates the network) | yes, free | not live-tested (offline contract tests from the public API docs) |
+| e-invoice.be (`einvoicebe`) | no (the sandbox simulates the network) | yes, free | not live-tested (offline contract tests from the public API docs) |
+| Storecove | unverified | 30-day, on request | planned for 1.0.0 |
+
+A test against a provider sandbox that simulates the network proves the provider's API contract,
+not delivery over Peppol; only Recommand can reach the Peppol test network. e-invoice.be sends
+Peppol BIS Billing 3.0 UBL only. B2Brouter renders the document it transmits from its own invoice
+model, so the delivered bytes may differ from your XML. What each driver sends, its status
+mapping, inbound behaviour and webhook details are in the core's
+[TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
 
 ## Installation
 
@@ -287,8 +307,17 @@ a send leaves the row `sending`; a delayed `ExpireSendingClaim` job then moves i
 
 ### Resolving an unconfirmed send
 
-Look the document up in the access point (for Recommand: the company's documents in the
-dashboard or the API, same receiver and invoice number), then:
+Look the document up in the access point, by receiver and invoice number, then:
+
+- Recommand: the company's documents in the dashboard or the API.
+- B2Brouter: the account's invoices; the document id is the invoice id (digits). Per B2Brouter's API
+  documentation, a resend of an invoice number the account already holds is refused as a
+  duplicate.
+- e-invoice.be: the drafts and sent documents; the document id is `doc-…`. A document still in
+  `DRAFT` was uploaded but not sent: either send it at e-invoice.be and use `--sent`, or use
+  `--resend`, which uploads a new draft.
+
+
 
 ```bash
 php artisan einvoicing:resolve 42 --sent=<document-id>   # it was accepted: pending, polled from here on
@@ -389,11 +418,24 @@ The package registers one route, `POST /einvoicing/webhooks/{transport}` (route 
 with a built-in driver (or a custom driver with a parser registered with
 `EInvoicing::extendWebhook()`) and a `webhook_secret`; any other name gets `404`. Setup:
 
-1. Run `php artisan einvoicing:doctor`. The `transport <name>: webhook` row prints the full URL
-   when the transport has a webhook secret and webhooks are enabled; otherwise it shows a
-   warning that says what is missing. A missing `company_id` fails the `config` row.
-2. Register that URL as a webhook in Recommand and put its signing secret into
-   `RECOMMAND_WEBHOOK_SECRET`.
+1. Run `php artisan einvoicing:doctor`. The `transport <name>: webhook` row prints the full URL,
+   `https://<your app>/einvoicing/webhooks/<name>`, where `<name>` is the transport's key in
+   `einvoicing.transports` (not the driver), when the transport has a webhook secret and webhooks
+   are enabled; otherwise it shows a warning that says what is missing. A missing required key
+   (Recommand `company_id`, B2Brouter `account_id`) fails the `config` row.
+2. Register that URL at the provider and put the secret it gives you into the transport's
+   `webhook_secret`:
+
+   | Driver | Register | Events | Secret |
+   |---|---|---|---|
+   | `recommand` | a webhook in Recommand | its document events | the webhook's signing `secret` → `RECOMMAND_WEBHOOK_SECRET` |
+   | `b2brouter` | a web hook in B2Brouter (API `POST /web_hooks`) | `issued_invoice.state_change`, `received_invoice.created` | the web hook's signing secret (`signing_secret` in the API; B2Brouter's guide calls it `signature_key`) → `B2BROUTER_WEBHOOK_SECRET` |
+   | `einvoicebe` | a webhook through the e-invoice.be API (`POST /api/webhooks/`) | `document.received`, `document.sent`, `document.sent.failed` | the `secret` of the create response → `EINVOICEBE_WEBHOOK_SECRET` |
+
+   Notifications are matched against the configured account: Recommand `company_id`, B2Brouter
+   `account_id` and, when set, e-invoice.be `tenant_id`. A notification that names another
+   account is ignored; one that names no account, or arrives for a transport without a configured
+   account, is applied.
 3. Nothing else: the route does not run the `web` middleware group, so no CSRF token or
    session is involved, and you need no CSRF exception.
 
@@ -404,10 +446,20 @@ without a webhook secret, `204` for everything else, including notifications tha
 not retry them. Repeated or out-of-order notifications are harmless: inbound documents are
 stored once per id, and `delivered` and `failed` never change again. A notification that says a
 delivery changed without saying how (e-invoice.be's `document.sent.failed`, or a Recommand
-event of a non-Peppol channel) schedules a status poll for each `pending` document it names,
-within the same `status.max_attempts` checks; once those are used up, or on a `sync` queue
-connection, nothing is polled and the row stays `pending`, as after the last regular status
-poll, so check it at the access point.
+event of a non-Peppol channel) starts an extra status-poll chain for each `pending` document it
+names. The extra chain shares the document's `status_checks` count with the regular polls, so
+together they stay within `status.max_attempts`. Once those are used up, with `status.poll` off,
+or on a `sync` queue connection, nothing is polled and the row stays `pending`, as after the last
+regular status poll. Check such a row at the access point: `einvoicing:resolve` does not handle a
+`pending` row (it resolves `unconfirmed` and abandoned `sending` rows).
+
+B2Brouter's `X-B2Brouter-Delivery-Id` header, which the package uses to recognise a repeated
+delivery, is not covered by B2Brouter's signature, and `webhook_tolerance` is off by default, so
+a captured notification can be replayed later. A replay can only repeat a state B2Brouter really
+reported, and `delivered` and `failed` never change again. Set `webhook_tolerance` if replays
+matter more to you than late retries (see the core's TRANSPORT.md). Webhooks are not live-tested,
+which needs a public HTTPS endpoint; their signatures are verified offline against each
+provider's documented scheme (for e-invoice.be also against its published test vector).
 
 **Harden the endpoint.** The route has no rate limit and no body size limit of its own. Add a
 throttle in `einvoicing.webhooks.middleware`, for example `['throttle:120,1']`, and cap the
@@ -491,6 +543,20 @@ contract with this package:
 Transports are cached per name once built. Changing `einvoicing.validation.enabled` at runtime
 does not rewrap a transport that was already built; set it in the configuration, not in code.
 
+To receive webhooks for a custom driver, register its parser, a core `WebhookParser`:
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+
+EInvoicing::extendWebhook('my-ap', fn ($app, #[\SensitiveParameter] array $config) => new MyAccessPointWebhook($config['webhook_secret']));
+```
+
+The factory gets the application and the transport's configuration, whose `webhook_secret` is
+always set (the route refuses a transport without one). The route then accepts notifications for
+every transport of that driver. A custom driver has no configured account, so no notification is
+ignored as foreign; check the account in your parser if you need to. A parser registered for a
+built-in driver replaces the built-in one.
+
 ## Testing
 
 ```php
@@ -544,11 +610,14 @@ configured secret while faked.
 | State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 231 tests, 1239 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description | **Live transmission not verified** |
+| B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference; manager, config, doctor and webhook routing tested here | **Not live-tested** |
+| Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | **Not live-tested** (needs a public HTTPS endpoint) |
 
 The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
 
-No test of this package makes a network call. The core has an opt-in `recommand-live` group
-for a Recommand playground team; see its
+No test of this package makes a network call. The core has opt-in live groups:
+`recommand-live` for a Recommand playground team, `b2brouter-live` for a B2Brouter sandbox and
+`einvoicebe-live` for an e-invoice.be sandbox company; see its
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
 
 ## Versioning

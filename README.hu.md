@@ -14,9 +14,10 @@ alkalmazásból.
 [English documentation → README.md](README.md)
 
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
-  beépített `recommand` driver a [Recommand](https://recommand.eu) access pointhoz csatlakozik,
-  saját drivert az `EInvoicing::extend()` regisztrál. Elérhető driver a Recommand; a Storecove,
-  az e-invoice.be és a B2Brouter driver az 1.0.0-ra tervezett.
+  beépített `recommand`, `b2brouter` és `einvoicebe` driver a [Recommand](https://recommand.eu),
+  a [B2Brouter](https://www.b2brouter.net) és az [e-invoice.be](https://e-invoice.be) access
+  pointhoz csatlakozik, saját drivert az `EInvoicing::extend()` regisztrál. A Storecove az
+  1.0.0-ra tervezett (külön lépésben); lásd: [Driverek](#driverek).
 - **Validáció minden küldés előtt**, alapból bekapcsolva: a Peppol BIS dokumentumokat a
   hivatalos szabályok ellenőrzik (egyetlen artisan parancs telepíti őket), az XRechnung
   dokumentumokat a KoSIT-szabályok.
@@ -29,14 +30,34 @@ alkalmazásból.
 - **Aláírt webhookok**, a nyers kéréstörzsön ellenőrizve, a `web` middleware-csoport nélkül.
 - `EInvoicing::fake()` a saját tesztekhez, `einvoicing:doctor` a telepítés ellenőrzéséhez.
 
-> **Az éles küldés a Recommandon keresztül még nincs kipróbálva.** Minden teszt offline fut;
-> lásd: [Mi van ellenőrizve](#mi-van-ellenőrizve).
+> **Egyik drivert sem teszteltük még élesben.** Minden teszt offline fut; lásd:
+> [Driverek](#driverek) és [Mi van ellenőrizve](#mi-van-ellenőrizve).
 
 ## Követelmények
 
 - PHP 8.3+ a `dom`, `libxml` és `mbstring` kiterjesztéssel
 - Laravel 12 vagy 13
 - Éles használathoz queue worker (lásd: [Queue](#queue))
+
+## Driverek
+
+Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove az 1.0.0-ra tervezett
+(külön lépésben).
+
+| Driver | Peppol tesztháló | Szolgáltatói sandbox | Állapot a kiadáskor |
+|---|---|---|---|
+| Recommand (`recommand`) | igen (playground csapat `useTestNetwork` beállítással) | igen | élesben nem tesztelt (offline szerződéstesztek a nyilvános API-dokumentációból) |
+| B2Brouter (`b2brouter`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben nem tesztelt (offline szerződéstesztek a nyilvános API-dokumentációból) |
+| e-invoice.be (`einvoicebe`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben nem tesztelt (offline szerződéstesztek a nyilvános API-dokumentációból) |
+| Storecove | nem ellenőrzött | 30 napos, kérésre | az 1.0.0-ra tervezett |
+
+A hálózatot csak szimuláló szolgáltatói sandbox elleni teszt a szolgáltató API-szerződését
+igazolja, nem a Peppolon történő kézbesítést; a Peppol teszthálót csak a Recommand éri el. Az
+e-invoice.be csak Peppol BIS Billing 3.0 UBL-t küld. A B2Brouter a továbbított dokumentumot a
+saját számlamodelljéből állítja elő, így a kézbesített bájtok eltérhetnek a te XML-edtől. Hogy
+melyik driver mit küld, hogyan képezi le az állapotokat, hogyan fogad és mit tud a webhookja, azt
+a core [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md)
+leírása tartalmazza (angolul).
 
 ## Telepítés
 
@@ -296,8 +317,17 @@ közben leáll, a sor `sending` állapotban marad, majd egy késleltetett `Expir
 
 ### Egy `unconfirmed` küldés rendezése
 
-Keresd meg a dokumentumot az access pointban (Recommandnál: a cég dokumentumai a felületen vagy
-az API-ban, azonos címzettel és számlaszámmal), majd:
+Keresd meg a dokumentumot az access pointban, címzett és számlaszám alapján, majd:
+
+- Recommand: a cég dokumentumai a felületen vagy az API-ban.
+- B2Brouter: a fiók számlái; a dokumentum-azonosító a számla azonosítója (számjegyek). A B2Brouter
+  API-dokumentációja szerint a fiókban már meglévő számlaszám újraküldését duplikátumként
+  elutasítja.
+- e-invoice.be: a piszkozatok és az elküldött dokumentumok; a dokumentum-azonosító `doc-…`. A még
+  `DRAFT` állapotú dokumentumot feltöltötték, de nem küldték el: vagy küldd el az e-invoice.be-nél,
+  és használd a `--sent` kapcsolót, vagy a `--resend` kapcsolót, amely új piszkozatot tölt fel.
+
+
 
 ```bash
 php artisan einvoicing:resolve 42 --sent=<dokumentum-azonosító>   # átvették: pending, innentől lekérdezve
@@ -402,11 +432,24 @@ driverű (vagy `EInvoicing::extendWebhook()`-kal regisztrált parserű saját dr
 `webhook_secret`-tel rendelkező transporthoz fogad el; minden más név `404`-et kap. Beállítás:
 
 1. Futtasd a `php artisan einvoicing:doctor` parancsot. A `transport <név>: webhook` sor akkor
-   írja ki a teljes URL-t, ha a transportnak van webhook secretje, és a webhookok be vannak
-   kapcsolva; különben figyelmeztetést ad arról, mi hiányzik. A hiányzó `company_id` miatt a
-   `config` sor jelez hibát.
-2. Vedd fel ezt az URL-t webhookként a Recommandban, az aláíró kulcsot pedig írd a
-   `RECOMMAND_WEBHOOK_SECRET` változóba.
+   írja ki a teljes URL-t (`https://<alkalmazásod>/einvoicing/webhooks/<név>`, ahol a `<név>` a
+   transport kulcsa az `einvoicing.transports` alatt, nem a driver neve), ha a transportnak van
+   webhook secretje, és a webhookok be vannak kapcsolva; különben figyelmeztetést ad arról, mi
+   hiányzik. Egy hiányzó kötelező kulcs (Recommandnál `company_id`, B2Brouternél `account_id`)
+   miatt a `config` sor jelez hibát.
+2. Vedd fel ezt az URL-t a szolgáltatónál, és a tőle kapott secretet írd a transport
+   `webhook_secret` beállításába:
+
+   | Driver | Hol veszed fel | Események | Secret |
+   |---|---|---|---|
+   | `recommand` | webhookként a Recommandban | a dokumentumeseményei | a webhook aláíró `secret`-je → `RECOMMAND_WEBHOOK_SECRET` |
+   | `b2brouter` | web hookként a B2Brouterben (API: `POST /web_hooks`) | `issued_invoice.state_change`, `received_invoice.created` | a web hook aláíró secretje (az API-ban `signing_secret`, a B2Brouter útmutatójában `signature_key`) → `B2BROUTER_WEBHOOK_SECRET` |
+   | `einvoicebe` | webhookként az e-invoice.be API-n keresztül (`POST /api/webhooks/`) | `document.received`, `document.sent`, `document.sent.failed` | a létrehozó válasz `secret` mezője → `EINVOICEBE_WEBHOOK_SECRET` |
+
+   Az értesítéseket a csomag a beállított fiókkal veti össze: Recommandnál a `company_id`,
+   B2Brouternél az `account_id`, e-invoice.be-nél a `tenant_id`, ha meg van adva. A más fiókot
+   megnevező értesítést figyelmen kívül hagyja; azt, amelyik nem nevez meg fiókot, vagy olyan
+   transporthoz érkezik, amelynek nincs beállított fiókja, alkalmazza.
 3. Más teendő nincs: az útvonal nem futtatja a `web` middleware-csoportot, így sem CSRF-token,
    sem session nem kell hozzá, és CSRF-kivételt sem kell felvenni.
 
@@ -418,10 +461,22 @@ access point ne próbálja újra őket. Az ismételt vagy rossz sorrendben érke
 ártalmatlanok: a bejövő dokumentum azonosítónként egyszer tárolódik, a `delivered` és `failed`
 állapot pedig már nem változik. Az az értesítés, amely csak annyit mond, hogy a kézbesítés
 állapota változott, de azt nem, hogy mire (az e-invoice.be `document.sent.failed` eseménye, vagy
-egy nem Peppol csatornás Recommand-esemény), státuszlekérdezést ütemez minden általa megnevezett
-`pending` dokumentumra, ugyanazon `status.max_attempts` kereten belül; ha a keret elfogyott, vagy
-`sync` queue-kapcsolaton, nem történik lekérdezés, és a sor `pending` marad, ahogy az utolsó
-rendes státuszlekérdezés után is, ezért ellenőrizd az access pointnál.
+egy nem Peppol csatornás Recommand-esemény), egy további státuszlekérdezési láncot indít minden
+általa megnevezett `pending` dokumentumra. Ez a lánc a rendes lekérdezésekkel közös
+`status_checks` számlálót használ, így együtt sem lépik túl a `status.max_attempts` keretet. Ha a
+keret elfogyott, a `status.poll` ki van kapcsolva, vagy `sync` queue-kapcsolaton, nem történik
+lekérdezés, és a sor `pending` marad, ahogy az utolsó rendes státuszlekérdezés után is. Az ilyen
+sort az access pointnál ellenőrizd: az `einvoicing:resolve` nem kezeli a `pending` sort (az
+`unconfirmed` és az elhagyott `sending` sort rendezi).
+
+A B2Brouter `X-B2Brouter-Delivery-Id` fejlécét, amelyből a csomag az ismételt kézbesítést
+felismeri, a B2Brouter aláírása nem fedi le, a `webhook_tolerance` pedig alapból ki van kapcsolva,
+így egy elfogott értesítés később újra beküldhető. Az újrajátszás csak olyan állapotot ismételhet
+meg, amelyet a B2Brouter valóban jelentett, a `delivered` és `failed` állapot pedig már nem
+változik. Állítsd be a `webhook_tolerance` értékét, ha az újrajátszás fontosabb szempont a késői
+újrapróbálásoknál (lásd a core TRANSPORT.md leírását). A webhookokat élesben nem teszteltük,
+ehhez nyilvános HTTPS-végpont kellene; az aláírásokat a szolgáltatók dokumentált sémája szerint
+offline ellenőrizzük (az e-invoice.be-nél a közzétett tesztvektorral is).
 
 **Védd az útvonalat.** Saját sebességkorlátja és törzsméret-korlátja nincs. Adj meg throttle-t az
 `einvoicing.webhooks.middleware` beállításban, például `['throttle:120,1']`, a kérés törzsének
@@ -515,6 +570,20 @@ A felépített transportot a csomag név szerint gyorsítótárazza. Az `einvoic
 futás közbeni átállítása nem csomagolja át a már felépített transportot; a konfigurációban
 állítsd, ne kódból.
 
+Ha saját driverrel webhookot is fogadnál, regisztráld a parserét, egy core `WebhookParser`-t:
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+
+EInvoicing::extendWebhook('my-ap', fn ($app, #[\SensitiveParameter] array $config) => new MyAccessPointWebhook($config['webhook_secret']));
+```
+
+A factory megkapja az alkalmazást és a transport konfigurációját, amelyben a `webhook_secret`
+mindig meg van adva (az útvonal a secret nélküli transportot elutasítja). Ettől kezdve az útvonal
+az adott driver minden transportjához fogad értesítést. Saját drivernek nincs beállított fiókja,
+ezért a csomag egyetlen értesítést sem hagy figyelmen kívül idegenként; ha kell, a fiókot a
+parseredben ellenőrizd. A beépített driverhez regisztrált parser a beépítettet váltja fel.
+
 ## Tesztelés
 
 ```php
@@ -568,11 +637,14 @@ fake módban is a beállított kulccsal ellenőrzi.
 | Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 231 teszt, 1239 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
+| B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben nem tesztelt** |
+| Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | **Élesben nem tesztelt** (nyilvános HTTPS-végpont kellene) |
 
 A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
 
-A csomag egyik tesztje sem használ hálózatot. A core-ban van egy opcionális `recommand-live`
-csoport Recommand playground csapathoz; lásd a core
+A csomag egyik tesztje sem használ hálózatot. A core-ban opcionális éles csoportok vannak:
+`recommand-live` Recommand playground csapathoz, `b2brouter-live` B2Brouter sandboxhoz és
+`einvoicebe-live` e-invoice.be sandbox céghez; lásd a core
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md) leírását.
 
 ## Verziókezelés
