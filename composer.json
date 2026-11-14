@@ -30,16 +30,11 @@
     "require": {
         "php": "^8.3",
         "guzzlehttp/guzzle": "^7.9",
-        "illuminate/bus": "^12.0|^13.0",
-        "illuminate/console": "^12.0|^13.0",
-        "illuminate/contracts": "^12.0|^13.0",
-        "illuminate/database": "^12.0|^13.0",
-        "illuminate/events": "^12.0|^13.0",
-        "illuminate/http": "^12.0|^13.0",
-        "illuminate/queue": "^12.0|^13.0",
-        "illuminate/routing": "^12.0|^13.0",
-        "illuminate/support": "^12.0|^13.0",
-        "intragile/php-einvoicing": "^1.0@dev"
+        "intragile/einvoicing-rules-en16931": "^1.0",
+        "intragile/einvoicing-rules-facturx": "^1.0",
+        "intragile/einvoicing-rules-xrechnung": "^1.0",
+        "intragile/php-einvoicing": "^1.0",
+        "laravel/framework": "^12.0|^13.0"
     },
     "require-dev": {
         "larastan/larastan": "^3.0",
@@ -50,11 +45,39 @@
     "repositories": [
         {
             "type": "path",
-            "url": "../php-einvoicing"
+            "url": "../php-einvoicing",
+            "options": {
+                "versions": {
+                    "intragile/php-einvoicing": "1.0.0"
+                }
+            }
         },
         {
             "type": "path",
-            "url": "../php-einvoicing/packages/rules-en16931"
+            "url": "../php-einvoicing/packages/rules-en16931",
+            "options": {
+                "versions": {
+                    "intragile/einvoicing-rules-en16931": "1.0.0"
+                }
+            }
+        },
+        {
+            "type": "path",
+            "url": "../php-einvoicing/packages/rules-facturx",
+            "options": {
+                "versions": {
+                    "intragile/einvoicing-rules-facturx": "1.0.0"
+                }
+            }
+        },
+        {
+            "type": "path",
+            "url": "../php-einvoicing/packages/rules-xrechnung",
+            "options": {
+                "versions": {
+                    "intragile/einvoicing-rules-xrechnung": "1.0.0"
+                }
+            }
         }
     ],
     "autoload": {
@@ -82,6 +105,6 @@
     "config": {
         "sort-packages": true
     },
-    "minimum-stability": "dev",
+    "minimum-stability": "stable",
     "prefer-stable": true
 }
