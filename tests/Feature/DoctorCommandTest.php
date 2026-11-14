@@ -291,6 +291,104 @@ final class DoctorCommandTest extends TestCase
         $this->assertStringNotContainsString('zq-71x', $output);
     }
 
+    public function test_doctor_rows_per_driver(): void
+    {
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.default', 'b2brouter');
+        config()->set('einvoicing.transports', [
+            'b2brouter' => [
+                'driver' => 'b2brouter',
+                'api_key' => 'live_'.self::SECRET_MARK,
+                'account_id' => '78234',
+                'document_type_codes' => ['urn:example:doctype' => 'xml.ubl.invoice.custom'],
+                'webhook_secret' => 'wh-'.self::SECRET_MARK,
+            ],
+            'einvoicebe' => [
+                'driver' => 'einvoicebe',
+                'api_key' => 'ak-'.self::SECRET_MARK,
+                'base_url' => 'https://api.e-invoice.be/',
+                'inbound_lookback_days' => '14',
+            ],
+        ]);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'b2brouter: config', 'ok');
+        $this->assertRow($output, 'b2brouter: base URL', 'ok', 'default https://api.b2brouter.net');
+        $this->assertRow($output, 'b2brouter: webhook', 'ok', '/einvoicing/webhooks/b2brouter');
+        $this->assertRow($output, 'einvoicebe: config', 'ok');
+        $this->assertRow($output, 'einvoicebe: base URL', 'ok', 'https');
+        $this->assertRow($output, 'einvoicebe: webhook', 'warn', 'webhooks off');
+        $this->assertRow($output, 'einvoicebe: acknowledge', 'ok', 'local only');
+        $this->assertStringNotContainsString('sandbox', $output);
+        $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+
+        // Missing keys are listed together; then each invalid setting is named, never its value.
+        config()->set('einvoicing.transports.b2brouter', ['driver' => 'b2brouter']);
+        config()->set('einvoicing.transports.einvoicebe', ['driver' => 'einvoicebe', 'api_key' => 'zq-71x', 'base_url' => 'http://'.self::SECRET_MARK.'.example']);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code, $output);
+        $this->assertRow($output, 'b2brouter: config', 'fail', 'missing or empty: einvoicing.transports.b2brouter.api_key, einvoicing.transports.b2brouter.account_id');
+        $this->assertRow($output, 'einvoicebe: config', 'fail', 'einvoicing.transports.einvoicebe.api_key');
+        $this->assertRow($output, 'einvoicebe: base URL', 'fail', 'https://');
+        $this->assertStringNotContainsString('zq-71x', $output);
+        $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+
+        foreach ([
+            ['account_id', '78q34'],
+            ['document_type_codes', ['urn:x' => 'Bad Code!']],
+            ['webhook_tolerance', 'soon'],
+        ] as [$key, $value]) {
+            config()->set('einvoicing.transports.b2brouter', [
+                'driver' => 'b2brouter',
+                'api_key' => 'live_'.self::SECRET_MARK,
+                'account_id' => '78234',
+                'webhook_secret' => 'wh-'.self::SECRET_MARK,
+                $key => $value,
+            ]);
+
+            [$code, $output] = $this->doctor();
+
+            $this->assertSame(1, $code, $output);
+            $this->assertMatchesRegularExpression('/b2brouter: (config|webhook)\s*\|\s*fail\s*\|[^\n]*einvoicing\.transports\.b2brouter\.'.$key.'/', $output);
+            $this->assertStringNotContainsString('78q34', $output);
+            $this->assertStringNotContainsString('Bad Code!', $output);
+            $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+        }
+    }
+
+    public function test_doctor_warns_on_sandbox_key(): void
+    {
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.default', 'b2brouter');
+        config()->set('einvoicing.transports', ['b2brouter' => [
+            'driver' => 'b2brouter',
+            'api_key' => 'test_'.self::SECRET_MARK,
+            'account_id' => 78234,
+        ]]);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'b2brouter: config', 'ok');
+        $this->assertRow($output, 'b2brouter: sandbox', 'warn', 'test_');
+        $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+    }
+
+    public function test_doctor_cuts_an_api_key_out_of_messages(): void
+    {
+        $this->useStubTransports(['stub' => ['api_key' => 'ak-'.self::SECRET_MARK]]);
+
+        [$code, $output] = $this->doctor(['--live' => true]);
+
+        $this->assertSame(1, $code);
+        $this->assertRow($output, 'stub: inbox', 'fail', AuthenticationFailed::class);
+        $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+    }
+
     public function test_doctor_live_uses_inbox(): void
     {
         $this->configureRecommand();
@@ -493,12 +591,14 @@ final class DoctorCommandTest extends TestCase
             {
                 $key = is_string($this->config['api_key_id'] ?? null) ? $this->config['api_key_id'] : '';
                 $secret = is_string($this->config['secret'] ?? null) ? $this->config['secret'] : '';
+                $apiKey = is_string($this->config['api_key'] ?? null) ? $this->config['api_key'] : '';
 
                 throw new AuthenticationFailed(sprintf(
-                    'The credentials %s / %s were refused (Basic %s).',
+                    'The credentials %s / %s were refused (Basic %s), and the API key %s.',
                     $key,
                     $secret,
                     base64_encode($key.':'.$secret),
+                    $apiKey,
                 ));
             }
 

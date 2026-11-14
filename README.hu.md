@@ -89,6 +89,81 @@ RECOMMAND_WEBHOOK_SECRET=...            # csak ha webhookot fogadsz
 # EINVOICING_QUEUE=einvoicing
 ```
 
+Minden access point egy bejegyzés az `einvoicing.transports` listában, a beépített `recommand`,
+`b2brouter` vagy `einvoicebe` driverek egyikével. A publikált konfigurációs fájlban a
+`recommand` bejegyzés aktív, a másik kettő kikommentezve szerepel, mert az `einvoicing:doctor`
+minden felsorolt transportot ellenőriz. Vedd ki a kommentből azokat, amelyeket használsz, és az
+`EINVOICING_TRANSPORT` mutasson az alapértelmezettre.
+
+**B2Brouter** (`driver`: `b2brouter`):
+
+```php
+// config/einvoicing.php
+return [
+    // ...
+    'transports' => [
+        'b2brouter' => [
+            'driver' => 'b2brouter',
+            'api_key' => env('B2BROUTER_API_KEY'),
+            'account_id' => env('B2BROUTER_ACCOUNT_ID'),
+            'base_url' => env('B2BROUTER_BASE_URL', 'https://api.b2brouter.net'),
+            'document_type_codes' => [],
+            'webhook_secret' => env('B2BROUTER_WEBHOOK_SECRET'),
+            'webhook_tolerance' => null,
+        ],
+    ],
+];
+```
+
+```dotenv
+B2BROUTER_API_KEY=...                   # a test_ kezdetű kulcs a sandboxba megy
+B2BROUTER_ACCOUNT_ID=12345              # a küldő és fogadó fiók
+B2BROUTER_WEBHOOK_SECRET=...            # csak ha webhookot fogadsz
+# B2BROUTER_BASE_URL=https://api.b2brouter.net
+```
+
+A B2Brouter a `test_` kezdetű kulcsot a sandboxába irányítja, amely sosem éri el a Peppol
+hálózatot; a doctor erre figyelmeztet. Az `account_id` pozitív egész szám. A
+`document_type_codes` további Peppol dokumentumtípus-azonosítókat rendel B2Brouter
+dokumentumtípus-kódokhoz; a Peppol BIS Billing 3.0 számlához és jóváíráshoz nem kell semmi. A
+`webhook_tolerance` (másodperc) elutasítja azt az értesítést, amelynek aláírt időbélyege ennél
+távolabb van a jelentől; alapból ki van kapcsolva (`null`), mert a B2Brouter nagyjából egy hétig
+próbálja újra az értesítést.
+
+**e-invoice.be** (`driver`: `einvoicebe`):
+
+```php
+// config/einvoicing.php
+return [
+    // ...
+    'transports' => [
+        'einvoicebe' => [
+            'driver' => 'einvoicebe',
+            'api_key' => env('EINVOICEBE_API_KEY'),
+            'base_url' => env('EINVOICEBE_BASE_URL', 'https://api.e-invoice.be'),
+            'tenant_id' => env('EINVOICEBE_TENANT_ID'),
+            'inbound_lookback_days' => 7,
+            'inbound_max_pages' => 10,
+            'webhook_secret' => env('EINVOICEBE_WEBHOOK_SECRET'),
+        ],
+    ],
+];
+```
+
+```dotenv
+EINVOICEBE_API_KEY=...
+EINVOICEBE_WEBHOOK_SECRET=...           # csak ha webhookot fogadsz
+# EINVOICEBE_TENANT_ID=...              # más tenant webhook-értesítéseit eldobja
+# EINVOICEBE_BASE_URL=https://api.e-invoice.be
+```
+
+Az e-invoice.be-nek nincs hívása egy fogadott dokumentum nyugtázására, ezért a nyugtázás csak
+helyi: a dokumentum a beérkező mappájában marad, és minden lekérdezés az utolsó
+`inbound_lookback_days` nap (1–365) dokumentumait listázza, legfeljebb `inbound_max_pages`
+százas oldalon (1–100); a csomag minden dokumentumot egyszer tárol és tölt le. Ha a `tenant_id`
+be van állítva, a más tenantot megnevező webhook-értesítéseket figyelmen kívül hagyja; nélküle
+minden aláírt értesítést feldolgoz.
+
 A `config/einvoicing.php` további részei: HTTP-időkorlátok és a válaszméret felső határa
 (`http`), a validáció ki- és bekapcsolása (`validation.enabled`), a küldés újrapróbálása
 (`sending.max_attempts`, `sending.backoff`), a státusz lekérdezése (`status.poll`,
@@ -97,7 +172,8 @@ A `config/einvoicing.php` további részei: HTTP-időkorlátok és a válaszmér
 késleltetési listák utolsó eleme ismétlődik. A számok számot tartalmazó stringként is
 megadhatók, ahogy a környezeti változók adják őket; minden mást a csomag a kulcsot megnevező
 hibával elutasít. A `webhooks.enabled` a `"true"`/`"false"` és az `"1"`/`"0"` stringet is
-elfogadja. A Recommand API-kulcs azonosítója és titka egyaránt legalább 8 karakter legyen.
+elfogadja. Az API-kulcsok, valamint a Recommand API-kulcs azonosítója és titka egyaránt legalább
+8 karakter legyenek.
 
 A transport első használatkor épül fel, így a hiányzó hozzáférési adatok sosem akasztják meg az
 alkalmazás indulását. A titkos kulcsok nem kerülnek kivételüzenetbe, a doctor kimenetébe,
@@ -246,7 +322,7 @@ a foglaló workert az időkorlátnál leállították, ehhez pedig `pcntl` kell 
 | `DocumentFailed` | a dokumentum biztosan nem lett kézbesítve |
 | `DocumentUnconfirmed` | a küldés kimenetele ismeretlen; operátornak kell rendeznie |
 | `DocumentReceived` | egy bejövő dokumentum eltárolva (`$event->message->xml`) |
-| `WebhookReceived` | egy ehhez a céghez tartozó, aláírt webhook ellenőrizve, még a feldolgozása előtt (ismételt kézbesítésnél újra lefut) |
+| `WebhookReceived` | egy ehhez a szolgáltatói fiókhoz tartozó, aláírt webhook ellenőrizve, még a feldolgozása előtt (ismételt kézbesítésnél újra lefut; a `$event->event->deduplicationKey` azonosít egy kézbesítést) |
 
 Mind az `IntrAgile\EInvoicing\Laravel\Events` névtérben van; a dokumentum-események a
 `$message` tulajdonságban adják át az `OutboundMessage` vagy `InboundMessage` modellt.
@@ -321,9 +397,9 @@ dokumentumokat is helyrehozza. Webhook mellett is érdemes ütemezni.
 ### Webhookok
 
 A csomag egyetlen útvonalat regisztrál minden transportnévhez:
-`POST /einvoicing/webhooks/{transport}` (neve: `einvoicing.webhook`). Értesítést csak `recommand`
-driverű, `webhook_secret`-tel rendelkező transporthoz fogad el; minden más név `404`-et kap.
-Beállítás:
+`POST /einvoicing/webhooks/{transport}` (neve: `einvoicing.webhook`). Értesítést csak beépített
+driverű (vagy `EInvoicing::extendWebhook()`-kal regisztrált parserű saját driverű),
+`webhook_secret`-tel rendelkező transporthoz fogad el; minden más név `404`-et kap. Beállítás:
 
 1. Futtasd a `php artisan einvoicing:doctor` parancsot. A `transport <név>: webhook` sor akkor
    írja ki a teljes URL-t, ha a transportnak van webhook secretje, és a webhookok be vannak
@@ -334,13 +410,18 @@ Beállítás:
 3. Más teendő nincs: az útvonal nem futtatja a `web` middleware-csoportot, így sem CSRF-token,
    sem session nem kell hozzá, és CSRF-kivételt sem kell felvenni.
 
-Az aláírást (`X-Signature`, HMAC-SHA256) a csomag a nyers kéréstörzsön ellenőrzi, pontosan úgy,
-ahogy megérkezett. A válaszok törzse üres: `401` hiányzó vagy hibás aláírásra, `404` webhook
+Az aláírást (HMAC-SHA256) a driver parsere a nyers kéréstörzsön ellenőrzi, pontosan úgy, ahogy
+megérkezett. A válaszok törzse üres: `401` hiányzó vagy hibás aláírásra, `404` webhook
 secret nélküli transportra, minden másra `204`, a figyelmen kívül hagyott értesítésekre is
-(másik cég, ismeretlen dokumentum, nem dokumentumra vonatkozó esemény), hogy a Recommand ne
-próbálja újra őket. Az ismételt vagy rossz sorrendben érkező értesítések ártalmatlanok: a bejövő
-dokumentum azonosítónként egyszer tárolódik, a `delivered` és `failed` állapot pedig már nem
-változik.
+(másik szolgáltatói fiók, ismeretlen dokumentum, nem dokumentumra vonatkozó esemény), hogy az
+access point ne próbálja újra őket. Az ismételt vagy rossz sorrendben érkező értesítések
+ártalmatlanok: a bejövő dokumentum azonosítónként egyszer tárolódik, a `delivered` és `failed`
+állapot pedig már nem változik. Az az értesítés, amely csak annyit mond, hogy a kézbesítés
+állapota változott, de azt nem, hogy mire (az e-invoice.be `document.sent.failed` eseménye, vagy
+egy nem Peppol csatornás Recommand-esemény), státuszlekérdezést ütemez minden általa megnevezett
+`pending` dokumentumra, ugyanazon `status.max_attempts` kereten belül; ha a keret elfogyott, vagy
+`sync` queue-kapcsolaton, nem történik lekérdezés, és a sor `pending` marad, ahogy az utolsó
+rendes státuszlekérdezés után is, ezért ellenőrizd az access pointnál.
 
 **Védd az útvonalat.** Saját sebességkorlátja és törzsméret-korlátja nincs. Adj meg throttle-t az
 `einvoicing.webhooks.middleware` beállításban, például `['throttle:120,1']`, a kérés törzsének

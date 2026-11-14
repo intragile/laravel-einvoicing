@@ -17,7 +17,14 @@ use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Model\Invoice;
+use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
+use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterTransport;
+use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterWebhook;
+use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeConfig;
+use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeTransport;
+use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeWebhook;
 use IntrAgile\EInvoicing\Transport\FakeTransport;
+use IntrAgile\EInvoicing\Transport\Http\ApiKey;
 use IntrAgile\EInvoicing\Transport\Http\HttpClient;
 use IntrAgile\EInvoicing\Transport\InboundSource;
 use IntrAgile\EInvoicing\Transport\OutboundDocument;
@@ -26,6 +33,7 @@ use IntrAgile\EInvoicing\Transport\Recommand\RecommandTransport;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandWebhook;
 use IntrAgile\EInvoicing\Transport\Transport;
 use IntrAgile\EInvoicing\Transport\ValidatingTransport;
+use IntrAgile\EInvoicing\Transport\Webhook\WebhookParser;
 use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
 use IntrAgile\EInvoicing\Validation\FacturX\FacturXValidator;
@@ -35,7 +43,9 @@ use InvalidArgumentException;
 use SensitiveParameter;
 
 /**
- * Builds the transports named in the einvoicing configuration.
+ * Builds the transports named in the einvoicing configuration, with the built-in Recommand,
+ * B2Brouter and e-invoice.be drivers or with drivers registered with extend(), and their webhook
+ * parsers.
  *
  * Transports are built on first use and cached per name. When validation is enabled, every
  * transport, custom drivers included, is wrapped in a ValidatingTransport with the document
@@ -50,13 +60,31 @@ use SensitiveParameter;
  */
 final class EInvoicingManager
 {
-    private const BUILT_IN_DRIVER = 'recommand';
+    /** The drivers that come with the package. */
+    public const BUILT_IN_DRIVERS = ['recommand', 'b2brouter', 'einvoicebe'];
+
+    /**
+     * Settings each built-in driver cannot be built without.
+     *
+     * @var array<string, list<string>>
+     */
+    public const REQUIRED_KEYS = [
+        'recommand' => ['api_key_id', 'secret', 'company_id'],
+        'b2brouter' => ['api_key', 'account_id'],
+        'einvoicebe' => ['api_key'],
+    ];
+
+    /** Longest webhook timestamp tolerance accepted, one year in seconds. */
+    private const MAX_WEBHOOK_TOLERANCE = 31_536_000;
 
     /** @var Closure(): Application */
     private readonly Closure $app;
 
     /** @var array<string, Closure> registered factories; their return type is checked when called */
     private array $drivers = [];
+
+    /** @var array<string, Closure> registered webhook parser factories; their return type is checked when called */
+    private array $webhookParsers = [];
 
     /** @var array<string, Transport> unwrapped drivers by transport name */
     private array $built = [];
@@ -204,37 +232,83 @@ final class EInvoicingManager
     }
 
     /**
-     * The webhook verifier of a Recommand transport. It reads the configuration even while the
-     * transports are faked, so signatures are checked as in production.
+     * The webhook parser of the transport with this name: the one of its built-in driver, or the
+     * one registered for its driver with extendWebhook(). Every driver needs a webhook secret. It
+     * reads the configuration even while the transports are faked, so signatures are checked as
+     * in production.
      *
-     * @throws ConfigurationException when the transport is not a Recommand transport with a webhook secret
+     * @throws ConfigurationException when the transport has no webhook parser or no webhook
+     *                                secret, or a webhook setting is invalid
      */
-    public function webhook(string $name): RecommandWebhook
+    public function webhook(string $name): WebhookParser
     {
         $config = $this->transportConfig($name);
-        if (($config['driver'] ?? null) !== self::BUILT_IN_DRIVER) {
+        $driver = $config['driver'] ?? null;
+        $factory = is_string($driver) ? ($this->webhookParsers[$driver] ?? null) : null;
+        if ($factory === null && ! in_array($driver, self::BUILT_IN_DRIVERS, true)) {
             throw new ConfigurationException(sprintf(
-                'Webhooks need the "%s" driver in einvoicing.transports.%s.driver.',
-                self::BUILT_IN_DRIVER,
+                'Webhooks need a built-in driver (%s) or a parser registered with extendWebhook() for einvoicing.transports.%s.driver.',
+                implode(', ', self::BUILT_IN_DRIVERS),
                 $name,
             ));
         }
+        $secret = $this->requiredString($config, $name, 'webhook_secret');
 
-        return new RecommandWebhook($this->requiredString($config, $name, 'webhook_secret'));
+        if ($factory !== null) {
+            return $this->customWebhook($name, $factory, $config);
+        }
+
+        try {
+            return match ($driver) {
+                'b2brouter' => new B2BrouterWebhook($secret, $this->webhookTolerance($config, $name)),
+                'einvoicebe' => new EInvoiceBeWebhook($secret),
+                default => new RecommandWebhook($secret),
+            };
+        } catch (InvalidArgumentException) {
+            // The settings were checked above; the core message is not repeated in any case.
+            throw new ConfigurationException(sprintf('einvoicing.transports.%s.webhook_secret is invalid.', $name));
+        }
     }
 
     /**
-     * The company id configured for the transport with this name, or null when there is none.
+     * The provider account configured for the transport with this name, which webhook events
+     * are matched against: the Recommand company id, the B2Brouter account id or the e-invoice.be
+     * tenant id. Null when there is none, the setting is invalid, or the driver is not built in.
      */
-    public function companyId(string $name): ?string
+    public function accountId(string $name): ?string
     {
         try {
-            $companyId = $this->transportConfig($name)['company_id'] ?? null;
+            $config = $this->transportConfig($name);
         } catch (ConfigurationException) {
             return null;
         }
 
-        return is_string($companyId) && trim($companyId) !== '' ? $companyId : null;
+        return match ($config['driver'] ?? null) {
+            'recommand' => self::nonBlank($config['company_id'] ?? null),
+            'b2brouter' => $this->b2brouterAccount($config['account_id'] ?? null),
+            'einvoicebe' => self::nonBlank($config['tenant_id'] ?? null),
+            default => null,
+        };
+    }
+
+    /**
+     * The core configuration of a transport with a built-in driver, checked as when the transport
+     * is built, but without building it or making a request; null for a custom driver.
+     *
+     * @internal used by einvoicing:doctor
+     *
+     * @throws ConfigurationException when a setting is missing or invalid, naming its key and never its value
+     */
+    public function driverConfig(string $name): RecommandConfig|B2BrouterConfig|EInvoiceBeConfig|null
+    {
+        $config = $this->transportConfig($name);
+
+        return match ($config['driver'] ?? null) {
+            'recommand' => $this->recommandConfig($name, $config),
+            'b2brouter' => $this->b2brouterConfig($name, $config),
+            'einvoicebe' => $this->einvoicebeConfig($name, $config),
+            default => null,
+        };
     }
 
     /**
@@ -253,11 +327,24 @@ final class EInvoicingManager
     }
 
     /**
-     * Whether a transport can be built with this driver: the built-in one or a registered one.
+     * Registers the webhook parser of a driver. The factory receives the application and the
+     * transport's configuration array, whose webhook_secret is set, and returns the parser. Mark
+     * the factory's configuration parameter #[\SensitiveParameter] so its secrets stay out of
+     * stack traces. A parser registered for a built-in driver replaces the built-in one.
+     *
+     * @param  Closure(Application, array<string, mixed>): WebhookParser  $factory
+     */
+    public function extendWebhook(string $driver, Closure $factory): void
+    {
+        $this->webhookParsers[$driver] = $factory;
+    }
+
+    /**
+     * Whether a transport can be built with this driver: a built-in one or a registered one.
      */
     public function hasDriver(string $driver): bool
     {
-        return $driver === self::BUILT_IN_DRIVER || isset($this->drivers[$driver]);
+        return in_array($driver, self::BUILT_IN_DRIVERS, true) || isset($this->drivers[$driver]);
     }
 
     /**
@@ -314,6 +401,7 @@ final class EInvoicingManager
             'transports' => $this->names(),
             'built' => array_keys($this->transports),
             'customDrivers' => array_keys($this->drivers),
+            'customWebhookParsers' => array_keys($this->webhookParsers),
             'faked' => $this->fake !== null,
         ];
     }
@@ -334,14 +422,17 @@ final class EInvoicingManager
 
         if (is_string($driver) && isset($this->drivers[$driver])) {
             $transport = $this->custom($name, $this->drivers[$driver], $config);
-        } elseif ($driver === self::BUILT_IN_DRIVER) {
-            $transport = $this->recommand($name, $config);
         } else {
-            throw new ConfigurationException(sprintf(
-                'einvoicing.transports.%s.driver names no known driver; use "%s" or register one with extend().',
-                $name,
-                self::BUILT_IN_DRIVER,
-            ));
+            $transport = match ($driver) {
+                'recommand' => new RecommandTransport($this->recommandConfig($name, $config), $this->httpClient()),
+                'b2brouter' => new B2BrouterTransport($this->b2brouterConfig($name, $config), $this->httpClient()),
+                'einvoicebe' => new EInvoiceBeTransport($this->einvoicebeConfig($name, $config), $this->httpClient()),
+                default => throw new ConfigurationException(sprintf(
+                    'einvoicing.transports.%s.driver names no known driver; use "%s" or register one with extend().',
+                    $name,
+                    implode('", "', self::BUILT_IN_DRIVERS),
+                )),
+            };
         }
 
         return $this->built[$name] = $transport;
@@ -370,31 +461,122 @@ final class EInvoicingManager
     }
 
     /**
+     * Builds a webhook parser with a registered factory, whose return value is checked.
+     *
+     * @param  Closure(Application, array<string, mixed>): mixed  $factory
      * @param  array<string, mixed>  $config
      *
      * @throws ConfigurationException
      */
-    private function recommand(string $name, #[SensitiveParameter] array $config): RecommandTransport
+    private function customWebhook(string $name, Closure $factory, #[SensitiveParameter] array $config): WebhookParser
+    {
+        $parser = $factory(($this->app)(), $config);
+        if (! $parser instanceof WebhookParser) {
+            throw new ConfigurationException(sprintf(
+                'The webhook parser factory of the driver in einvoicing.transports.%s.driver must return a %s.',
+                $name,
+                WebhookParser::class,
+            ));
+        }
+
+        return $parser;
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException
+     */
+    private function recommandConfig(string $name, #[SensitiveParameter] array $config): RecommandConfig
     {
         $apiKeyId = $this->credential($config, $name, 'api_key_id');
         $secret = $this->credential($config, $name, 'secret');
         $companyId = $this->requiredString($config, $name, 'company_id');
+        $baseUrl = $this->baseUrl($config, $name, RecommandConfig::DEFAULT_BASE_URL);
 
-        $baseUrl = $config['base_url'] ?? null;
-        if ($baseUrl === null || $baseUrl === '') {
-            $baseUrl = RecommandConfig::DEFAULT_BASE_URL;
-        }
-        if (! is_string($baseUrl)) {
+        try {
+            return new RecommandConfig($apiKeyId, $secret, $companyId, $baseUrl);
+        } catch (InvalidArgumentException) {
+            // The other settings were checked above. The core message repeats the URL, which may
+            // carry credentials; name the key only.
             throw self::invalidBaseUrl($name);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException
+     */
+    private function b2brouterConfig(string $name, #[SensitiveParameter] array $config): B2BrouterConfig
+    {
+        $apiKey = $this->credential($config, $name, 'api_key');
+        $accountId = $config['account_id'] ?? null;
+        if ($accountId === null || (is_string($accountId) && trim($accountId) === '')) {
+            throw self::missing($name, 'account_id');
+        }
+        $accountId = self::accountNumber($accountId) ?? throw new ConfigurationException(sprintf(
+            'einvoicing.transports.%s.account_id must be the B2Brouter account id, a positive whole number.',
+            $name,
+        ));
+        $baseUrl = $this->baseUrl($config, $name, B2BrouterConfig::DEFAULT_BASE_URL);
+        $codes = $config['document_type_codes'] ?? [];
+        if (! is_array($codes)) {
+            throw self::invalidDocumentTypeCodes($name);
+        }
+        $typed = [];
+        foreach ($codes as $documentType => $code) {
+            if (! is_string($documentType) || ! is_string($code)) {
+                throw self::invalidDocumentTypeCodes($name);
+            }
+            $typed[$documentType] = $code;
+        }
+
+        // Built without the codes first, so a refusal is attributed to the right setting.
+        try {
+            $b2brouterConfig = new B2BrouterConfig($apiKey, $accountId, $baseUrl);
+        } catch (InvalidArgumentException) {
+            throw self::invalidBaseUrl($name);
+        }
+        if ($typed === []) {
+            return $b2brouterConfig;
         }
 
         try {
-            $recommandConfig = new RecommandConfig($apiKeyId, $secret, $companyId, $baseUrl);
+            return new B2BrouterConfig($apiKey, $accountId, $baseUrl, $typed);
         } catch (InvalidArgumentException) {
-            // The core message repeats the URL, which may carry credentials; name the key only.
+            throw self::invalidDocumentTypeCodes($name);
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException
+     */
+    private function einvoicebeConfig(string $name, #[SensitiveParameter] array $config): EInvoiceBeConfig
+    {
+        $apiKey = $this->credential($config, $name, 'api_key');
+        $baseUrl = $this->baseUrl($config, $name, EInvoiceBeConfig::DEFAULT_BASE_URL);
+        $lookbackDays = ConfigValue::integer($config['inbound_lookback_days'] ?? 7, "einvoicing.transports.{$name}.inbound_lookback_days", 1, 365);
+        $maxPages = ConfigValue::integer($config['inbound_max_pages'] ?? 10, "einvoicing.transports.{$name}.inbound_max_pages", 1, 100);
+
+        try {
+            return new EInvoiceBeConfig($apiKey, $baseUrl, $lookbackDays, $maxPages);
+        } catch (InvalidArgumentException) {
             throw self::invalidBaseUrl($name);
         }
+    }
 
+    /**
+     * The HTTP client every built-in driver sends through. It never follows a redirect: the
+     * drivers follow the ones they trust themselves. It carries no secrets; each transport adds
+     * its own.
+     *
+     * @throws ConfigurationException when an einvoicing.http setting is invalid
+     */
+    private function httpClient(): HttpClient
+    {
         $factory = new HttpFactory;
         $client = new Client([
             'timeout' => $this->number('einvoicing.http.timeout', 60),
@@ -408,7 +590,66 @@ final class EInvoicingManager
             throw new ConfigurationException('einvoicing.http.max_response_bytes must be a positive integer.');
         }
 
-        return new RecommandTransport($recommandConfig, new HttpClient($client, $factory, $factory, $maxBytes));
+        return new HttpClient($client, $factory, $factory, $maxBytes);
+    }
+
+    /**
+     * The webhook timestamp tolerance in seconds, or null when none is set.
+     *
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException when it is not a whole number of seconds within a year
+     */
+    private function webhookTolerance(array $config, string $name): ?int
+    {
+        $tolerance = $config['webhook_tolerance'] ?? null;
+        if ($tolerance === null || $tolerance === '') {
+            return null;
+        }
+
+        return ConfigValue::integer($tolerance, "einvoicing.transports.{$name}.webhook_tolerance", 1, self::MAX_WEBHOOK_TOLERANCE);
+    }
+
+    /**
+     * The configured B2Brouter account id in the form webhook events carry it, or null.
+     */
+    private function b2brouterAccount(mixed $accountId): ?string
+    {
+        $number = self::accountNumber($accountId);
+
+        return $number === null ? null : (string) $number;
+    }
+
+    /**
+     * A positive whole number, given as a number or a numeric string, or null.
+     */
+    private static function accountNumber(mixed $value): ?int
+    {
+        try {
+            return ConfigValue::integer($value, 'account_id', 1, PHP_INT_MAX);
+        } catch (ConfigurationException) {
+            return null;
+        }
+    }
+
+    /**
+     * The base URL, or the driver's default when it is not set.
+     *
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException when it is set but not a string
+     */
+    private function baseUrl(#[SensitiveParameter] array $config, string $name, string $default): string
+    {
+        $baseUrl = $config['base_url'] ?? null;
+        if ($baseUrl === null || $baseUrl === '') {
+            return $default;
+        }
+        if (! is_string($baseUrl)) {
+            throw self::invalidBaseUrl($name);
+        }
+
+        return $baseUrl;
     }
 
     /**
@@ -440,18 +681,14 @@ final class EInvoicingManager
     {
         $value = $config[$key] ?? null;
         if (! is_string($value) || trim($value) === '') {
-            throw new ConfigurationException(sprintf(
-                'einvoicing.transports.%s.%s is missing or empty.',
-                $name,
-                $key,
-            ));
+            throw self::missing($name, $key);
         }
 
         return $value;
     }
 
     /**
-     * A credential of the built-in driver, required and at least as long as the driver accepts.
+     * A credential of a built-in driver, required and at least as long as the drivers accept.
      *
      * @param  array<string, mixed>  $config
      *
@@ -460,12 +697,12 @@ final class EInvoicingManager
     private function credential(#[SensitiveParameter] array $config, string $name, string $key): string
     {
         $value = $this->requiredString($config, $name, $key);
-        if (strlen(trim($value)) < RecommandConfig::MIN_CREDENTIAL_LENGTH) {
+        if (strlen(trim($value)) < ApiKey::MIN_LENGTH) {
             throw new ConfigurationException(sprintf(
                 'einvoicing.transports.%s.%s must be at least %d characters long.',
                 $name,
                 $key,
-                RecommandConfig::MIN_CREDENTIAL_LENGTH,
+                ApiKey::MIN_LENGTH,
             ));
         }
 
@@ -495,6 +732,24 @@ final class EInvoicingManager
     private function config(): Repository
     {
         return ($this->app)()->make(Repository::class);
+    }
+
+    private static function nonBlank(mixed $value): ?string
+    {
+        return is_string($value) && trim($value) !== '' ? $value : null;
+    }
+
+    private static function missing(string $name, string $key): ConfigurationException
+    {
+        return new ConfigurationException(sprintf('einvoicing.transports.%s.%s is missing or empty.', $name, $key));
+    }
+
+    private static function invalidDocumentTypeCodes(string $name): ConfigurationException
+    {
+        return new ConfigurationException(sprintf(
+            'einvoicing.transports.%s.document_type_codes must map Peppol document type identifiers to B2Brouter document type codes of 3 to 100 characters of a-z, 0-9, "." and "_".',
+            $name,
+        ));
     }
 
     private static function invalidBaseUrl(string $name): ConfigurationException

@@ -87,6 +87,78 @@ RECOMMAND_WEBHOOK_SECRET=...            # only when you receive webhooks
 # EINVOICING_QUEUE=einvoicing
 ```
 
+Each access point is one entry in `einvoicing.transports`, with one of the built-in drivers
+`recommand`, `b2brouter` or `einvoicebe`. The published config file holds the `recommand` entry;
+the other two are in it commented out, because `einvoicing:doctor` checks every listed transport.
+Uncomment the ones you use and point `EINVOICING_TRANSPORT` at the default one.
+
+**B2Brouter** (`driver` `b2brouter`):
+
+```php
+// config/einvoicing.php
+return [
+    // ...
+    'transports' => [
+        'b2brouter' => [
+            'driver' => 'b2brouter',
+            'api_key' => env('B2BROUTER_API_KEY'),
+            'account_id' => env('B2BROUTER_ACCOUNT_ID'),
+            'base_url' => env('B2BROUTER_BASE_URL', 'https://api.b2brouter.net'),
+            'document_type_codes' => [],
+            'webhook_secret' => env('B2BROUTER_WEBHOOK_SECRET'),
+            'webhook_tolerance' => null,
+        ],
+    ],
+];
+```
+
+```dotenv
+B2BROUTER_API_KEY=...                   # a key starting with test_ goes to the sandbox
+B2BROUTER_ACCOUNT_ID=12345              # the account that sends and receives
+B2BROUTER_WEBHOOK_SECRET=...            # only when you receive webhooks
+# B2BROUTER_BASE_URL=https://api.b2brouter.net
+```
+
+B2Brouter sends a key starting with `test_` to its sandbox, which never reaches the Peppol
+network; the doctor shows a warning for it. `account_id` is a positive whole number.
+`document_type_codes` maps further Peppol document type identifiers to B2Brouter document type
+codes; Peppol BIS Billing 3.0 invoices and credit notes need none. `webhook_tolerance`, in
+seconds, refuses notifications whose signed timestamp is further from now; it is off (`null`) by
+default, because B2Brouter retries a notification for about a week.
+
+**e-invoice.be** (`driver` `einvoicebe`):
+
+```php
+// config/einvoicing.php
+return [
+    // ...
+    'transports' => [
+        'einvoicebe' => [
+            'driver' => 'einvoicebe',
+            'api_key' => env('EINVOICEBE_API_KEY'),
+            'base_url' => env('EINVOICEBE_BASE_URL', 'https://api.e-invoice.be'),
+            'tenant_id' => env('EINVOICEBE_TENANT_ID'),
+            'inbound_lookback_days' => 7,
+            'inbound_max_pages' => 10,
+            'webhook_secret' => env('EINVOICEBE_WEBHOOK_SECRET'),
+        ],
+    ],
+];
+```
+
+```dotenv
+EINVOICEBE_API_KEY=...
+EINVOICEBE_WEBHOOK_SECRET=...           # only when you receive webhooks
+# EINVOICEBE_TENANT_ID=...              # drops webhook notifications of other tenants
+# EINVOICEBE_BASE_URL=https://api.e-invoice.be
+```
+
+e-invoice.be has no call to acknowledge a received document, so acknowledgement is local only:
+a document stays in its inbox and each poll lists the last `inbound_lookback_days` days (1 to
+365), at most `inbound_max_pages` pages of 100 (1 to 100); the package stores and fetches each
+document once. With `tenant_id` set, webhook notifications naming another tenant are ignored;
+without it, every signed notification is applied.
+
 The rest of `config/einvoicing.php`: HTTP timeouts and the response size cap (`http`),
 validation on or off (`validation.enabled`), send retries (`sending.max_attempts`,
 `sending.backoff`), status polling (`status.poll`, `status.delays`, `status.max_attempts`),
@@ -94,8 +166,8 @@ inbound acknowledgement and the inbound attempt budget (`inbound.acknowledge`,
 `inbound.max_fetch_attempts`) and the webhook route (`webhooks`). In every list of delays the
 last value repeats. Numbers may be given as numeric strings, as environment variables deliver
 them; anything else is refused with an error that names the key. `webhooks.enabled` also takes
-the strings `"true"`/`"false"` and `"1"`/`"0"`. The Recommand API key id and secret must each be
-at least 8 characters long.
+the strings `"true"`/`"false"` and `"1"`/`"0"`. API keys, and the Recommand API key id and
+secret, must each be at least 8 characters long.
 
 A transport is built on first use, so missing credentials never break application boot.
 Secrets never appear in exception messages, doctor output, events or queued job payloads; jobs
@@ -240,7 +312,7 @@ killed at its timeout, which needs `pcntl` (see [Queues](#queues)).
 | `DocumentFailed` | the document was definitely not delivered |
 | `DocumentUnconfirmed` | the outcome of the send is unknown; an operator must resolve it |
 | `DocumentReceived` | an inbound document is stored (`$event->message->xml`) |
-| `WebhookReceived` | a signed webhook for this company was verified, before it is applied (repeated deliveries fire it again) |
+| `WebhookReceived` | a signed webhook for this provider account was verified, before it is applied (repeated deliveries fire it again; `$event->event->deduplicationKey` identifies one delivery) |
 
 All are in `IntrAgile\EInvoicing\Laravel\Events`; the document events carry the
 `OutboundMessage` or `InboundMessage` model as `$message`.
@@ -314,7 +386,8 @@ webhooks.
 
 The package registers one route, `POST /einvoicing/webhooks/{transport}` (route name
 `einvoicing.webhook`), for every transport name. It accepts notifications only for a transport
-with the `recommand` driver and a `webhook_secret`; any other name gets `404`. Setup:
+with a built-in driver (or a custom driver with a parser registered with
+`EInvoicing::extendWebhook()`) and a `webhook_secret`; any other name gets `404`. Setup:
 
 1. Run `php artisan einvoicing:doctor`. The `transport <name>: webhook` row prints the full URL
    when the transport has a webhook secret and webhooks are enabled; otherwise it shows a
@@ -324,12 +397,17 @@ with the `recommand` driver and a `webhook_secret`; any other name gets `404`. S
 3. Nothing else: the route does not run the `web` middleware group, so no CSRF token or
    session is involved, and you need no CSRF exception.
 
-The signature (`X-Signature`, HMAC-SHA256) is checked on the raw body exactly as received.
+The driver's parser checks the signature (HMAC-SHA256) on the raw body exactly as received.
 Answers have an empty body: `401` for a missing or wrong signature, `404` for a transport
 without a webhook secret, `204` for everything else, including notifications that are ignored
-(another company, an unknown document, a non-document event), so Recommand does not retry
-them. Repeated or out-of-order notifications are harmless: inbound documents are stored once
-per id, and `delivered` and `failed` never change again.
+(another provider account, an unknown document, a non-document event), so the access point does
+not retry them. Repeated or out-of-order notifications are harmless: inbound documents are
+stored once per id, and `delivered` and `failed` never change again. A notification that says a
+delivery changed without saying how (e-invoice.be's `document.sent.failed`, or a Recommand
+event of a non-Peppol channel) schedules a status poll for each `pending` document it names,
+within the same `status.max_attempts` checks; once those are used up, or on a `sync` queue
+connection, nothing is polled and the row stays `pending`, as after the last regular status
+poll, so check it at the access point.
 
 **Harden the endpoint.** The route has no rate limit and no body size limit of its own. Add a
 throttle in `einvoicing.webhooks.middleware`, for example `['throttle:120,1']`, and cap the

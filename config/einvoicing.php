@@ -20,10 +20,13 @@ return [
     | Transports
     |--------------------------------------------------------------------------
     |
-    | Named connections to a network. The built-in "recommand" driver talks to
-    | the Recommand Peppol access point; further drivers can be registered with
+    | Named connections to a network. The built-in drivers talk to Peppol
+    | access points: "recommand" (Recommand), "b2brouter" (B2Brouter) and
+    | "einvoicebe" (e-invoice.be). Further drivers can be registered with
     | EInvoicing::extend(). A transport is built on first use, so missing
-    | credentials never break application boot.
+    | credentials never break application boot. Uncomment the transport of
+    | each access point you use; einvoicing:doctor checks every transport
+    | listed here.
     |
     */
 
@@ -36,6 +39,38 @@ return [
             'base_url' => env('RECOMMAND_BASE_URL', 'https://app.recommand.eu'),
             'webhook_secret' => env('RECOMMAND_WEBHOOK_SECRET'),
         ],
+
+        // B2Brouter. A key starting with "test_" is routed to the B2Brouter
+        // sandbox. document_type_codes maps further Peppol document type
+        // identifiers to B2Brouter codes; BIS Billing 3.0 invoices and credit
+        // notes need none. webhook_tolerance (seconds, or null) refuses
+        // notifications whose signed timestamp is further off; B2Brouter
+        // retries for about a week, so leave it null unless replays matter more.
+        //
+        // 'b2brouter' => [
+        //     'driver' => 'b2brouter',
+        //     'api_key' => env('B2BROUTER_API_KEY'),
+        //     'account_id' => env('B2BROUTER_ACCOUNT_ID'),
+        //     'base_url' => env('B2BROUTER_BASE_URL', 'https://api.b2brouter.net'),
+        //     'document_type_codes' => [],
+        //     'webhook_secret' => env('B2BROUTER_WEBHOOK_SECRET'),
+        //     'webhook_tolerance' => null,
+        // ],
+
+        // e-invoice.be. It has no acknowledgement call: received documents
+        // are listed for inbound_lookback_days (1 to 365), reading at most
+        // inbound_max_pages pages of 100 (1 to 100) per poll, and stored once.
+        // tenant_id, when set, drops webhook notifications of other tenants.
+        //
+        // 'einvoicebe' => [
+        //     'driver' => 'einvoicebe',
+        //     'api_key' => env('EINVOICEBE_API_KEY'),
+        //     'base_url' => env('EINVOICEBE_BASE_URL', 'https://api.e-invoice.be'),
+        //     'tenant_id' => env('EINVOICEBE_TENANT_ID'),
+        //     'inbound_lookback_days' => 7,
+        //     'inbound_max_pages' => 10,
+        //     'webhook_secret' => env('EINVOICEBE_WEBHOOK_SECRET'),
+        // ],
     ],
 
     /*
@@ -141,9 +176,11 @@ return [
     |--------------------------------------------------------------------------
     |
     | The route POST {prefix}/{transport} receives signed notifications for
-    | transports that have a webhook secret. It never runs the "web"
-    | middleware group, so no session or CSRF token is involved. "enabled"
-    | also accepts the strings "true"/"false" and "1"/"0" from the environment.
+    | transports that have a webhook secret, with any built-in driver or a
+    | driver whose parser is registered with EInvoicing::extendWebhook(). It
+    | never runs the "web" middleware group, so no session or CSRF token is
+    | involved. "enabled" also accepts the strings "true"/"false" and "1"/"0"
+    | from the environment.
     |
     */
 

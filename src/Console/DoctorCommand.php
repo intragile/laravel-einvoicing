@@ -17,6 +17,8 @@ use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
+use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeConfig;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
 use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
@@ -46,13 +48,19 @@ final class DoctorCommand extends Command
 
     private const FAIL = 'fail';
 
-    private const BUILT_IN_DRIVER = 'recommand';
+    /** What the config row of each built-in driver confirms. */
+    private const CONFIG_SUMMARIES = [
+        'recommand' => 'API key id, secret and company id set',
+        'b2brouter' => 'API key and account id set',
+        'einvoicebe' => 'API key set',
+    ];
 
-    /** Settings of the built-in driver without which it cannot be built. */
-    private const REQUIRED_KEYS = ['api_key_id', 'secret', 'company_id'];
-
-    /** Credentials of the built-in driver, which must have a minimum length. */
-    private const CREDENTIAL_KEYS = ['api_key_id', 'secret'];
+    /** The base URL each built-in driver uses when none is configured. */
+    private const DEFAULT_BASE_URLS = [
+        'recommand' => RecommandConfig::DEFAULT_BASE_URL,
+        'b2brouter' => B2BrouterConfig::DEFAULT_BASE_URL,
+        'einvoicebe' => EInvoiceBeConfig::DEFAULT_BASE_URL,
+    ];
 
     /**
      * Stand-in credentials for checking a base URL on its own; the configured ones are checked
@@ -73,7 +81,7 @@ final class DoctorCommand extends Command
     ];
 
     /** Settings that are never printed. */
-    private const SECRET_KEYS = ['api_key_id', 'secret', 'webhook_secret'];
+    private const SECRET_KEYS = ['api_key_id', 'secret', 'api_key', 'webhook_secret'];
 
     /** @var list<array{string, string, string}> */
     private array $rows = [];
@@ -146,57 +154,80 @@ final class DoctorCommand extends Command
             $this->row("{$check}: config", self::FAIL, sprintf(
                 'einvoicing.transports.%s.driver names no known driver; use "%s" or register one with extend()',
                 $name,
-                self::BUILT_IN_DRIVER,
+                implode('", "', EInvoicingManager::BUILT_IN_DRIVERS),
             ));
 
             return;
         }
-        if ($driver !== self::BUILT_IN_DRIVER) {
+        if (! in_array($driver, EInvoicingManager::BUILT_IN_DRIVERS, true)) {
             $this->row("{$check}: config", self::OK, sprintf('custom driver "%s"; its settings are checked by its factory', $driver));
 
             return;
         }
 
+        $this->checkDriverConfig($manager, $name, $driver, $config);
+        $this->checkBaseUrl($name, $driver, $config['base_url'] ?? null);
+        $this->checkWebhook($manager, $name, $config);
+        if ($driver === 'einvoicebe') {
+            $this->row("{$check}: acknowledge", self::OK, 'local only: e-invoice.be has no acknowledgement call, so a received '
+                .'document stays listed for inbound_lookback_days; it is stored and fetched once');
+        }
+    }
+
+    /**
+     * The config row of a built-in driver: every missing setting by name, else the first invalid
+     * one as the manager reports it when building the transport. The values are never printed.
+     *
+     * @param  array<array-key, mixed>  $config
+     */
+    private function checkDriverConfig(EInvoicingManager $manager, string $name, string $driver, #[SensitiveParameter] array $config): void
+    {
+        $check = "transport {$name}";
         $missing = array_values(array_filter(
-            self::REQUIRED_KEYS,
-            static fn (string $key): bool => ! self::filled($config[$key] ?? null),
-        ));
-        $short = array_values(array_filter(
-            self::CREDENTIAL_KEYS,
-            static fn (string $key): bool => self::filled($config[$key] ?? null)
-                && strlen(trim($config[$key])) < RecommandConfig::MIN_CREDENTIAL_LENGTH,
+            EInvoicingManager::REQUIRED_KEYS[$driver] ?? [],
+            static fn (string $key): bool => ! self::present($config[$key] ?? null),
         ));
         if ($missing !== []) {
             $this->row("{$check}: config", self::FAIL, 'missing or empty: '.self::keyPaths($name, $missing));
-        } elseif ($short !== []) {
-            $this->row("{$check}: config", self::FAIL, sprintf(
-                'shorter than %d characters: %s',
-                RecommandConfig::MIN_CREDENTIAL_LENGTH,
-                self::keyPaths($name, $short),
-            ));
-        } else {
-            $this->row("{$check}: config", self::OK, 'API key id, secret and company id set');
-        }
-
-        $this->checkBaseUrl($name, $config['base_url'] ?? null);
-        $this->checkWebhook($name, $config);
-    }
-
-    private function checkBaseUrl(string $name, #[SensitiveParameter] mixed $baseUrl): void
-    {
-        $check = "transport {$name}: base URL";
-        if ($baseUrl === null || $baseUrl === '') {
-            $this->row($check, self::OK, 'default '.RecommandConfig::DEFAULT_BASE_URL);
 
             return;
         }
 
-        // The URL itself is never printed: it may carry credentials as user info.
+        try {
+            $driverConfig = $manager->driverConfig($name);
+        } catch (ConfigurationException $exception) {
+            $this->row("{$check}: config", self::FAIL, $this->describe($exception, withClass: false));
+
+            return;
+        }
+        $this->row("{$check}: config", self::OK, self::CONFIG_SUMMARIES[$driver] ?? 'set');
+
+        if ($driverConfig instanceof B2BrouterConfig && $driverConfig->isSandboxKey()) {
+            $this->row("{$check}: sandbox", self::WARN, 'the API key starts with "test_", so B2Brouter routes every request to '
+                .'its sandbox: nothing reaches the Peppol network');
+        }
+    }
+
+    private function checkBaseUrl(string $name, string $driver, #[SensitiveParameter] mixed $baseUrl): void
+    {
+        $check = "transport {$name}: base URL";
+        if ($baseUrl === null || $baseUrl === '') {
+            $this->row($check, self::OK, 'default '.(self::DEFAULT_BASE_URLS[$driver] ?? ''));
+
+            return;
+        }
+
+        // The URL itself is never printed: it may carry credentials as user info. It is checked by
+        // the driver's own configuration, with stand-in credentials.
         try {
             if (! is_string($baseUrl)) {
                 throw new InvalidArgumentException('The base URL is not a string.');
             }
-            new RecommandConfig(self::PLACEHOLDER_KEY_ID, self::PLACEHOLDER_SECRET, 'placeholder-company', $baseUrl);
+            match ($driver) {
+                'b2brouter' => new B2BrouterConfig(self::PLACEHOLDER_SECRET, 1, $baseUrl),
+                'einvoicebe' => new EInvoiceBeConfig(self::PLACEHOLDER_SECRET, $baseUrl),
+                default => new RecommandConfig(self::PLACEHOLDER_KEY_ID, self::PLACEHOLDER_SECRET, 'placeholder-company', $baseUrl),
+            };
             $this->row($check, self::OK, 'https');
         } catch (InvalidArgumentException) {
             $this->row($check, self::FAIL, sprintf(
@@ -209,7 +240,7 @@ final class DoctorCommand extends Command
     /**
      * @param  array<array-key, mixed>  $config
      */
-    private function checkWebhook(string $name, #[SensitiveParameter] array $config): void
+    private function checkWebhook(EInvoicingManager $manager, string $name, #[SensitiveParameter] array $config): void
     {
         $check = "transport {$name}: webhook";
         if (! self::filled($config['webhook_secret'] ?? null)) {
@@ -217,7 +248,15 @@ final class DoctorCommand extends Command
 
             return;
         }
-        // A missing company id already fails the config row of the built-in driver.
+        // The parser checks the webhook settings; building it makes no request.
+        try {
+            $manager->webhook($name);
+        } catch (ConfigurationException $exception) {
+            $this->row($check, self::FAIL, $this->describe($exception, withClass: false));
+
+            return;
+        }
+        // A missing account id already fails the config row of a driver that requires one.
         if (! Route::has('einvoicing.webhook')) {
             $this->row($check, self::WARN, 'einvoicing.webhooks.enabled is off, so no webhook route exists; schedule einvoicing:poll-inbound');
 
@@ -550,6 +589,14 @@ final class DoctorCommand extends Command
             static fn (string $key): string => "einvoicing.transports.{$name}.{$key}",
             $keys,
         ));
+    }
+
+    /**
+     * Whether a setting is given: a number, or a string that is not blank.
+     */
+    private static function present(#[SensitiveParameter] mixed $value): bool
+    {
+        return is_int($value) || is_float($value) || self::filled($value);
     }
 
     /**
