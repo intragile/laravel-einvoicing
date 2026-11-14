@@ -23,6 +23,11 @@ use IntrAgile\EInvoicing\Transport\Exception\UnexpectedResponse;
  * for a missing or wrong signature, and 204 otherwise, also for notifications that are ignored,
  * so the sender does not retry them. Repeated deliveries are harmless: inbound documents are
  * stored once per id and delivery states only move a pending document.
+ *
+ * A delivery status that arrives before the send job has stored the provider document id finds
+ * no row and is dropped; the status polls recover it, except on a synchronous queue connection,
+ * which schedules no polls. On the sync connection the fetch and acknowledgement of a received
+ * document run inside this request, so an error there answers with 500.
  */
 final class WebhookController
 {

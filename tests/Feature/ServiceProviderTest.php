@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
 use Illuminate\Foundation\Application;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
@@ -62,6 +63,36 @@ final class ServiceProviderTest extends TestCase
     {
         $app['config']->set('einvoicing.webhooks.prefix', 'hooks/peppol');
         $app['config']->set('einvoicing.webhooks.middleware', ['throttle:60,1']);
+    }
+
+    public function test_boot_stays_lazy_after_routes_and_commands(): void
+    {
+        $manager = EInvoicing::getFacadeRoot();
+        $commands = array_keys(Artisan::all());
+
+        // Routes and commands are registered, yet nothing is built and no database is opened.
+        self::assertNotNull(Route::getRoutes()->getByName('einvoicing.webhook'));
+        foreach (['einvoicing:doctor', 'einvoicing:install-rules', 'einvoicing:poll-inbound', 'einvoicing:resolve'] as $command) {
+            self::assertContains($command, $commands);
+        }
+        self::assertSame([], $manager->__debugInfo()['built']);
+        self::assertFalse($manager->__debugInfo()['faked']);
+        self::assertSame([], DB::getConnections(), 'No database connection is opened at boot.');
+    }
+
+    #[DefineEnvironment('webhooksOffAsString')]
+    public function test_webhooks_enabled_false_string_disables_routes(): void
+    {
+        self::assertNull(Route::getRoutes()->getByName('einvoicing.webhook'));
+    }
+
+    /**
+     * @param  Application  $app
+     */
+    protected function webhooksOffAsString($app): void
+    {
+        // As read from an environment variable.
+        $app['config']->set('einvoicing.webhooks.enabled', 'false');
     }
 
     public function test_config_is_merged_and_publishable(): void

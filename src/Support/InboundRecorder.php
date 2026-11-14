@@ -23,6 +23,13 @@ final class InboundRecorder
     /**
      * The row of the notified document, created in the notified state when it is new, in which
      * case the job that fetches it is queued after the open transaction commits.
+     *
+     * When another process stores the same document concurrently, the insert loses on the unique
+     * key and the winner's row is returned. Called inside an outer transaction under REPEATABLE
+     * READ, the MySQL default, that row may not be visible to this transaction yet; the unique
+     * violation is then rethrown, and the document is picked up on the next notification or poll.
+     *
+     * @throws UniqueConstraintViolationException when a concurrent insert won but its row is not visible here
      */
     public function notify(string $transport, string $documentId, ?InboundReference $reference = null): InboundMessage
     {

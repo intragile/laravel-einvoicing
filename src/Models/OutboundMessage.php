@@ -39,6 +39,8 @@ use IntrAgile\EInvoicing\Transport\Peppol\ProcessId;
  * @property Carbon|null $finished_at
  * @property Carbon $created_at
  * @property Carbon $updated_at
+ *
+ * @phpstan-consistent-constructor
  */
 class OutboundMessage extends Model
 {
@@ -70,9 +72,9 @@ class OutboundMessage extends Model
     /**
      * An unsaved message for the document; the caller sets the state and saves.
      */
-    public static function fromDocument(OutboundDocument $document, string $transport, ?string $reference): self
+    public static function fromDocument(OutboundDocument $document, string $transport, ?string $reference): static
     {
-        return new self([
+        return new static([
             'transport' => $transport,
             'reference' => $reference,
             'sender' => $document->sender->toString(),
@@ -114,8 +116,16 @@ class OutboundMessage extends Model
      * Only one worker can win the transition, which guards against the same document
      * being sent twice by duplicate or retried jobs. On a lost race the model is refreshed.
      *
+     * Edge cases:
+     * - Attributes that were already changed on the model before the call are written too, as
+     *   part of the same conditional update.
+     * - A null condition matches a NULL column (`IS NULL`), not a comparison with NULL.
+     * - On a model that was never saved nothing matches: false is returned, nothing is reloaded,
+     *   and the given attributes stay filled in as unsaved changes.
+     * - The updated_at timestamp is written to the row but not to the model in memory.
+     *
      * @param  array<string, mixed>  $attributes  Further columns to update together with the state.
-     * @param  array<string, int|string>  $conditions  Further column values the row must still have, e.g. the claimed attempt count.
+     * @param  array<string, int|string|null>  $conditions  Further column values the row must still have, e.g. the claimed attempt count.
      */
     public function transition(OutboundState $from, OutboundState $to, array $attributes = [], array $conditions = []): bool
     {

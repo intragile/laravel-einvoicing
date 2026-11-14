@@ -10,7 +10,9 @@ use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentReceived;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Laravel\Support\InboundRecorder;
 use IntrAgile\EInvoicing\Transport\Exception\OutcomeUnknown;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
@@ -32,15 +34,39 @@ use Throwable;
  *
  * A failed fetch or acknowledgement is counted in fetch_attempts and recorded on the row, which
  * stays notified or fetched. Either is queued again after the configured sending backoff when it
- * is safe to repeat, while fewer than sending.max_attempts have failed and unless the queue
- * connection runs jobs synchronously and cannot delay them; beyond that the next poll of the
- * inbound source retries it.
+ * is safe to repeat, while fewer than sending.max_attempts and inbound.max_fetch_attempts have
+ * failed and unless the queue connection runs jobs synchronously and cannot delay them; beyond
+ * that the next poll of the inbound source retries it. inbound.max_fetch_attempts is the total
+ * budget of a document, fetches and acknowledgements together: a row that has used it up is left
+ * alone, by this job and by the poll, until an operator retries it with
+ * `einvoicing:poll-inbound --include-capped`. The counter never grows past the cap.
  */
 final class FetchInboundDocument extends MessageJob
 {
     private const DEFAULT_BACKOFF = [30, 120, 600, 1800];
 
     private const DEFAULT_MAX_ATTEMPTS = 5;
+
+    private const DEFAULT_MAX_FETCH_ATTEMPTS = 10;
+
+    /** The largest accepted cap, so the counter fits a small unsigned column on every database. */
+    private const MAX_FETCH_ATTEMPTS_LIMIT = 65535;
+
+    /**
+     * The total number of failed fetches and acknowledgements after which a document is no
+     * longer tried automatically.
+     *
+     * @throws ConfigurationException when inbound.max_fetch_attempts is not a whole number from 1 to 65535
+     */
+    public static function attemptCap(): int
+    {
+        return ConfigValue::integer(
+            config('einvoicing.inbound.max_fetch_attempts') ?? self::DEFAULT_MAX_FETCH_ATTEMPTS,
+            'einvoicing.inbound.max_fetch_attempts',
+            1,
+            self::MAX_FETCH_ATTEMPTS_LIMIT,
+        );
+    }
 
     /**
      * Two requests, each with its connect and response timeouts, plus a margin.
@@ -54,7 +80,7 @@ final class FetchInboundDocument extends MessageJob
     {
         // The stored XML is never needed here.
         $message = InboundMessage::queryWithoutXml()->find($this->messageId);
-        if ($message === null || $message->state === InboundState::Acknowledged) {
+        if ($message === null || $message->state === InboundState::Acknowledged || $message->fetch_attempts >= self::attemptCap()) {
             return;
         }
 
@@ -121,12 +147,12 @@ final class FetchInboundDocument extends MessageJob
     private function fetchFailed(InboundMessage $message, int $attempts, Throwable $exception): void
     {
         $recorded = $message->transition(InboundState::Notified, InboundState::Notified, [
-            'fetch_attempts' => $attempts + 1,
+            'fetch_attempts' => self::counted($attempts),
             'last_error' => self::describe($exception),
         ], ['fetch_attempts' => $attempts]);
 
         if ($recorded && $exception instanceof TransportException && $exception->isRetryable()) {
-            self::retry($message->id, $attempts);
+            $this->retry($message->id, $attempts);
         }
 
         // A document that cannot be read is left for an operator; anything else is a defect.
@@ -149,14 +175,14 @@ final class FetchInboundDocument extends MessageJob
         } catch (TransportException $exception) {
             $attempts = $message->fetch_attempts;
             $recorded = $message->transition(InboundState::Fetched, InboundState::Fetched, [
-                'fetch_attempts' => $attempts + 1,
+                'fetch_attempts' => self::counted($attempts),
                 'last_error' => self::describe($exception),
             ], ['fetch_attempts' => $attempts]);
 
             // Acknowledging is idempotent, so an acknowledgement whose outcome is unknown is
             // repeated as well. A lost update means another job has moved the row on.
             if ($recorded && ($exception->isRetryable() || $exception instanceof OutcomeUnknown)) {
-                self::retry($message->id, $attempts);
+                $this->retry($message->id, $attempts);
             }
 
             return;
@@ -170,18 +196,28 @@ final class FetchInboundDocument extends MessageJob
 
     /**
      * Queues the job again after the backoff for the failed attempt, while attempts remain and
-     * the connection can delay jobs. Once they are used up, only the next poll of the inbound
-     * source queues the document again, one job per poll.
+     * the connection can delay jobs. Once sending.max_attempts are used up, only the next poll of
+     * the inbound source queues the document again, one job per poll, until the cap is reached.
      *
      * @param  int  $attempts  the failed attempts recorded before this one
      */
-    private static function retry(int $messageId, int $attempts): void
+    private function retry(int $messageId, int $attempts): void
     {
-        if ($attempts + 1 >= self::setting('sending.max_attempts', self::DEFAULT_MAX_ATTEMPTS) || self::runsSynchronously()) {
+        $budget = min(self::setting('sending.max_attempts', self::DEFAULT_MAX_ATTEMPTS), self::attemptCap());
+        $connection = $this->queueConnection();
+        if ($attempts + 1 >= $budget || self::runsSynchronously($connection)) {
             return;
         }
 
-        self::schedule($messageId, self::delayAt('sending.backoff', self::DEFAULT_BACKOFF, $attempts), $attempts + 1);
+        self::schedule($messageId, self::delayAt('sending.backoff', self::DEFAULT_BACKOFF, $attempts), $attempts + 1, $connection);
+    }
+
+    /**
+     * The failed attempts after one more, never more than the cap.
+     */
+    private static function counted(int $attempts): int
+    {
+        return min($attempts + 1, self::attemptCap());
     }
 
     private static function describe(Throwable $exception): string

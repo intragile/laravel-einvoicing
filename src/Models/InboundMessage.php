@@ -62,21 +62,27 @@ class InboundMessage extends Model
      */
     public static function queryWithoutXml(): Builder
     {
-        return static::query()->select([
-            'id', 'transport', 'provider_document_id', 'sender', 'receiver', 'document_type', 'received_at',
-            'state', 'envelope_id', 'fetch_attempts', 'last_error', 'fetched_at', 'acknowledged_at',
-            'created_at', 'updated_at',
-        ]);
+        return static::query()->select(self::COLUMNS_WITHOUT_XML);
     }
 
+    /** Every column except the potentially large XML. */
+    private const COLUMNS_WITHOUT_XML = [
+        'id', 'transport', 'provider_document_id', 'sender', 'receiver', 'document_type', 'received_at',
+        'state', 'envelope_id', 'fetch_attempts', 'last_error', 'fetched_at', 'acknowledged_at',
+        'created_at', 'updated_at',
+    ];
+
     /**
-     * Atomically move the message from one state to another; see OutboundMessage::transition().
+     * Atomically move the message from one state to another; see OutboundMessage::transition()
+     * for the edge cases. On a lost race a model without its XML, such as one read with
+     * queryWithoutXml(), is reloaded without it; any other model is refreshed in full.
      *
      * @param  array<string, mixed>  $attributes  Further columns to update together with the state.
-     * @param  array<string, int|string>  $conditions  Further column values the row must still have.
+     * @param  array<string, int|string|null>  $conditions  Further column values the row must still have.
      */
     public function transition(InboundState $from, InboundState $to, array $attributes = [], array $conditions = []): bool
     {
+        $withXml = array_key_exists('xml', $this->getRawOriginal());
         $attributes['state'] = $to;
         $this->fill($attributes);
         $dirty = $this->getDirty();
@@ -91,7 +97,13 @@ class InboundMessage extends Model
             ->where($conditions)
             ->update($dirty) === 1;
 
-        $updated ? $this->syncOriginal() : $this->refresh();
+        if ($updated) {
+            $this->syncOriginal();
+        } elseif ($withXml || ! $this->exists) {
+            $this->refresh();
+        } else {
+            $this->setRawAttributes(static::queryWithoutXml()->whereKey($this->getKey())->firstOrFail()->getAttributes(), true);
+        }
 
         return $updated;
     }

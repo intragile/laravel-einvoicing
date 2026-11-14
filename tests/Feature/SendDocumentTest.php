@@ -16,6 +16,7 @@ use IntrAgile\EInvoicing\Laravel\Events\DocumentFailed;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentSent;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Laravel\Jobs\ExpireSendingClaim;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\Invoices;
@@ -243,6 +244,28 @@ final class SendDocumentTest extends TestCase
         $this->assertSame(55, $job->timeout);
         $this->assertSame(1, $job->tries);
         $this->assertSame(2, $job->attempt);
+    }
+
+    public function test_runs_synchronously_reads_the_jobs_connection(): void
+    {
+        Queue::fake();
+        config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'default']);
+        $first = OutboundMessage::fromDocument(OutboundDocument::fromXml($this->fixture()), 'recommand', 'INV-1');
+        $first->state = OutboundState::Queued;
+        $first->save();
+        $second = $first->replicate();
+        $second->save();
+
+        // The configuration says sync, but this job was put on an asynchronous connection.
+        (new SendDocument($first->id))->onConnection('db')->handle($this->app->make(EInvoicingManager::class));
+        Queue::assertPushed(ExpireSendingClaim::class, fn (ExpireSendingClaim $job): bool => $job->messageId === $first->id);
+
+        // The configuration says asynchronous, but this job runs on the sync connection.
+        config()->set('einvoicing.queue.connection', 'db');
+        (new SendDocument($second->id))->onConnection('sync')->handle($this->app->make(EInvoicingManager::class));
+        Queue::assertNotPushed(ExpireSendingClaim::class, fn (ExpireSendingClaim $job): bool => $job->messageId === $second->id);
+
+        $this->assertCount(2, $this->fake->sent());
     }
 
     public function test_dispatch_waits_for_commit(): void

@@ -9,7 +9,9 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schema;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
+use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Transport\DeliveryStatus;
 use IntrAgile\EInvoicing\Transport\Exception\AuthenticationFailed;
@@ -21,6 +23,7 @@ use IntrAgile\EInvoicing\Transport\Peppol\PeppolBis3;
 use IntrAgile\EInvoicing\Transport\SendResult;
 use IntrAgile\EInvoicing\Transport\Transport;
 use LogicException;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 final class DoctorCommandTest extends TestCase
 {
@@ -98,6 +101,7 @@ final class DoctorCommandTest extends TestCase
         $this->assertStringContainsString('no expiry', $output);
         $this->assertStringContainsString('pcntl', $output);
         $this->assertRow($output, 'tables', 'ok');
+        $this->assertRow($output, 'inbound capped', 'ok');
     }
 
     public function test_doctor_treats_deferred_and_background_drivers_as_sync(): void
@@ -125,6 +129,8 @@ final class DoctorCommandTest extends TestCase
         $this->assertRow($output, 'queue retry_after', 'warn', 'queue.connections.db.retry_after');
         $this->assertStringContainsString('send 100 s', $output);
         $this->assertStringContainsString('longest 170 s', $output);
+        // pcntl is checked in the PHP that runs the doctor, which may not be the workers' PHP.
+        $this->assertRow($output, 'queue', extension_loaded('pcntl') ? 'ok' : 'warn', 'the PHP running this command');
 
         config()->set('queue.connections.db.retry_after', 300);
         [, $output] = $this->doctor();
@@ -171,6 +177,7 @@ final class DoctorCommandTest extends TestCase
 
         $this->assertSame(1, $code, $output);
         $this->assertRow($output, 'queue fifo', 'fail', 'einvoicing.fifo');
+        $this->assertStringContainsString('does not allow per-message delays', $output);
     }
 
     public function test_doctor_has_no_sqs_rows_on_other_drivers(): void
@@ -212,22 +219,50 @@ final class DoctorCommandTest extends TestCase
         $this->assertStringContainsString('/einvoicing/webhooks/recommand', $output);
     }
 
-    public function test_doctor_warns_without_webhook_secret_or_company(): void
+    public function test_doctor_warns_without_webhook_secret(): void
     {
         $this->configureRecommand();
         config()->set('einvoicing.validation.enabled', false);
         config()->set('einvoicing.transports.recommand.webhook_secret', null);
         config()->set('einvoicing.transports.other', [
             'driver' => 'recommand',
-            'api_key_id' => 'k',
-            'secret' => 's',
-            'webhook_secret' => 'w',
+            'api_key_id' => 'other-key-id',
+            'secret' => 'other-secret',
+            'webhook_secret' => 'other-webhook-secret',
         ]);
 
         [, $output] = $this->doctor();
 
         $this->assertRow($output, 'recommand: webhook', 'warn', 'webhooks off; schedule einvoicing:poll-inbound');
-        $this->assertRow($output, 'other: webhook', 'warn', 'einvoicing.transports.other.company_id');
+        // The missing company id fails the config row; the webhook row does not repeat it.
+        $this->assertRow($output, 'other: config', 'fail', 'einvoicing.transports.other.company_id');
+        $this->assertRow($output, 'other: webhook', 'ok', '/einvoicing/webhooks/other');
+    }
+
+    public function test_doctor_accepts_a_valid_custom_base_url(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports.recommand.base_url', 'https://sandbox.example.test/api/');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'recommand: base URL', 'ok', 'https');
+    }
+
+    public function test_doctor_fails_on_credentials_shorter_than_the_minimum(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports.recommand.secret', 'zq-71x');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code, $output);
+        $this->assertRow($output, 'recommand: config', 'fail', 'einvoicing.transports.recommand.secret');
+        $this->assertRow($output, 'recommand: base URL', 'ok');
+        $this->assertStringNotContainsString('zq-71x', $output);
     }
 
     public function test_doctor_live_uses_inbox(): void
@@ -253,6 +288,105 @@ final class DoctorCommandTest extends TestCase
         [, $output] = $this->doctor();
 
         $this->assertStringNotContainsString('inbox', $output);
+    }
+
+    public function test_doctor_without_live_builds_no_transport(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports.spy', ['driver' => 'spy']);
+        $built = 0;
+        $manager = $this->app->make(EInvoicingManager::class);
+        $manager->extend('spy', static function () use (&$built): Transport {
+            $built++;
+
+            throw new LogicException('The doctor built a transport without --live.');
+        });
+
+        [, $output] = $this->doctor();
+
+        $this->assertSame(0, $built, $output);
+        $this->assertSame([], $manager->__debugInfo()['built']);
+        $this->assertRow($output, 'spy: config', 'ok', 'custom driver');
+    }
+
+    /**
+     * @return iterable<string, array{array<string, mixed>, string|null}>
+     */
+    public static function fifoQueues(): iterable
+    {
+        yield 'queue name' => [['queue' => 'jobs.fifo'], null];
+        yield 'prefix, name and suffix' => [['prefix' => 'https://sqs.eu-west-1.amazonaws.com/123456789012', 'queue' => 'jobs', 'suffix' => '.fifo'], null];
+        yield 'full queue url' => [['queue' => 'https://sqs.eu-west-1.amazonaws.com/123456789012/jobs.fifo'], null];
+        yield 'package queue name with suffix' => [['queue' => 'default', 'suffix' => '.fifo'], 'einvoicing'];
+    }
+
+    /**
+     * @param  array<string, mixed>  $connection
+     */
+    #[DataProvider('fifoQueues')]
+    public function test_fifo_detected_by_suffix_prefix_and_url(array $connection, ?string $queueName): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('queue.connections.sqs', ['driver' => 'sqs', 'region' => 'eu-west-1', ...$connection]);
+        config()->set('einvoicing.queue.connection', 'sqs');
+        config()->set('einvoicing.queue.name', $queueName);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code, $output);
+        $this->assertRow($output, 'queue fifo', 'fail', 'FIFO');
+        $this->assertStringNotContainsString('ignores', $output);
+    }
+
+    public function test_standard_sqs_queue_is_not_taken_for_fifo(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('queue.connections.sqs', [
+            'driver' => 'sqs', 'region' => 'eu-west-1', 'prefix' => 'https://sqs.eu-west-1.amazonaws.com/123456789012.fifo', 'queue' => 'jobs', 'suffix' => '-prod',
+        ]);
+        config()->set('einvoicing.queue.connection', 'sqs');
+
+        [, $output] = $this->doctor();
+
+        $this->assertStringNotContainsString('queue fifo', $output);
+    }
+
+    public function test_doctor_warns_about_capped_rows(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.inbound.max_fetch_attempts', 3);
+
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'inbound capped', 'ok', 'none');
+
+        foreach (['in-1' => 3, 'in-2' => 7, 'in-3' => 2] as $id => $attempts) {
+            InboundMessage::query()->create(['transport' => 'recommand', 'provider_document_id' => $id, 'state' => InboundState::Notified, 'fetch_attempts' => $attempts]);
+        }
+        InboundMessage::query()->create(['transport' => 'recommand', 'provider_document_id' => 'in-4', 'state' => InboundState::Acknowledged, 'fetch_attempts' => 9]);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'inbound capped', 'warn', '2 inbound documents');
+        $this->assertStringContainsString('--include-capped', $output);
+    }
+
+    public function test_doctor_fails_on_a_non_numeric_setting(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'default', 'retry_after' => 300]);
+        config()->set('queue.default', 'db');
+        config()->set('einvoicing.http.timeout', 'soon');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code, $output);
+        $this->assertRow($output, 'queue', 'fail', 'einvoicing.http.timeout');
     }
 
     public function test_doctor_never_prints_secrets(): void

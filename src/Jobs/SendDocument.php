@@ -88,9 +88,10 @@ final class SendDocument extends MessageJob
         // this claim, so the job left behind when the claim is lost below does nothing; and
         // when it cannot be scheduled, the error propagates with the row still unclaimed.
         $claim = $message->attempts + 1;
-        $synchronous = self::runsSynchronously();
+        $connection = $this->queueConnection();
+        $synchronous = self::runsSynchronously($connection);
         if (! $synchronous) {
-            ExpireSendingClaim::schedule($message->id, self::claimLifetime(), $claim);
+            ExpireSendingClaim::schedule($message->id, self::claimLifetime(), $claim, $connection);
         }
 
         if (! $message->transition(OutboundState::Queued, OutboundState::Sending, ['attempts' => $claim], ['attempts' => $claim - 1])) {
@@ -157,7 +158,7 @@ final class SendDocument extends MessageJob
         } elseif ($state === OutboundState::Failed) {
             event(new DocumentFailed($message));
         } else {
-            PollDeliveryStatus::start($message->id, $claim);
+            PollDeliveryStatus::start($message->id, $claim, $this->queueConnection());
         }
     }
 
@@ -255,7 +256,11 @@ final class SendDocument extends MessageJob
 
         if ($recorded) {
             event(new DocumentFailed($message));
+
+            return;
         }
+
+        self::reportLostAnswer($message, $claim, $reason);
     }
 
     /**
@@ -264,6 +269,8 @@ final class SendDocument extends MessageJob
     private function requeue(OutboundMessage $message, int $claim, TransportException $e): void
     {
         if (! $message->transition(OutboundState::Sending, OutboundState::Queued, ['failure_message' => $e->getMessage()], ['attempts' => $claim])) {
+            self::reportLostAnswer($message, $claim, $e->getMessage());
+
             return;
         }
 
@@ -271,7 +278,22 @@ final class SendDocument extends MessageJob
             ? $e->retryAfterSeconds
             : self::retryDelay($claim);
 
-        self::schedule($message->id, max(0, $delay));
+        self::schedule($message->id, max(0, $delay), connection: $this->queueConnection());
+    }
+
+    /**
+     * Reports a definite "not accepted" answer that could not be recorded because the row left
+     * this claim meanwhile, typically into unconfirmed. The operator who now owns the row learns
+     * that the document was not delivered under this claim.
+     */
+    private static function reportLostAnswer(OutboundMessage $message, int $claim, string $reason): void
+    {
+        report(new RuntimeException(sprintf(
+            'Outbound document %d was not accepted by its transport under attempt %d, but the row had left that sending claim, so the answer was not recorded: %s',
+            $message->id,
+            $claim,
+            $reason,
+        )));
     }
 
     private function unconfirmed(OutboundMessage $message, int $claim, string $reason): void

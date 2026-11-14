@@ -6,7 +6,10 @@ namespace IntrAgile\EInvoicing\Laravel\Console;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Str;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
+use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Jobs\MessageJob;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
@@ -45,6 +48,17 @@ final class DoctorCommand extends Command
 
     /** Settings of the built-in driver without which it cannot be built. */
     private const REQUIRED_KEYS = ['api_key_id', 'secret', 'company_id'];
+
+    /** Credentials of the built-in driver, which must have a minimum length. */
+    private const CREDENTIAL_KEYS = ['api_key_id', 'secret'];
+
+    /**
+     * Stand-in credentials for checking a base URL on its own; the configured ones are checked
+     * separately and never passed along.
+     */
+    private const PLACEHOLDER_KEY_ID = 'placeholder-key-id';
+
+    private const PLACEHOLDER_SECRET = 'placeholder-secret';
 
     /** Settings that are never printed. */
     private const SECRET_KEYS = ['api_key_id', 'secret', 'webhook_secret'];
@@ -134,12 +148,22 @@ final class DoctorCommand extends Command
             self::REQUIRED_KEYS,
             static fn (string $key): bool => ! self::filled($config[$key] ?? null),
         ));
-        $missing === []
-            ? $this->row("{$check}: config", self::OK, 'API key id, secret and company id set')
-            : $this->row("{$check}: config", self::FAIL, 'missing or empty: '.implode(', ', array_map(
-                static fn (string $key): string => "einvoicing.transports.{$name}.{$key}",
-                $missing,
-            )));
+        $short = array_values(array_filter(
+            self::CREDENTIAL_KEYS,
+            static fn (string $key): bool => self::filled($config[$key] ?? null)
+                && strlen(trim($config[$key])) < RecommandConfig::MIN_CREDENTIAL_LENGTH,
+        ));
+        if ($missing !== []) {
+            $this->row("{$check}: config", self::FAIL, 'missing or empty: '.self::keyPaths($name, $missing));
+        } elseif ($short !== []) {
+            $this->row("{$check}: config", self::FAIL, sprintf(
+                'shorter than %d characters: %s',
+                RecommandConfig::MIN_CREDENTIAL_LENGTH,
+                self::keyPaths($name, $short),
+            ));
+        } else {
+            $this->row("{$check}: config", self::OK, 'API key id, secret and company id set');
+        }
 
         $this->checkBaseUrl($name, $config['base_url'] ?? null);
         $this->checkWebhook($name, $config);
@@ -159,7 +183,7 @@ final class DoctorCommand extends Command
             if (! is_string($baseUrl)) {
                 throw new InvalidArgumentException('The base URL is not a string.');
             }
-            new RecommandConfig('id', 'secret', 'company', $baseUrl);
+            new RecommandConfig(self::PLACEHOLDER_KEY_ID, self::PLACEHOLDER_SECRET, 'placeholder-company', $baseUrl);
             $this->row($check, self::OK, 'https');
         } catch (InvalidArgumentException) {
             $this->row($check, self::FAIL, sprintf(
@@ -180,16 +204,9 @@ final class DoctorCommand extends Command
 
             return;
         }
+        // A missing company id already fails the config row of the built-in driver.
         if (! Route::has('einvoicing.webhook')) {
             $this->row($check, self::WARN, 'einvoicing.webhooks.enabled is off, so no webhook route exists; schedule einvoicing:poll-inbound');
-
-            return;
-        }
-        if (! self::filled($config['company_id'] ?? null)) {
-            $this->row($check, self::WARN, sprintf(
-                'einvoicing.transports.%s.company_id is missing, so every notification that names a company is ignored',
-                $name,
-            ));
 
             return;
         }
@@ -231,12 +248,60 @@ final class DoctorCommand extends Command
             return;
         }
 
-        $missing === []
-            ? $this->row('tables', self::OK, 'einvoicing_outbound_documents, einvoicing_inbound_documents')
-            : $this->row('tables', self::FAIL, 'missing: '.implode(', ', $missing).'; run php artisan migrate');
+        if ($missing !== []) {
+            $this->row('tables', self::FAIL, 'missing: '.implode(', ', $missing).'; run php artisan migrate');
+
+            return;
+        }
+
+        $this->row('tables', self::OK, 'einvoicing_outbound_documents, einvoicing_inbound_documents');
+        $this->checkCapped();
+    }
+
+    /**
+     * Counts the inbound documents that have used up their fetch attempts and are no longer
+     * tried automatically.
+     */
+    private function checkCapped(): void
+    {
+        try {
+            $cap = FetchInboundDocument::attemptCap();
+            $states = [InboundState::Notified->value];
+            if ((bool) config('einvoicing.inbound.acknowledge', true)) {
+                $states[] = InboundState::Fetched->value;
+            }
+            $capped = InboundMessage::query()->whereIn('state', $states)->where('fetch_attempts', '>=', $cap)->count();
+        } catch (ConfigurationException $exception) {
+            $this->row('inbound capped', self::FAIL, $exception->getMessage());
+
+            return;
+        } catch (Throwable $exception) {
+            $this->row('inbound capped', self::FAIL, $this->describe($exception));
+
+            return;
+        }
+
+        $capped === 0
+            ? $this->row('inbound capped', self::OK, "none at the cap of {$cap} attempts")
+            : $this->row('inbound capped', self::WARN, sprintf(
+                '%d inbound documents have used up einvoicing.inbound.max_fetch_attempts (%d) and are no longer fetched '
+                .'or acknowledged automatically; see last_error, then run php artisan einvoicing:poll-inbound --include-capped',
+                $capped,
+                $cap,
+            ));
     }
 
     private function checkQueue(): void
+    {
+        try {
+            $this->checkQueueConnection();
+        } catch (ConfigurationException $exception) {
+            // The message names the setting, never its value.
+            $this->row('queue', self::FAIL, $exception->getMessage());
+        }
+    }
+
+    private function checkQueueConnection(): void
     {
         $connection = MessageJob::connectionName();
         $driver = MessageJob::connectionDriver();
@@ -259,10 +324,16 @@ final class DoctorCommand extends Command
             return;
         }
 
+        // Only the PHP running this command can be inspected; workers may run another binary.
         extension_loaded('pcntl')
-            ? $this->row('queue', self::OK, "{$connection} (driver {$driver})")
+            ? $this->row('queue', self::OK, sprintf(
+                '%s (driver %s); pcntl is loaded in the PHP running this command, make sure the workers\' PHP has it too',
+                $connection,
+                $driver,
+            ))
             : $this->row('queue', self::WARN, sprintf(
-                '%s (driver %s), but pcntl is not loaded: workers cannot stop a job at its timeout, so a row einvoicing:resolve takes as abandoned may still be sending',
+                '%s (driver %s), but pcntl is not loaded in the PHP running this command: if the workers\' PHP lacks it too, '
+                .'they cannot stop a job at its timeout, so a row einvoicing:resolve takes as abandoned may still be sending',
                 $connection,
                 $driver,
             ));
@@ -275,8 +346,8 @@ final class DoctorCommand extends Command
 
     /**
      * Amazon SQS refuses delays over 900 seconds, so longer ones are capped and the job runs
-     * earlier; a FIFO queue supports no per-message delay at all, so a sending claim would
-     * expire as soon as it is taken.
+     * earlier; on a FIFO queue it does not allow per-message delays at all, so retries, status
+     * polls and the expiry of a sending claim would not be spaced out.
      */
     private function checkSqs(string $connection): void
     {
@@ -284,10 +355,11 @@ final class DoctorCommand extends Command
         if (! is_string($queue) || $queue === '') {
             $queue = config("queue.connections.{$connection}.queue");
         }
-        if (is_string($queue) && str_ends_with($queue, '.fifo')) {
+        if (is_string($queue) && self::isFifoQueue($queue, config("queue.connections.{$connection}.suffix"))) {
             $this->row('queue fifo', self::FAIL, sprintf(
-                'the SQS queue %s is a FIFO queue, which ignores job delays: every sending claim would expire at once '
-                .'and turn each send unconfirmed; use a standard queue',
+                'the SQS queue %s is a FIFO queue; Amazon SQS does not allow per-message delays on FIFO queues '
+                .'(DelaySeconds can only be set on the queue), so retries, status polls and the expiry of a sending claim '
+                .'would not be spaced out; use a standard queue',
                 $queue,
             ));
         }
@@ -313,6 +385,23 @@ final class DoctorCommand extends Command
                     $over,
                 )),
             ));
+    }
+
+    /**
+     * Whether the SQS queue Laravel addresses for this name is a FIFO queue. A full queue URL is
+     * used as is; a plain name gets the connection's suffix appended, as Laravel's SQS queue does,
+     * and the prefix only adds the account path in front, so the name decides.
+     */
+    private static function isFifoQueue(string $queue, mixed $suffix): bool
+    {
+        if (str_ends_with($queue, '.fifo')) {
+            return true;
+        }
+        if (filter_var($queue, FILTER_VALIDATE_URL) !== false) {
+            return false;
+        }
+
+        return is_string($suffix) && str_ends_with(Str::finish($queue, $suffix), '.fifo');
     }
 
     /**
@@ -413,6 +502,19 @@ final class DoctorCommand extends Command
             : str_replace($this->secrets, '[redacted]', $exception->getMessage());
 
         return $withClass ? $exception::class.': '.$message : $message;
+    }
+
+    /**
+     * The full configuration paths of settings of a transport, comma separated.
+     *
+     * @param  list<string>  $keys
+     */
+    private static function keyPaths(string $name, array $keys): string
+    {
+        return implode(', ', array_map(
+            static fn (string $key): string => "einvoicing.transports.{$name}.{$key}",
+            $keys,
+        ));
     }
 
     /**

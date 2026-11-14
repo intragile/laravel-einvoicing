@@ -8,6 +8,8 @@ use Illuminate\Contracts\Foundation\Application;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Transport\DeliveryStatus;
 use IntrAgile\EInvoicing\Transport\FakeTransport;
@@ -60,6 +62,74 @@ final class ManagerTest extends TestCase
         config()->set('einvoicing.transports.recommand.base_url', 'http://user:'.self::SECRET_MARK.'@app.recommand.eu/?token='.self::SECRET_MARK);
         $exception = $this->assertConfigurationError('einvoicing.transports.recommand.base_url');
         self::assertNull($exception->getPrevious(), 'The core message would repeat the URL.');
+    }
+
+    public function test_numeric_string_settings_are_accepted(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.http.timeout', '20');
+        config()->set('einvoicing.http.connect_timeout', '2.5');
+        config()->set('einvoicing.http.max_response_bytes', '1000000');
+        config()->set('einvoicing.sending.max_attempts', '3');
+
+        self::assertInstanceOf(RecommandTransport::class, $this->freshManager()->transport());
+        // 20 + ceil(2.5) + 30
+        self::assertSame(53, (new SendDocument(1))->timeout);
+        self::assertSame(3, ConfigValue::number(config('einvoicing.sending.max_attempts'), 'einvoicing.sending.max_attempts'));
+        self::assertSame(2.5, ConfigValue::number('2.5', 'x'));
+        self::assertSame(7, ConfigValue::number(7, 'x'));
+    }
+
+    public function test_non_numeric_setting_names_the_key(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+
+        foreach (['einvoicing.http.timeout', 'einvoicing.http.connect_timeout', 'einvoicing.http.max_response_bytes'] as $key) {
+            config()->set($key, 'plenty');
+            $this->assertConfigurationError($key);
+            config()->set($key, null);
+        }
+
+        config()->set('einvoicing.http.max_response_bytes', '1.5');
+        $this->assertConfigurationError('einvoicing.http.max_response_bytes');
+        config()->set('einvoicing.http.max_response_bytes', null);
+
+        config()->set('einvoicing.http.timeout', ['60']);
+        try {
+            new SendDocument(1);
+            self::fail('A non-numeric job setting was accepted.');
+        } catch (ConfigurationException $exception) {
+            self::assertStringContainsString('einvoicing.http.timeout', $exception->getMessage());
+        }
+    }
+
+    public function test_short_credentials_are_named_not_taken_for_a_bad_base_url(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+
+        config()->set('einvoicing.transports.recommand.api_key_id', 'short');
+        $exception = $this->assertConfigurationError('einvoicing.transports.recommand.api_key_id');
+        self::assertStringNotContainsString('base_url', $exception->getMessage());
+        self::assertStringNotContainsString('short', $exception->getMessage());
+
+        config()->set('einvoicing.transports.recommand.api_key_id', 'key-'.self::SECRET_MARK);
+        config()->set('einvoicing.transports.recommand.secret', '   tiny   ');
+        $this->assertConfigurationError('einvoicing.transports.recommand.secret');
+    }
+
+    public function test_transport_cache_keeps_the_validation_setting_it_was_built_with(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        $transport = $this->freshManager()->transport();
+
+        config()->set('einvoicing.validation.enabled', true);
+        config()->set('einvoicing.validation.rules_dir', $this->emptyDir());
+
+        self::assertSame($transport, $this->manager()->transport());
     }
 
     public function test_unknown_transport_and_driver(): void

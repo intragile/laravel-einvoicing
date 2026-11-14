@@ -6,6 +6,7 @@ namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
 use Closure;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Queue;
@@ -649,6 +650,69 @@ final class SendFailurePolicyTest extends TestCase
         Queue::assertNotPushed(SendDocument::class);
         Event::assertDispatched(DocumentUnconfirmed::class, 1);
         Event::assertNotDispatched(DocumentFailed::class);
+    }
+
+    public function test_losing_requeue_reports_the_answer(): void
+    {
+        Queue::fake();
+        Exceptions::fake();
+        $message = $this->queued();
+        $manager = $this->transportThat(function () use ($message): SendResult {
+            (new ExpireSendingClaim($message->id, 1))->handle();
+
+            throw new TransportUnavailable('Connection refused.');
+        });
+
+        $this->sendJob($message, $manager);
+
+        // The row stays with the operator, who learns that the document was not accepted.
+        $this->assertSame(OutboundState::Unconfirmed, $this->stored($message)->state);
+        Queue::assertNotPushed(SendDocument::class);
+        Exceptions::assertReported(fn (RuntimeException $e): bool => str_contains($e->getMessage(), (string) $message->id)
+            && str_contains($e->getMessage(), 'not accepted')
+            && str_contains($e->getMessage(), 'Connection refused.'));
+    }
+
+    public function test_losing_definite_failure_reports_the_answer(): void
+    {
+        Queue::fake();
+        Exceptions::fake();
+        $message = $this->queued();
+        $manager = $this->transportThat(function () use ($message): SendResult {
+            // A newer claim owns the row by the time the rejection arrives.
+            OutboundMessage::query()->whereKey($message->id)->update(['state' => OutboundState::Sending->value, 'attempts' => 2]);
+
+            throw new DocumentRejected('The access point rejected the document.');
+        });
+
+        $this->sendJob($message, $manager);
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Sending, $row->state);
+        $this->assertSame(2, $row->attempts);
+        Event::assertNotDispatched(DocumentFailed::class);
+        Exceptions::assertReported(fn (RuntimeException $e): bool => str_contains($e->getMessage(), 'not accepted')
+            && str_contains($e->getMessage(), 'rejected the document'));
+    }
+
+    public function test_revert_failure_keeps_the_original_exception(): void
+    {
+        $message = $this->queued();
+        $original = new RuntimeException('The queue is unreachable.');
+        Bus::shouldReceive('dispatch')->andThrow($original);
+
+        try {
+            $this->sendJob($message);
+            $this->fail('The send went ahead without its expiry.');
+        } catch (RuntimeException $caught) {
+            // Nothing was claimed, so there is nothing to revert that could replace the error.
+            $this->assertSame($original, $caught);
+        }
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Queued, $row->state);
+        $this->assertSame(0, $row->attempts);
+        $this->assertSame([], $this->fake->sent());
     }
 
     public function test_late_unknown_outcome_fires_unconfirmed_once(): void

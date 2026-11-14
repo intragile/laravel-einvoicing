@@ -15,6 +15,7 @@ use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Transport\FakeTransport;
 use IntrAgile\EInvoicing\Transport\Http\HttpClient;
@@ -35,7 +36,10 @@ use SensitiveParameter;
  *
  * Transports are built on first use and cached per name. When validation is enabled, every
  * transport, custom drivers included, is wrapped in a ValidatingTransport with the Peppol rules,
- * so a missing rule set surfaces when a transport is requested, never at boot. The application
+ * so a missing rule set surfaces when a transport is requested, never at boot. The cache keeps the
+ * validation setting a transport was built with: changing einvoicing.validation.enabled at run
+ * time affects only transports built afterwards, so a long-running worker needs a restart (or
+ * extend(), which empties the cache) to pick it up. The application
  * is held inside a closure, so the configuration and its secrets stay out of var_export(),
  * print_r() and var_dump() output of the manager.
  */
@@ -315,8 +319,8 @@ final class EInvoicingManager
      */
     private function recommand(string $name, #[SensitiveParameter] array $config): RecommandTransport
     {
-        $apiKeyId = $this->requiredString($config, $name, 'api_key_id');
-        $secret = $this->requiredString($config, $name, 'secret');
+        $apiKeyId = $this->credential($config, $name, 'api_key_id');
+        $secret = $this->credential($config, $name, 'secret');
         $companyId = $this->requiredString($config, $name, 'company_id');
 
         $baseUrl = $config['base_url'] ?? null;
@@ -341,7 +345,8 @@ final class EInvoicingManager
             'allow_redirects' => false,
             'http_errors' => false,
         ]);
-        $maxBytes = $this->config()->get('einvoicing.http.max_response_bytes', 20_000_000);
+        $maxBytes = $this->config()->get('einvoicing.http.max_response_bytes') ?? 20_000_000;
+        $maxBytes = ConfigValue::number($maxBytes, 'einvoicing.http.max_response_bytes');
         if (! is_int($maxBytes) || $maxBytes < 1) {
             throw new ConfigurationException('einvoicing.http.max_response_bytes must be a positive integer.');
         }
@@ -389,12 +394,36 @@ final class EInvoicingManager
     }
 
     /**
-     * @throws ConfigurationException when the value is not a positive number
+     * A credential of the built-in driver, required and at least as long as the driver accepts.
+     *
+     * @param  array<string, mixed>  $config
+     *
+     * @throws ConfigurationException when the value is missing, blank or too short; never quoting it
+     */
+    private function credential(#[SensitiveParameter] array $config, string $name, string $key): string
+    {
+        $value = $this->requiredString($config, $name, $key);
+        if (strlen(trim($value)) < RecommandConfig::MIN_CREDENTIAL_LENGTH) {
+            throw new ConfigurationException(sprintf(
+                'einvoicing.transports.%s.%s must be at least %d characters long.',
+                $name,
+                $key,
+                RecommandConfig::MIN_CREDENTIAL_LENGTH,
+            ));
+        }
+
+        return $value;
+    }
+
+    /**
+     * A positive number of seconds; null uses the default.
+     *
+     * @throws ConfigurationException when the value is not a positive number or numeric string
      */
     private function number(string $key, int|float $default): int|float
     {
-        $value = $this->config()->get($key, $default);
-        if ((! is_int($value) && ! is_float($value)) || $value <= 0) {
+        $value = ConfigValue::number($this->config()->get($key) ?? $default, $key);
+        if ($value <= 0) {
             throw new ConfigurationException(sprintf('%s must be a positive number of seconds.', $key));
         }
 

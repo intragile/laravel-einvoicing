@@ -39,8 +39,9 @@ final class PeppolRulesTest extends TestCase
             $this->markTestSkipped('Set EINVOICING_PEPPOL_FROM to a folder holding the Peppol BIS Billing .sch files.');
         }
         $example = dirname($from).'/examples/base-example.xml';
+        // A source folder was named, so a missing example is a broken setup, not an opt-out.
         if (! is_file($example)) {
-            $this->markTestSkipped("The Peppol base example is not at {$example}.");
+            $this->fail("EINVOICING_PEPPOL_FROM is set, but the Peppol base example is not at {$example}.");
         }
         $xml = (string) file_get_contents($example);
 

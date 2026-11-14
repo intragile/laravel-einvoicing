@@ -123,12 +123,15 @@ return [
     |--------------------------------------------------------------------------
     |
     | Whether a received document is acknowledged at the access point once it
-    | has been stored.
+    | has been stored, and the total number of failed fetches and
+    | acknowledgements (1 to 65535) after which a document is no longer tried
+    | automatically; einvoicing:poll-inbound --include-capped retries it once.
     |
     */
 
     'inbound' => [
         'acknowledge' => true,
+        'max_fetch_attempts' => 10,
     ],
 
     /*
@@ -138,7 +141,8 @@ return [
     |
     | The route POST {prefix}/{transport} receives signed notifications for
     | transports that have a webhook secret. It never runs the "web"
-    | middleware group, so no session or CSRF token is involved.
+    | middleware group, so no session or CSRF token is involved. "enabled"
+    | also accepts the strings "true"/"false" and "1"/"0" from the environment.
     |
     */
 

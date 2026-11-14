@@ -8,6 +8,8 @@ use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 
 /**
  * Base of the jobs that drive a stored document through its lifecycle.
@@ -47,12 +49,17 @@ abstract class MessageJob implements ShouldQueue
      * which ignores delays, callers decide whether delayed work makes sense at all. On Amazon
      * SQS, which refuses longer delays, the delay is capped at SQS_MAX_DELAY, so the job simply
      * runs earlier than configured.
+     *
+     * @param  string|null  $connection  the queue connection; the configured one when null
      */
-    public static function schedule(int $messageId, int $delay = 0, int $attempt = 0): void
+    public static function schedule(int $messageId, int $delay = 0, int $attempt = 0, ?string $connection = null): void
     {
         $job = new static($messageId, $attempt);
         $job->afterCommit();
-        if (self::connectionDriver() === 'sqs') {
+        if ($connection !== null) {
+            $job->onConnection($connection);
+        }
+        if (self::driverOf($connection ?? self::connectionName()) === 'sqs') {
             $delay = min($delay, self::SQS_MAX_DELAY);
         }
         if ($delay > 0) {
@@ -66,12 +73,25 @@ abstract class MessageJob implements ShouldQueue
     private const SYNCHRONOUS_DRIVERS = ['sync', 'deferred', 'background'];
 
     /**
-     * Whether jobs of this package run on a connection whose driver runs them in the current
-     * process and ignores delays, so no delayed work can be scheduled.
+     * Whether the connection, by default the one configured for the jobs of this package, has a
+     * driver that runs jobs in the current process and ignores delays, so no delayed work can be
+     * scheduled on it.
      */
-    public static function runsSynchronously(): bool
+    public static function runsSynchronously(?string $connection = null): bool
     {
-        return in_array(self::connectionDriver(), self::SYNCHRONOUS_DRIVERS, true);
+        return in_array(self::driverOf($connection ?? self::connectionName()), self::SYNCHRONOUS_DRIVERS, true);
+    }
+
+    /**
+     * The queue connection this job runs on: the one the worker took it from, else the one it was
+     * dispatched to, else the configured one. Follow-up jobs are scheduled on the same connection,
+     * so the decision whether they can be delayed holds for the connection that carries them.
+     */
+    protected function queueConnection(): ?string
+    {
+        $connection = $this->job?->getConnectionName() ?? $this->connection;
+
+        return is_string($connection) && $connection !== '' ? $connection : self::connectionName();
     }
 
     /**
@@ -92,7 +112,11 @@ abstract class MessageJob implements ShouldQueue
      */
     public static function connectionDriver(): ?string
     {
-        $connection = self::connectionName();
+        return self::driverOf(self::connectionName());
+    }
+
+    private static function driverOf(?string $connection): ?string
+    {
         $driver = $connection !== null ? config("queue.connections.{$connection}.driver") : null;
 
         return is_string($driver) ? $driver : null;
@@ -104,14 +128,16 @@ abstract class MessageJob implements ShouldQueue
     }
 
     /**
-     * An integer setting of the einvoicing configuration, rounded up; the default when the
-     * value is not numeric.
+     * An integer setting of the einvoicing configuration, rounded up; the default when it is not
+     * set.
+     *
+     * @throws ConfigurationException when the value is not a number or a numeric string
      */
     protected static function setting(string $key, int $default): int
     {
-        $value = config('einvoicing.'.$key, $default);
+        $value = config('einvoicing.'.$key) ?? $default;
 
-        return is_numeric($value) ? (int) ceil((float) $value) : $default;
+        return (int) ceil(ConfigValue::number($value, 'einvoicing.'.$key));
     }
 
     /**

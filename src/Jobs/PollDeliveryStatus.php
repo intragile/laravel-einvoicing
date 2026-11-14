@@ -38,14 +38,16 @@ final class PollDeliveryStatus extends MessageJob
     /**
      * Schedules the first poll for a document that has just become pending, unless polling is
      * disabled or the queue connection cannot delay jobs.
+     *
+     * @param  string|null  $connection  the queue connection; the configured one when null
      */
-    public static function start(int $messageId, int $attempts): void
+    public static function start(int $messageId, int $attempts, ?string $connection = null): void
     {
-        if (! config('einvoicing.status.poll', true) || self::runsSynchronously()) {
+        if (! config('einvoicing.status.poll', true) || self::runsSynchronously($connection)) {
             return;
         }
 
-        self::schedule($messageId, self::delayAt('status.delays', self::DEFAULT_DELAYS, 0), $attempts);
+        self::schedule($messageId, self::delayAt('status.delays', self::DEFAULT_DELAYS, 0), $attempts, $connection);
     }
 
     /**
@@ -105,10 +107,11 @@ final class PollDeliveryStatus extends MessageJob
      */
     private function again(OutboundMessage $message, int $checks, int $maxChecks): void
     {
-        if ($message->state !== OutboundState::Pending || $checks >= $maxChecks || self::runsSynchronously()) {
+        $connection = $this->queueConnection();
+        if ($message->state !== OutboundState::Pending || $checks >= $maxChecks || self::runsSynchronously($connection)) {
             return;
         }
 
-        self::schedule($message->id, self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks), $this->attempt);
+        self::schedule($message->id, self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks), $this->attempt, $connection);
     }
 }

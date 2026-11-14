@@ -86,8 +86,12 @@ RECOMMAND_WEBHOOK_SECRET=...            # only when you receive webhooks
 The rest of `config/einvoicing.php`: HTTP timeouts and the response size cap (`http`),
 validation on or off (`validation.enabled`), send retries (`sending.max_attempts`,
 `sending.backoff`), status polling (`status.poll`, `status.delays`, `status.max_attempts`),
-inbound acknowledgement (`inbound.acknowledge`) and the webhook route (`webhooks`). In every
-list of delays the last value repeats.
+inbound acknowledgement and the inbound attempt budget (`inbound.acknowledge`,
+`inbound.max_fetch_attempts`) and the webhook route (`webhooks`). In every list of delays the
+last value repeats. Numbers may be given as numeric strings, as environment variables deliver
+them; anything else is refused with an error that names the key. `webhooks.enabled` also takes
+the strings `"true"`/`"false"` and `"1"`/`"0"`. The Recommand API key id and secret must each be
+at least 8 characters long.
 
 A transport is built on first use, so missing credentials never break application boot.
 Secrets never appear in exception messages, doctor output, events or queued job payloads; jobs
@@ -230,12 +234,18 @@ again. Make listeners that must not miss a document queued (`ShouldQueue`), and 
 the table: every stored document is a `fetched` or `acknowledged` row with its XML.
 
 A document that cannot be read (a DOCTYPE, broken XML) stays `notified` with `last_error` and
-is not acknowledged. Because the access point keeps listing it, every poll fetches it again;
-there is no command yet to skip such a document, so fix it at the access point or live with
-the repeated fetch. A fetch or acknowledgement that failed with a retryable error (and an
+is not acknowledged. A fetch or acknowledgement that failed with a retryable error (and an
 acknowledgement whose outcome is unknown) is retried after `sending.backoff`, up to
 `sending.max_attempts`; any other fetch error, and anything left after the last attempt, waits
-for the next poll.
+for the next poll, which queues one more attempt each time the access point still lists the
+document.
+
+Every failed fetch and acknowledgement counts against one budget per document,
+`inbound.max_fetch_attempts` (default 10, from 1 to 65535). A document that has used it up is
+no longer fetched or acknowledged automatically: the poll skips it and reports it as capped,
+and `einvoicing:doctor` warns about it. Look at its `last_error`, fix the cause (often at the
+access point), then run `php artisan einvoicing:poll-inbound --include-capped`, which gives each
+capped document still listed by the access point exactly one more attempt.
 
 ### Polling
 
@@ -260,8 +270,8 @@ The package registers one route, `POST /einvoicing/webhooks/{transport}` (route 
 with the `recommand` driver and a `webhook_secret`; any other name gets `404`. Setup:
 
 1. Run `php artisan einvoicing:doctor`. The `transport <name>: webhook` row prints the full URL
-   when the transport has a webhook secret and a `company_id` and webhooks are enabled;
-   otherwise it shows a warning that says what is missing.
+   when the transport has a webhook secret and webhooks are enabled; otherwise it shows a
+   warning that says what is missing. A missing `company_id` fails the `config` row.
 2. Register that URL as a webhook in Recommand and put its signing secret into
    `RECOMMAND_WEBHOOK_SECRET`.
 3. Nothing else: the route does not run the `web` middleware group, so no CSRF token or
@@ -302,16 +312,20 @@ queue in production.**
   retried it is marked failed while the first run may still succeed. The doctor checks this.
 - **Run workers with `pcntl`** (usually available in Linux CLI builds; it needs PHP built with
   `--enable-pcntl`), so a worker stops a job at its timeout. `einvoicing:resolve` treats a
-  long-`sending` row as abandoned on that assumption. The doctor warns when `pcntl` is not
-  loaded.
+  long-`sending` row as abandoned on that assumption. The doctor checks `pcntl` in the PHP that
+  runs the doctor, which is not necessarily the PHP your workers run; it warns when `pcntl` is
+  missing there, and otherwise reminds you to check the workers.
 - **Amazon SQS accepts delays of at most 900 seconds.** On an `sqs` connection every delay is
   capped at 900 seconds, so a longer backoff, status poll delay or `Retry-After` simply waits
   less: the default `sending.backoff` (up to 1800) and `status.delays` (up to 21600) then poll
   and retry earlier than configured. Keep the claim expiry (send job timeout plus 30 seconds,
   130 with the default `http` settings) below 900, or a slow send is marked `unconfirmed` while
-  it still runs. **Do not use a FIFO queue** (`.fifo`): it ignores per-job delays, so every
-  sending claim would expire at once. The doctor warns about delays over 900 seconds and fails
-  on a FIFO queue.
+  it still runs. Amazon SQS does not allow per-message delays on FIFO queues (`DelaySeconds`
+  can only be set on the queue), so retries and status polls would not be spaced out. **Do not
+  use a FIFO queue.** (See `DelaySeconds` in the
+  [SendMessage API reference](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html).) The doctor warns about delays over
+  900 seconds and fails on a FIFO queue, recognised by a queue name, the connection's `prefix`,
+  name and `suffix`, or a full queue URL that ends in `.fifo`.
 
 ## Custom drivers
 
@@ -389,9 +403,9 @@ configured secret while faked.
 
 | Command | Purpose |
 |---|---|
-| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
+| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, inbound documents at the attempt cap, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
 | `einvoicing:install-rules [--from=DIR]` | install the Peppol BIS Billing validation rules |
-| `einvoicing:poll-inbound [--transport=]` | record waiting inbound documents and queue their intake; schedule it |
+| `einvoicing:poll-inbound [--transport=] [--include-capped]` | record waiting inbound documents and queue their intake; schedule it. `--include-capped` gives each document at `inbound.max_fetch_attempts` one more attempt |
 | `einvoicing:resolve ID (--sent=DOCUMENT-ID \| --resend) [--force]` | resolve an `unconfirmed` send, or queue a document again |
 
 ## What is verified

@@ -14,6 +14,7 @@ use IntrAgile\EInvoicing\Exception\UnsafeXml;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentReceived;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
@@ -785,6 +786,115 @@ final class InboundTest extends TestCase
         $this->assertSame(1, InboundMessage::query()->where('provider_document_id', 'in-1')->count());
         // Only the first notification queued a fetch; the race loser queued none.
         Queue::assertPushed(FetchInboundDocument::class, 1);
+    }
+
+    public function test_fetch_attempts_stop_at_the_cap(): void
+    {
+        config()->set('einvoicing.sending.max_attempts', 5);
+        config()->set('einvoicing.inbound.max_fetch_attempts', 3);
+        $this->stubSource();
+        $message = $this->notified();
+        $this->fetches = array_fill(0, 3, new TransportUnavailable('down'));
+
+        $this->runFetch($message);
+        $this->runFetch($message, 1);
+        $this->runFetch($message, 2);
+
+        // The cap is the whole budget: the third failure reaches it and schedules nothing.
+        $this->assertSame(3, $this->stored($message)->fetch_attempts);
+        $this->assertSame([null, 30, 120], $this->pushedFetchDelays());
+
+        // A job for a capped row neither fetches nor counts.
+        $this->runFetch($message, 3);
+        $this->assertSame(['in-1', 'in-1', 'in-1'], $this->fetched);
+        $this->assertSame(3, $this->stored($message)->fetch_attempts);
+    }
+
+    public function test_cap_outside_its_range_is_refused(): void
+    {
+        $this->stubSource();
+        $message = $this->notified();
+
+        foreach ([0, 65536, 'ten', 2.5] as $cap) {
+            config()->set('einvoicing.inbound.max_fetch_attempts', $cap);
+            try {
+                $this->runFetch($message);
+                $this->fail('A cap of '.var_export($cap, true).' was accepted.');
+            } catch (ConfigurationException $e) {
+                $this->assertStringContainsString('einvoicing.inbound.max_fetch_attempts', $e->getMessage());
+            }
+        }
+        $this->assertSame([], $this->fetched);
+    }
+
+    public function test_poll_skips_capped_rows(): void
+    {
+        config()->set('einvoicing.inbound.max_fetch_attempts', 3);
+        $this->stubSource();
+        $this->pendingReferences = [$this->document('in-1')->reference, $this->document('in-2')->reference];
+        $capped = $this->notified('in-1');
+        $capped->transition(InboundState::Notified, InboundState::Notified, ['fetch_attempts' => 3]);
+        $open = InboundMessage::query()->create(['transport' => 'recommand', 'provider_document_id' => 'in-2', 'state' => InboundState::Notified, 'fetch_attempts' => 2]);
+
+        $this->pollWith('0 new, 1 retried, 0 already known, 1 capped');
+
+        $pushed = Queue::pushed(FetchInboundDocument::class)->map(fn (FetchInboundDocument $job): int => $job->messageId)->values()->all();
+        // The notification of the capped row, then one retry of the open row only.
+        $this->assertSame([$capped->id, $open->id], $pushed);
+        $this->assertSame(3, $this->stored($capped)->fetch_attempts);
+    }
+
+    public function test_include_capped_retries_once(): void
+    {
+        Event::fake([DocumentReceived::class]);
+        config()->set('einvoicing.inbound.max_fetch_attempts', 3);
+        $this->stubSource();
+        $this->pendingReferences = [$this->document('in-1')->reference];
+        $message = $this->notified();
+        $message->transition(InboundState::Notified, InboundState::Notified, ['fetch_attempts' => 3]);
+        $this->fetches = [new TransportUnavailable('down')];
+
+        $this->artisan('einvoicing:poll-inbound', ['--include-capped' => true])
+            ->expectsOutputToContain('0 new, 1 retried, 0 already known, 0 capped')
+            ->assertSuccessful()
+            ->run();
+        $this->assertSame(2, $this->stored($message)->fetch_attempts);
+        $this->runPushedFetches();
+
+        // One more attempt, which fails and brings the row back to the cap without a reschedule.
+        $this->assertSame(['in-1'], $this->fetched);
+        $this->assertSame(3, $this->stored($message)->fetch_attempts);
+        $this->assertSame([null, null], $this->pushedFetchDelays());
+    }
+
+    public function test_transition_refresh_does_not_load_xml(): void
+    {
+        $created = InboundMessage::query()->create([
+            'transport' => 'recommand',
+            'provider_document_id' => 'in-1',
+            'state' => InboundState::Notified,
+        ]);
+        $created->transition(InboundState::Notified, InboundState::Fetched, ['xml' => '<Invoice/>']);
+        $stale = InboundMessage::queryWithoutXml()->findOrFail($created->id);
+        $stale->state = InboundState::Notified;
+        $stale->syncOriginal();
+        $queries = [];
+        DB::listen(function (QueryExecuted $query) use (&$queries): void {
+            if (str_starts_with($query->sql, 'select')) {
+                $queries[] = $query->sql;
+            }
+        });
+
+        $this->assertFalse($stale->transition(InboundState::Notified, InboundState::Fetched, ['fetch_attempts' => 1]));
+
+        // The lost race refreshes the columns the model was loaded with, the XML not among them.
+        $this->assertCount(1, $queries);
+        $this->assertStringNotContainsString('*', $queries[0]);
+        $this->assertStringNotContainsString('"xml"', $queries[0]);
+        $this->assertSame(InboundState::Fetched, $stale->state);
+        $this->assertSame(0, $stale->fetch_attempts);
+        $this->assertArrayNotHasKey('xml', $stale->getAttributes());
+        $this->assertFalse($stale->isDirty());
     }
 
     private function pollWith(string $expected = '0 new, 1 retried, 0 already known'): void

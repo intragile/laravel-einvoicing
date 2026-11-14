@@ -87,9 +87,12 @@ RECOMMAND_WEBHOOK_SECRET=...            # csak ha webhookot fogadsz
 A `config/einvoicing.php` további részei: HTTP-időkorlátok és a válaszméret felső határa
 (`http`), a validáció ki- és bekapcsolása (`validation.enabled`), a küldés újrapróbálása
 (`sending.max_attempts`, `sending.backoff`), a státusz lekérdezése (`status.poll`,
-`status.delays`, `status.max_attempts`), a bejövő dokumentumok nyugtázása
-(`inbound.acknowledge`) és a webhook-útvonal (`webhooks`). A késleltetési listák utolsó eleme
-ismétlődik.
+`status.delays`, `status.max_attempts`), a bejövő dokumentumok nyugtázása és kísérleti kerete
+(`inbound.acknowledge`, `inbound.max_fetch_attempts`) és a webhook-útvonal (`webhooks`). A
+késleltetési listák utolsó eleme ismétlődik. A számok számot tartalmazó stringként is
+megadhatók, ahogy a környezeti változók adják őket; minden mást a csomag a kulcsot megnevező
+hibával elutasít. A `webhooks.enabled` a `"true"`/`"false"` és az `"1"`/`"0"` stringet is
+elfogadja. A Recommand API-kulcs azonosítója és titka egyaránt legalább 8 karakter legyen.
 
 A transport első használatkor épül fel, így a hiányzó hozzáférési adatok sosem akasztják meg az
 alkalmazás indulását. A titkos kulcsok nem kerülnek kivételüzenetbe, a doctor kimenetébe,
@@ -234,12 +237,19 @@ tedd sorba (`ShouldQueue`), és egyeztess a táblából: minden eltárolt dokume
 vagy `acknowledged` sor az XML-lel együtt.
 
 Az olvashatatlan dokumentum (DOCTYPE, hibás XML) `notified` állapotban marad a `last_error`
-oszlopban rögzített okkal, és nem kerül nyugtázásra. Mivel az access point továbbra is listázza,
-minden lekérdezés újra letölti; ilyen dokumentum átugrására egyelőre nincs parancs, ezért az
-access pointnál kell rendezni, vagy együtt kell élni az ismételt letöltéssel. Az újrapróbálható
-hibával elbukott letöltést vagy nyugtázást (és az ismeretlen kimenetelű nyugtázást) a csomag a
-`sending.backoff` szerint, legfeljebb `sending.max_attempts` alkalommal próbálja újra; minden más
-letöltési hiba, és ami az utolsó kísérlet után is megmaradt, a következő lekérdezésre vár.
+oszlopban rögzített okkal, és nem kerül nyugtázásra. Az újrapróbálható hibával elbukott
+letöltést vagy nyugtázást (és az ismeretlen kimenetelű nyugtázást) a csomag a `sending.backoff`
+szerint, legfeljebb `sending.max_attempts` alkalommal próbálja újra; minden más letöltési hiba,
+és ami az utolsó kísérlet után is megmaradt, a következő lekérdezésre vár, amely minden
+alkalommal még egy kísérletet indít, amíg az access point listázza a dokumentumot.
+
+Minden elbukott letöltés és nyugtázás dokumentumonként egyetlen keretből fogy, ez az
+`inbound.max_fetch_attempts` (alapértelmezés 10, 1 és 65535 között). Ha egy dokumentum elhasználta,
+a csomag többé nem tölti le és nem nyugtázza automatikusan: a lekérdezés átugorja és elakadtként
+jelzi, az `einvoicing:doctor` pedig figyelmeztet rá. Nézd meg a `last_error` értékét, hárítsd el
+az okot (gyakran az access pointnál), majd futtasd a
+`php artisan einvoicing:poll-inbound --include-capped` parancsot, amely minden elakadt, az access
+point által még listázott dokumentumnak pontosan egy újabb kísérletet ad.
 
 ### Lekérdezés
 
@@ -265,8 +275,9 @@ driverű, `webhook_secret`-tel rendelkező transporthoz fogad el; minden más n�
 Beállítás:
 
 1. Futtasd a `php artisan einvoicing:doctor` parancsot. A `transport <név>: webhook` sor akkor
-   írja ki a teljes URL-t, ha a transportnak van webhook secretje és `company_id`-ja, és a
-   webhookok be vannak kapcsolva; különben figyelmeztetést ad arról, mi hiányzik.
+   írja ki a teljes URL-t, ha a transportnak van webhook secretje, és a webhookok be vannak
+   kapcsolva; különben figyelmeztetést ad arról, mi hiányzik. A hiányzó `company_id` miatt a
+   `config` sor jelez hibát.
 2. Vedd fel ezt az URL-t webhookként a Recommandban, az aláíró kulcsot pedig írd a
    `RECOMMAND_WEBHOOK_SECRET` változóba.
 3. Más teendő nincs: az útvonal nem futtatja a `web` middleware-csoportot, így sem CSRF-token,
@@ -311,17 +322,24 @@ használj.**
   doctor ezt is ellenőrzi.
 - **A workerek fussanak `pcntl`-lel** (a linuxos CLI buildekben általában elérhető; a PHP-t
   `--enable-pcntl` kapcsolóval kell fordítani), hogy az időkorlátnál le tudják állítani a jobot.
-  Az `einvoicing:resolve` erre építve tekinti elhagyottnak a sokáig `sending` állapotú sort. Ha a
-  `pcntl` nincs betöltve, a doctor szól.
+  Az `einvoicing:resolve` erre építve tekinti elhagyottnak a sokáig `sending` állapotú sort. A
+  doctor a `pcntl`-t abban a PHP-ban ellenőrzi, amely a doctort futtatja, és ez nem feltétlenül
+  azonos a workerek PHP-jával; ha ott hiányzik, figyelmeztet, egyébként emlékeztet, hogy a
+  workereknél is nézd meg.
 - **Az Amazon SQS legfeljebb 900 másodperces késleltetést fogad el.** `sqs` kapcsolaton minden
   késleltetés legfeljebb 900 másodperc, így a hosszabb backoff, státuszlekérdezési késleltetés
   vagy `Retry-After` egyszerűen rövidebb várakozást jelent: az alapértelmezett `sending.backoff`
   (legfeljebb 1800) és `status.delays` (legfeljebb 21600) esetén a csomag a beállítottnál
   korábban kérdez le és próbálkozik újra. A foglalás lejárata (a küldő job időkorlátja plusz 30
   másodperc, az alapértelmezett `http` beállításokkal 130) maradjon 900 alatt, különben a lassú
-  küldés még futás közben `unconfirmed` lesz. **Ne használj FIFO queue-t** (`.fifo`): figyelmen
-  kívül hagyja a jobonkénti késleltetést, így minden küldési foglalás azonnal lejárna. A doctor
-  figyelmeztet a 900 másodpercnél hosszabb késleltetésekre, FIFO queue-nál pedig hibát jelez.
+  küldés még futás közben `unconfirmed` lesz. Az Amazon SQS FIFO queue-n nem enged
+  üzenetenkénti késleltetést (a `DelaySeconds` csak a queue szintjén állítható be), így az
+  újrapróbálások és a státuszlekérdezések nem lennének időben széthúzva. **Ne használj FIFO
+  queue-t.** (Lásd a `DelaySeconds` leírását a
+  [SendMessage API-referenciában](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html).) A doctor
+  figyelmeztet a 900 másodpercnél hosszabb késleltetésekre, FIFO queue-nál pedig hibát jelez; a
+  FIFO queue-t a `.fifo` végű queue-névről, a kapcsolat `prefix` + név + `suffix` alakjáról vagy a
+  teljes queue-URL-ről ismeri fel.
 
 ## Saját driver
 
@@ -402,9 +420,9 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Parancs | Feladat |
 |---|---|
-| `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a táblákat, a queue drivert, a `pcntl`-t, a `retry_after`-t és az SQS-késleltetéseket; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
+| `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a táblákat, a kísérleti keretet elhasznált bejövő dokumentumokat, a queue drivert, a `pcntl`-t, a `retry_after`-t és az SQS-késleltetéseket; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
 | `einvoicing:install-rules [--from=DIR]` | telepíti a Peppol BIS Billing validációs szabályokat |
-| `einvoicing:poll-inbound [--transport=]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd |
+| `einvoicing:poll-inbound [--transport=] [--include-capped]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd. A `--include-capped` minden, az `inbound.max_fetch_attempts` keretet elhasznált dokumentumnak még egy kísérletet ad |
 | `einvoicing:resolve ID (--sent=DOKUMENTUM-ID \| --resend) [--force]` | rendez egy `unconfirmed` küldést, vagy újra sorba állít egy dokumentumot |
 
 ## Mi van ellenőrizve

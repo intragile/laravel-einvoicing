@@ -77,6 +77,19 @@ final class ModelsTest extends TestCase
 
         $this->assertFalse($message->transition(OutboundState::Queued, OutboundState::Sending, [], ['attempts' => 0]));
         $this->assertSame(OutboundState::Queued, $message->state);
+        // The lost race refreshed the model to the row as stored.
+        $this->assertSame(1, $message->attempts);
+        $this->assertFalse($message->isDirty());
+    }
+
+    public function test_from_document_builds_the_calling_class(): void
+    {
+        $subclass = (new class extends OutboundMessage {})::class;
+
+        $message = $subclass::fromDocument($this->document(), 'recommand', 'INV-1');
+
+        $this->assertInstanceOf($subclass, $message);
+        $this->assertFalse($message->exists);
     }
 
     public function test_provider_id_unique_per_transport(): void
