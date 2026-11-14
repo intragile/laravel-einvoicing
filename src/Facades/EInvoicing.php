@@ -10,7 +10,10 @@ use IntrAgile\EInvoicing\Transport\FakeTransport;
 use LogicException;
 
 /**
- * @method static \IntrAgile\EInvoicing\Transport\Transport transport(?string $name = null)
+ * @method static \IntrAgile\EInvoicing\Transport\Transport transport(?string $name = null, bool $validated = true)
+ * @method static \IntrAgile\EInvoicing\Validation\DocumentValidator|null validator()
+ * @method static \IntrAgile\EInvoicing\Validation\XRechnung\XRechnungValidator xrechnung()
+ * @method static \IntrAgile\EInvoicing\Validation\FacturX\FacturXValidator facturx()
  * @method static \IntrAgile\EInvoicing\Laravel\Models\OutboundMessage send(\IntrAgile\EInvoicing\Transport\OutboundDocument|\IntrAgile\EInvoicing\Model\Invoice|string $document, ?string $reference = null, ?string $transport = null)
  * @method static \IntrAgile\EInvoicing\Transport\InboundSource inbound(?string $name = null)
  * @method static \IntrAgile\EInvoicing\Transport\Recommand\RecommandWebhook webhook(string $name)

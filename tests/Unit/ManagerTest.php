@@ -10,15 +10,21 @@ use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
+use IntrAgile\EInvoicing\Laravel\Tests\Support\CallbackValidator;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Transport\DeliveryStatus;
+use IntrAgile\EInvoicing\Transport\Exception\InvalidDocument;
 use IntrAgile\EInvoicing\Transport\FakeTransport;
 use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandTransport;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandWebhook;
 use IntrAgile\EInvoicing\Transport\SendResult;
 use IntrAgile\EInvoicing\Transport\Transport;
+use IntrAgile\EInvoicing\Transport\ValidatingTransport;
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
+use IntrAgile\EInvoicing\Validation\FacturX\FacturXValidator;
+use IntrAgile\EInvoicing\Validation\XRechnung\XRechnungValidator;
 use LogicException;
 
 final class ManagerTest extends TestCase
@@ -347,6 +353,61 @@ final class ManagerTest extends TestCase
 
         self::assertSame('other', $this->manager()->defaultName());
         self::assertSame(['recommand', 'other'], $this->manager()->names());
+    }
+
+    public function test_public_transport_still_validates(): void
+    {
+        $inner = new FakeTransport;
+        $validator = new CallbackValidator(static fn () => CallbackValidator::invalid());
+        $this->app->instance(DocumentValidator::class, $validator);
+        config()->set('einvoicing.validation.enabled', true);
+        config()->set('einvoicing.transports.recommand', ['driver' => 'inner']);
+        $manager = $this->freshManager();
+        $manager->extend('inner', static fn (): Transport => $inner);
+
+        $transport = $manager->transport();
+        self::assertInstanceOf(ValidatingTransport::class, $transport);
+        self::assertSame($inner, $manager->transport(validated: false));
+
+        $xml = (string) file_get_contents(dirname(__DIR__).'/fixtures/bis-invoice.xml');
+        try {
+            $transport->send(OutboundDocument::fromXml($xml));
+            self::fail('The public transport must validate before sending.');
+        } catch (InvalidDocument $exception) {
+            self::assertStringContainsString('PEPPOL-EN16931-R001', $exception->getMessage());
+        }
+        self::assertSame(1, $validator->calls);
+        self::assertSame([], $inner->sent());
+    }
+
+    public function test_validator_follows_the_binding_the_setting_and_the_fake(): void
+    {
+        config()->set('einvoicing.validation.enabled', true);
+        config()->set('einvoicing.validation.rules_dir', $this->emptyDir());
+        try {
+            $this->freshManager()->validator();
+            self::fail('Without a binding, the Peppol rules must be required.');
+        } catch (RulesNotInstalled) {
+            $this->addToAssertionCount(1);
+        }
+
+        $bound = new CallbackValidator(static fn () => CallbackValidator::valid());
+        $this->app->instance(DocumentValidator::class, $bound);
+        self::assertSame($bound, $this->freshManager()->validator());
+
+        config()->set('einvoicing.validation.enabled', false);
+        self::assertNull($this->freshManager()->validator());
+
+        config()->set('einvoicing.validation.enabled', true);
+        $manager = $this->freshManager();
+        $manager->fake();
+        self::assertNull($manager->validator(), 'Faked transports skip validation.');
+    }
+
+    public function test_xrechnung_and_facturx_accessors(): void
+    {
+        self::assertInstanceOf(XRechnungValidator::class, $this->manager()->xrechnung());
+        self::assertInstanceOf(FacturXValidator::class, $this->manager()->facturx());
     }
 
     private function manager(): EInvoicingManager

@@ -77,6 +77,7 @@ final class PeppolRulesTest extends TestCase
 
         $this->assertSame(OutboundState::Failed, $refused->state);
         $this->assertSame(FailureCategory::Validation, $refused->failure_category);
+        $this->assertSame(0, $refused->attempts, 'An invalid document is refused before it is claimed.');
         $this->assertCount(1, $inner->sent());
     }
 }

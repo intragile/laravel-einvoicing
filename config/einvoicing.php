@@ -59,10 +59,11 @@ return [
     | Validation
     |--------------------------------------------------------------------------
     |
-    | When enabled, every document is validated against the Peppol BIS Billing
-    | rules before it is sent. The rules are installed with the core's
-    | "einvoicing-rules install peppol" command; a null folder means
-    | storage/einvoicing/peppol-rules.
+    | When enabled, every document is validated before it is sent: a Peppol BIS
+    | Billing document against the Peppol rules, an XRechnung document against
+    | the KoSIT rules of intragile/einvoicing-rules-xrechnung. The Peppol rules
+    | are installed with "php artisan einvoicing:install-rules" into this
+    | folder; null means storage/einvoicing/peppol-rules.
     |
     */
 

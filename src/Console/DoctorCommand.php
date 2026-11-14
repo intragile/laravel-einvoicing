@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Console;
 
+use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
@@ -17,6 +18,7 @@ use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
 use IntrAgile\EInvoicing\Validation\Validator;
 use InvalidArgumentException;
@@ -60,6 +62,16 @@ final class DoctorCommand extends Command
 
     private const PLACEHOLDER_SECRET = 'placeholder-secret';
 
+    /**
+     * Rule packages this package requires, with what each one is needed for. Factur-X rules are
+     * not used when sending, so their absence is only a warning.
+     */
+    private const RULE_PACKAGES = [
+        'intragile/einvoicing-rules-en16931' => [self::FAIL, 'XRechnung documents cannot be validated'],
+        'intragile/einvoicing-rules-xrechnung' => [self::FAIL, 'XRechnung documents cannot be validated'],
+        'intragile/einvoicing-rules-facturx' => [self::WARN, 'EInvoicing::facturx() is not available'],
+    ];
+
     /** Settings that are never printed. */
     private const SECRET_KEYS = ['api_key_id', 'secret', 'webhook_secret'];
 
@@ -79,6 +91,7 @@ final class DoctorCommand extends Command
             $this->checkTransport($manager, $name);
         }
         $this->checkValidation($manager);
+        $this->checkRulePackages();
         $this->checkTables();
         $this->checkQueue();
 
@@ -217,7 +230,13 @@ final class DoctorCommand extends Command
     private function checkValidation(EInvoicingManager $manager): void
     {
         if (! (bool) config('einvoicing.validation.enabled', true)) {
-            $this->row('validation', self::WARN, 'off: documents are sent unchecked, and a document whose CustomizationID is not Peppol BIS Billing is not refused before sending');
+            $this->row('validation', self::WARN, 'off: documents are sent without rule checks; only documents that are not a sendable Peppol BIS or XRechnung type are refused');
+
+            return;
+        }
+
+        if (app()->bound(DocumentValidator::class)) {
+            $this->row('validation', self::OK, 'documents are checked by the '.DocumentValidator::class.' bound in the container');
 
             return;
         }
@@ -230,6 +249,16 @@ final class DoctorCommand extends Command
             $this->row('validation', self::FAIL, "no Peppol rules in {$dir}; run php artisan einvoicing:install-rules");
         } catch (Throwable $exception) {
             $this->row('validation', self::FAIL, $this->describe($exception).'; run php artisan einvoicing:install-rules');
+        }
+    }
+
+    private function checkRulePackages(): void
+    {
+        foreach (self::RULE_PACKAGES as $package => [$status, $effect]) {
+            $check = 'rules '.substr($package, strlen('intragile/'));
+            InstalledVersions::isInstalled($package)
+                ? $this->row($check, self::OK, (string) InstalledVersions::getPrettyVersion($package))
+                : $this->row($check, $status, "missing: composer require {$package}; {$effect}");
         }
     }
 

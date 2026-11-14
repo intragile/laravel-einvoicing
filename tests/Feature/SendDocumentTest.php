@@ -19,14 +19,23 @@ use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Jobs\ExpireSendingClaim;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Laravel\Tests\Support\CallbackValidator;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\Invoices;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
+use IntrAgile\EInvoicing\Peppol\PeppolDocumentTypes;
+use IntrAgile\EInvoicing\Syntax\Syntax;
 use IntrAgile\EInvoicing\Transport\DeliveryFailure;
 use IntrAgile\EInvoicing\Transport\DeliveryState;
 use IntrAgile\EInvoicing\Transport\FailureCategory;
 use IntrAgile\EInvoicing\Transport\FakeTransport;
 use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\SendResult;
+use IntrAgile\EInvoicing\Transport\Transport;
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
+use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
+use IntrAgile\EInvoicing\Validation\PeppolPayloadValidator;
+use IntrAgile\EInvoicing\Validation\ValidationReport;
+use IntrAgile\EInvoicing\Validation\XRechnung\XRechnungValidator;
 
 final class SendDocumentTest extends TestCase
 {
@@ -58,6 +67,35 @@ final class SendDocumentTest extends TestCase
     private function stored(OutboundMessage $message): OutboundMessage
     {
         return OutboundMessage::query()->findOrFail($message->id);
+    }
+
+    /**
+     * Routes the default transport to an in-memory driver behind validation, with $validator
+     * bound as the document validator, and returns that driver.
+     */
+    private function validatedThrough(DocumentValidator $validator): FakeTransport
+    {
+        $inner = new FakeTransport;
+        config()->set('einvoicing.validation.enabled', true);
+        config()->set('einvoicing.transports.recommand', ['driver' => 'inner']);
+        $this->app->instance(DocumentValidator::class, $validator);
+        $this->app->forgetInstance(EInvoicingManager::class);
+        EInvoicing::clearResolvedInstances();
+        $this->app->make(EInvoicingManager::class)->extend('inner', static fn (): Transport => $inner);
+
+        return $inner;
+    }
+
+    /**
+     * Stores a queued document without dispatching its job.
+     */
+    private function queued(): OutboundMessage
+    {
+        $message = OutboundMessage::fromDocument(OutboundDocument::fromXml($this->fixture()), 'recommand', 'INV-1');
+        $message->state = OutboundState::Queued;
+        $message->save();
+
+        return $message;
     }
 
     public function test_send_queues_and_delivers(): void
@@ -308,5 +346,121 @@ final class SendDocumentTest extends TestCase
         $message = EInvoicing::send($this->fixture());
 
         Queue::assertPushed(SendDocument::class, fn (SendDocument $job): bool => $job->messageId === $message->id && $job->afterCommit === true);
+    }
+
+    public function test_validation_runs_before_the_claim(): void
+    {
+        $seen = [];
+        $inner = $this->validatedThrough(new CallbackValidator(function () use (&$seen): ValidationReport {
+            $row = OutboundMessage::query()->sole();
+            $seen = [$row->state, $row->attempts];
+
+            return CallbackValidator::valid();
+        }));
+
+        $message = EInvoicing::send($this->fixture());
+
+        $this->assertSame([OutboundState::Queued, 0], $seen);
+        $this->assertSame(OutboundState::Delivered, $this->stored($message)->state);
+        $this->assertCount(1, $inner->sent());
+    }
+
+    public function test_invalid_document_fails_without_claim(): void
+    {
+        Queue::fake();
+        Event::fake([DocumentSent::class, DocumentFailed::class]);
+        config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'default']);
+        $inner = $this->validatedThrough(new CallbackValidator(static fn (): ValidationReport => CallbackValidator::invalid()));
+        $message = $this->queued();
+
+        // An asynchronous connection, on which a claim would schedule its expiry.
+        (new SendDocument($message->id))->onConnection('db')->handle($this->app->make(EInvoicingManager::class));
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertSame(FailureCategory::Validation, $row->failure_category);
+        $this->assertStringContainsString('PEPPOL-EN16931-R001', (string) $row->failure_message);
+        $this->assertSame(0, $row->attempts);
+        $this->assertNull($row->sent_at);
+        $this->assertNotNull($row->finished_at);
+        Queue::assertNotPushed(ExpireSendingClaim::class);
+        $this->assertSame([], $inner->sent());
+        Event::assertDispatched(DocumentFailed::class, fn (DocumentFailed $e): bool => $e->message->id === $message->id);
+        Event::assertNotDispatched(DocumentSent::class);
+    }
+
+    public function test_document_the_validator_refuses_fails_without_claim(): void
+    {
+        Queue::fake();
+        $inner = $this->validatedThrough(new CallbackValidator(static fn (): never => throw new UnsupportedDocument('Not a Peppol document.')));
+        $message = $this->queued();
+
+        (new SendDocument($message->id))->handle($this->app->make(EInvoicingManager::class));
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertSame(FailureCategory::Validation, $row->failure_category);
+        $this->assertSame('Not a Peppol document.', $row->failure_message);
+        $this->assertSame(0, $row->attempts);
+        $this->assertSame([], $inner->sent());
+    }
+
+    public function test_missing_rules_leave_the_row_queued_and_unclaimed(): void
+    {
+        Queue::fake();
+        $inner = $this->validatedThrough(new CallbackValidator(static fn (): never => throw new RulesNotInstalled('No XRechnung rules.')));
+        $message = $this->queued();
+
+        try {
+            (new SendDocument($message->id))->handle($this->app->make(EInvoicingManager::class));
+            $this->fail('A missing rule set must propagate.');
+        } catch (RulesNotInstalled) {
+        }
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Queued, $row->state);
+        $this->assertSame(0, $row->attempts);
+        $this->assertSame([], $inner->sent());
+    }
+
+    public function test_send_uses_unvalidated_transport_after_validation(): void
+    {
+        $validator = new CallbackValidator(static fn (): ValidationReport => CallbackValidator::valid());
+        $inner = $this->validatedThrough($validator);
+
+        $message = EInvoicing::send($this->fixture());
+
+        $this->assertSame(OutboundState::Delivered, $this->stored($message)->state);
+        $this->assertSame(1, $validator->calls, 'The document is validated once, not again by the transport.');
+        $this->assertCount(1, $inner->sent());
+    }
+
+    public function test_xrechnung_document_is_sent_with_xrechnung_doctype(): void
+    {
+        $bis = new CallbackValidator(static fn (): ValidationReport => CallbackValidator::invalid());
+        $inner = $this->validatedThrough(new PeppolPayloadValidator($bis, XRechnungValidator::create()));
+
+        $message = EInvoicing::send(OutboundDocument::fromInvoice(Invoices::xrechnung(), syntax: Syntax::Cii), 'RE-2026-0815');
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Delivered, $row->state, (string) $row->failure_message);
+        $this->assertSame(PeppolDocumentTypes::XRECHNUNG_CII_INVOICE, $row->document_type);
+        $this->assertSame(0, $bis->calls, 'An XRechnung document is checked with the XRechnung rules only.');
+        $this->assertCount(1, $inner->sent());
+        $this->assertSame(PeppolDocumentTypes::XRECHNUNG_CII_INVOICE, $inner->sent()[0]->documentType->value);
+        $this->assertSame('0204:'.Invoices::XRECHNUNG_LEITWEG_ID, $inner->sent()[0]->receiver->toString());
+    }
+
+    public function test_invoice_without_process_control_is_refused_and_stores_nothing(): void
+    {
+        try {
+            EInvoicing::send(Invoices::bis()->withProcessControl(null));
+            $this->fail('An invoice with the plain EN 16931 identifier was accepted for Peppol.');
+        } catch (UnsupportedDocument $e) {
+            $this->assertStringContainsString('process control', $e->getMessage());
+        }
+
+        $this->assertSame(0, OutboundMessage::query()->count());
+        $this->assertSame([], $this->fake->sent());
     }
 }

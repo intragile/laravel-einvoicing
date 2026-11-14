@@ -15,8 +15,8 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 - **Configured transports.** Named connections in `config/einvoicing.php`; the built-in
   `recommand` driver talks to the [Recommand](https://recommand.eu) access point, and
   `EInvoicing::extend()` adds your own.
-- **Peppol BIS validation before every send**, on by default, with the official rules installed
-  by one artisan command.
+- **Validation before every send**, on by default: Peppol BIS documents with the official rules,
+  installed by one artisan command, and XRechnung documents with the KoSIT rules.
 - **Queued sending with a guarded state machine.** A send is claimed with a conditional update,
   so a duplicate or repeated job never sends twice. A send whose outcome is unknown is
   **never resent automatically**: it waits for an operator.
@@ -105,20 +105,31 @@ use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 $message = EInvoicing::send($invoice, reference: 'INV-2026-0001');
 ```
 
-`send()` accepts a core `Invoice` model, UBL XML as a string, or an `OutboundDocument`. The
+`send()` accepts a core `Invoice` model, UBL or CII XML as a string, or an `OutboundDocument`. The
 routing (sender, receiver, process) is read from the invoice itself. It stores the document as
 an `OutboundMessage` in state `queued` and dispatches the `SendDocument` job after the open
 database transaction, if any, commits. The optional third argument names a transport other than
 the default.
 
-**Set the Peppol BIS CustomizationID.** The core's UBL writer writes `urn:cen.eu:en16931:2017`
-as `cbc:CustomizationID` by default, which is plain EN 16931, not Peppol BIS Billing 3.0. Give
-the invoice the BIS identifier before sending:
+**Give the invoice the process control of what you send.** Only these documents are sent over
+Peppol, chosen by the exact pair of document element and specification identifier (BT-24):
+
+- Peppol BIS Billing 3.0: a UBL Invoice or CreditNote;
+- XRechnung 3.0: a UBL Invoice, UBL CreditNote or CII invoice;
+- XRechnung 3.0 Extension: a UBL Invoice or CII invoice.
+
+The XRechnung CVD and the deprecated XRechnung UBL Credit Note Extension are refused. The core's
+writers use `urn:cen.eu:en16931:2017` for an invoice without process control, which is plain
+EN 16931 and none of these, so set it:
 
 ```php
 use IntrAgile\EInvoicing\Model\ProcessControl;
+use IntrAgile\EInvoicing\Syntax\Syntax;
+use IntrAgile\EInvoicing\Syntax\XRechnung;
+use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\Peppol\PeppolBis3;
 
+// Peppol BIS Billing 3.0
 new Invoice(
     // ...
     processControl: new ProcessControl(
@@ -126,11 +137,37 @@ new Invoice(
         PeppolBis3::PROCESS,
     ),
 );
+
+// XRechnung 3.0, sent as UBL by send($invoice), or as CII:
+$invoice = new Invoice(/* ... */ processControl: XRechnung::processControl());
+EInvoicing::send(OutboundDocument::fromInvoice($invoice, syntax: Syntax::Cii));
 ```
 
-With validation on (the default), the Peppol rules refuse a document without it, and the send
-ends as `failed` with category `validation`, before anything leaves your server. With validation
-off, nothing stops it; the doctor warns about that.
+Any other document is refused by `send()` itself: it throws `UnsupportedDocument` with the reason
+and stores nothing. This holds with validation off as well.
+
+### Validation
+
+With validation on (the default), the `SendDocument` job validates the document before it claims
+the row: Peppol BIS documents with the installed Peppol rules, XRechnung documents with the KoSIT
+rules of `intragile/einvoicing-rules-xrechnung`, which this package requires. An invalid document
+ends as `failed` with category `validation` and `attempts` 0, and nothing leaves your server. A
+missing rule set leaves the row `queued` and the job fails with the reason, so install the rules
+and queue it again with `einvoicing:resolve ID --resend`.
+
+To check documents with your own rules, bind a validator in the container; the job and
+`EInvoicing::transport()` then use it instead of the Peppol rules:
+
+```php
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
+
+$this->app->singleton(DocumentValidator::class, fn () => new MyValidator());
+```
+
+`EInvoicing::transport()` returns a transport that validates every document;
+`EInvoicing::transport($name, validated: false)` returns the bare driver. To validate a document
+yourself, for example a received one, `EInvoicing::xrechnung()->validate($xml)` and
+`EInvoicing::facturx()->validate($xml)` return a core `ValidationReport`.
 
 ### States
 
@@ -343,7 +380,8 @@ EInvoicing::extend('my-ap', fn ($app, #[\SensitiveParameter] array $config) => n
 ```
 
 The factory returns a core `Transport` (and an `InboundSource` if it receives documents). With
-validation on, the manager wraps it in `ValidatingTransport` like the built-in driver. Its
+validation on, its documents are validated like those of the built-in driver: by the send job
+before the claim, and by the `ValidatingTransport` that `EInvoicing::transport()` wraps it in. Its
 contract with this package:
 
 - **After the request has been sent, throw only `TransportException` subclasses** of the core,
@@ -403,7 +441,7 @@ configured secret while faked.
 
 | Command | Purpose |
 |---|---|
-| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, inbound documents at the attempt cap, numeric job settings, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
+| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, the installed rule packages, tables, inbound documents at the attempt cap, numeric job settings, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
 | `einvoicing:install-rules [--from=DIR]` | install the Peppol BIS Billing validation rules |
 | `einvoicing:poll-inbound [--transport=] [--include-capped]` | record waiting inbound documents and queue their intake; schedule it. `--include-capped` gives each document at `inbound.max_fetch_attempts` one more attempt |
 | `einvoicing:resolve ID (--sent=DOCUMENT-ID \| --resend) [--force]` | resolve an `unconfirmed` send, or queue a document again |

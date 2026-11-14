@@ -75,15 +75,32 @@ final class SendDocument extends MessageJob
             return;
         }
 
-        // A configuration or rule set problem propagates and leaves the row queued.
-        $transport = $manager->transport($message->transport);
+        // A configuration or rule set problem propagates and leaves the row queued. The document
+        // is validated here, before the claim, so the bare driver sends it.
+        $transport = $manager->transport($message->transport, validated: false);
+        $validator = $manager->validator();
 
         try {
             $document = $message->toOutboundDocument();
         } catch (InvalidArgumentException $e) {
-            $this->failUnsent($message, $e);
+            $this->failUnsent($message, FailureCategory::Other, $e->getMessage());
 
             return;
+        }
+
+        if ($validator !== null) {
+            try {
+                $report = $validator->validate($document->xml);
+            } catch (UnsupportedDocument|UnsafeXml $e) {
+                $this->failUnsent($message, FailureCategory::Validation, $e->getMessage());
+
+                return;
+            }
+            if (! $report->isValid()) {
+                $this->failUnsent($message, FailureCategory::Validation, (new InvalidDocument($report))->getMessage());
+
+                return;
+            }
         }
 
         // The expiry is scheduled before the claim, so a worker killed right after claiming
@@ -196,7 +213,7 @@ final class SendDocument extends MessageJob
     private function sendFailed(OutboundMessage $message, Throwable $e, int $claim, bool $synchronous): void
     {
         // Definitely not accepted, and trying again would not help. A document that cannot be
-        // read is refused by validation before any request is made.
+        // read is refused by validation, here or in a custom driver, before any request is made.
         $category = match (true) {
             $e instanceof InvalidDocument, $e instanceof DocumentRejected,
             $e instanceof UnsupportedDocument, $e instanceof UnsafeXml => FailureCategory::Validation,
@@ -328,13 +345,14 @@ final class SendDocument extends MessageJob
     }
 
     /**
-     * Fails a document that cannot be rebuilt from its row; nothing was sent.
+     * Fails a queued document before it is claimed: one that cannot be rebuilt from its row or
+     * that failed validation. Nothing was sent.
      */
-    private function failUnsent(OutboundMessage $message, InvalidArgumentException $e): void
+    private function failUnsent(OutboundMessage $message, FailureCategory $category, string $reason): void
     {
         if ($message->transition(OutboundState::Queued, OutboundState::Failed, [
-            'failure_category' => FailureCategory::Other,
-            'failure_message' => $e->getMessage(),
+            'failure_category' => $category,
+            'failure_message' => $reason,
             'finished_at' => now(),
         ])) {
             event(new DocumentFailed($message));

@@ -16,8 +16,9 @@ alkalmazásból.
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
   beépített `recommand` driver a [Recommand](https://recommand.eu) access pointhoz csatlakozik,
   saját drivert az `EInvoicing::extend()` regisztrál.
-- **Peppol BIS validáció minden küldés előtt**, alapból bekapcsolva; a hivatalos szabályokat
-  egyetlen artisan parancs telepíti.
+- **Validáció minden küldés előtt**, alapból bekapcsolva: a Peppol BIS dokumentumokat a
+  hivatalos szabályok ellenőrzik (egyetlen artisan parancs telepíti őket), az XRechnung
+  dokumentumokat a KoSIT-szabályok.
 - **Sorba állított küldés, védett állapotgéppel.** A küldést egy feltételes UPDATE foglalja le,
   így egy duplikált vagy megismételt job sosem küld kétszer. Ha egy küldés kimenetele nem
   ismert, a csomag **soha nem küldi újra magától**: egy operátor dönt róla.
@@ -106,20 +107,32 @@ use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 $message = EInvoicing::send($invoice, reference: 'INV-2026-0001');
 ```
 
-A `send()` elfogad egy core `Invoice` modellt, UBL XML-t stringként vagy egy
+A `send()` elfogad egy core `Invoice` modellt, UBL vagy CII XML-t stringként vagy egy
 `OutboundDocument`-et. A címzést (küldő, címzett, folyamat) magából a számlából olvassa ki. A
 dokumentumot `OutboundMessage`-ként, `queued` állapotban tárolja, a `SendDocument` jobot pedig
 a nyitott adatbázis-tranzakció (ha van) commitja után indítja. A harmadik, opcionális
 paraméterrel az alapértelmezettől eltérő transport adható meg.
 
-**Állítsd be a Peppol BIS CustomizationID-t.** A core UBL-írója alapból
-`urn:cen.eu:en16931:2017` értéket ír a `cbc:CustomizationID`-be: ez sima EN 16931, nem Peppol
-BIS Billing 3.0. Küldés előtt add meg a számlán a BIS-azonosítót:
+**Add meg a számlán annak a folyamatvezérlését (process control), amit küldesz.** Peppolon csak
+ezek a dokumentumok mennek ki, a gyökérelem és a specifikációazonosító (BT-24) pontos párosa
+alapján:
+
+- Peppol BIS Billing 3.0: UBL Invoice vagy CreditNote;
+- XRechnung 3.0: UBL Invoice, UBL CreditNote vagy CII számla;
+- XRechnung 3.0 Extension: UBL Invoice vagy CII számla.
+
+Az XRechnung CVD-t és az elavult XRechnung UBL Credit Note Extensiont a csomag elutasítja. A core
+írói folyamatvezérlés nélküli számlára `urn:cen.eu:en16931:2017` értéket írnak: ez sima
+EN 16931, egyik fenti sem, ezért állítsd be:
 
 ```php
 use IntrAgile\EInvoicing\Model\ProcessControl;
+use IntrAgile\EInvoicing\Syntax\Syntax;
+use IntrAgile\EInvoicing\Syntax\XRechnung;
+use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\Peppol\PeppolBis3;
 
+// Peppol BIS Billing 3.0
 new Invoice(
     // ...
     processControl: new ProcessControl(
@@ -127,11 +140,38 @@ new Invoice(
         PeppolBis3::PROCESS,
     ),
 );
+
+// XRechnung 3.0, a send($invoice) UBL-ként küldi, CII-ként így:
+$invoice = new Invoice(/* ... */ processControl: XRechnung::processControl());
+EInvoicing::send(OutboundDocument::fromInvoice($invoice, syntax: Syntax::Cii));
 ```
 
-Bekapcsolt validációval (ez az alapértelmezés) a Peppol-szabályok elutasítják az enélküli
-dokumentumot, és a küldés `failed` állapotban, `validation` kategóriával zárul, mielőtt bármi
-elhagyná a szervert. Kikapcsolt validációnál semmi sem állítja meg; erre a doctor figyelmeztet.
+Minden más dokumentumot már maga a `send()` elutasít: `UnsupportedDocument` kivételt dob az
+okkal, és semmit sem tárol. Ez kikapcsolt validációnál is így van.
+
+### Validáció
+
+Bekapcsolt validációnál (ez az alapértelmezés) a `SendDocument` job még a sor lefoglalása előtt
+validálja a dokumentumot: a Peppol BIS dokumentumokat a telepített Peppol-szabályokkal, az
+XRechnung dokumentumokat az `intragile/einvoicing-rules-xrechnung` KoSIT-szabályaival (ezt a
+csomag függőségként behúzza). Az érvénytelen dokumentum `failed` állapotba kerül `validation`
+kategóriával és 0 `attempts` értékkel, és semmi sem hagyja el a szervert. Ha egy szabálykészlet
+hiányzik, a sor `queued` marad, a job pedig az okkal együtt elbukik: telepítsd a szabályokat,
+majd sorold be újra az `einvoicing:resolve ID --resend` paranccsal.
+
+Saját szabályokhoz köss be egy validátort a containerbe; a job és az `EInvoicing::transport()`
+ekkor ezt használja a Peppol-szabályok helyett:
+
+```php
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
+
+$this->app->singleton(DocumentValidator::class, fn () => new MyValidator());
+```
+
+Az `EInvoicing::transport()` minden dokumentumot validáló transportot ad vissza, az
+`EInvoicing::transport($name, validated: false)` a nyers drivert. Ha magad validálnál egy
+dokumentumot, például egy fogadottat, az `EInvoicing::xrechnung()->validate($xml)` és az
+`EInvoicing::facturx()->validate($xml)` core `ValidationReport`-ot ad vissza.
 
 ### Állapotok
 
@@ -357,7 +397,8 @@ EInvoicing::extend('my-ap', fn ($app, #[\SensitiveParameter] array $config) => n
 ```
 
 A factory egy core `Transport`-ot ad vissza (és `InboundSource`-ot is, ha dokumentumot fogad).
-Bekapcsolt validációnál a manager a beépített driverhez hasonlóan `ValidatingTransport`-ba
+Bekapcsolt validációnál a dokumentumait a beépített driveréhez hasonlóan validálja a csomag: a
+küldő job a lefoglalás előtt, és az a `ValidatingTransport`, amelybe az `EInvoicing::transport()`
 csomagolja. A csomaggal szemben vállalt szerződése:
 
 - **Miután a kérés elment, csak a core `TransportException` alosztályait dobja**, aszerint, amit
@@ -420,7 +461,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Parancs | Feladat |
 |---|---|
-| `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a táblákat, a kísérleti keretet elhasznált bejövő dokumentumokat, a számértékű job-beállításokat, a queue drivert, a `pcntl`-t, a `retry_after`-t és az SQS-késleltetéseket; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
+| `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a telepített szabálycsomagokat, a táblákat, a kísérleti keretet elhasznált bejövő dokumentumokat, a számértékű job-beállításokat, a queue drivert, a `pcntl`-t, a `retry_after`-t és az SQS-késleltetéseket; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
 | `einvoicing:install-rules [--from=DIR]` | telepíti a Peppol BIS Billing validációs szabályokat |
 | `einvoicing:poll-inbound [--transport=] [--include-capped]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd. A `--include-capped` minden, az `inbound.max_fetch_attempts` keretet elhasznált dokumentumnak még egy kísérletet ad |
 | `einvoicing:resolve ID (--sent=DOKUMENTUM-ID \| --resend) [--force]` | rendez egy `unconfirmed` küldést, vagy újra sorba állít egy dokumentumot |

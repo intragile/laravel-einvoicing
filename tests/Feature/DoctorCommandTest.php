@@ -12,6 +12,7 @@ use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
+use IntrAgile\EInvoicing\Laravel\Tests\Support\CallbackValidator;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Transport\DeliveryStatus;
 use IntrAgile\EInvoicing\Transport\Exception\AuthenticationFailed;
@@ -22,6 +23,7 @@ use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\Peppol\PeppolBis3;
 use IntrAgile\EInvoicing\Transport\SendResult;
 use IntrAgile\EInvoicing\Transport\Transport;
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use LogicException;
 use PHPUnit\Framework\Attributes\DataProvider;
 
@@ -95,7 +97,7 @@ final class DoctorCommandTest extends TestCase
         $this->assertRow($output, 'default transport', 'ok', 'recommand');
         $this->assertRow($output, 'recommand: config', 'ok');
         $this->assertRow($output, 'recommand: base URL', 'ok');
-        $this->assertRow($output, 'validation', 'warn', 'CustomizationID');
+        $this->assertRow($output, 'validation', 'warn', 'without rule checks');
         $this->assertRow($output, 'queue', 'warn', 'no retries');
         $this->assertStringContainsString('no delivery status polling', $output);
         $this->assertStringContainsString('no expiry', $output);
@@ -206,6 +208,30 @@ final class DoctorCommandTest extends TestCase
         $this->assertRow($output, 'validation', 'fail', 'run php artisan einvoicing:install-rules');
         $this->assertRow($output, 'tables', 'fail', 'run php artisan migrate');
         $this->assertStringContainsString('einvoicing_inbound_documents', $output);
+    }
+
+    public function test_doctor_reports_rule_packages(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+
+        [, $output] = $this->doctor();
+
+        foreach (['en16931', 'xrechnung', 'facturx'] as $package) {
+            $this->assertRow($output, "rules einvoicing-rules-{$package}", 'ok', '1.0.0');
+        }
+    }
+
+    public function test_doctor_names_a_bound_validator_instead_of_the_peppol_rules(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', true);
+        config()->set('einvoicing.validation.rules_dir', $this->emptyDir());
+        $this->app->instance(DocumentValidator::class, new CallbackValidator(static fn () => CallbackValidator::valid()));
+
+        [, $output] = $this->doctor();
+
+        $this->assertRow($output, 'validation', 'ok', 'bound in the container');
     }
 
     public function test_doctor_shows_webhook_url(): void

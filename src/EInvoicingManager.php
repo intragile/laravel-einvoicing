@@ -26,8 +26,11 @@ use IntrAgile\EInvoicing\Transport\Recommand\RecommandTransport;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandWebhook;
 use IntrAgile\EInvoicing\Transport\Transport;
 use IntrAgile\EInvoicing\Transport\ValidatingTransport;
+use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
-use IntrAgile\EInvoicing\Validation\Validator;
+use IntrAgile\EInvoicing\Validation\FacturX\FacturXValidator;
+use IntrAgile\EInvoicing\Validation\PeppolPayloadValidator;
+use IntrAgile\EInvoicing\Validation\XRechnung\XRechnungValidator;
 use InvalidArgumentException;
 use SensitiveParameter;
 
@@ -35,8 +38,10 @@ use SensitiveParameter;
  * Builds the transports named in the einvoicing configuration.
  *
  * Transports are built on first use and cached per name. When validation is enabled, every
- * transport, custom drivers included, is wrapped in a ValidatingTransport with the Peppol rules,
- * so a missing rule set surfaces when a transport is requested, never at boot. The cache keeps the
+ * transport, custom drivers included, is wrapped in a ValidatingTransport with the document
+ * validator: a DocumentValidator bound in the container, or else the Peppol payload validator,
+ * which checks Peppol BIS documents with the installed Peppol rules and XRechnung documents with
+ * the KoSIT rules. A missing rule set surfaces when a transport is requested, never at boot. The cache keeps the
  * validation setting a transport was built with: changing einvoicing.validation.enabled at run
  * time affects only transports built afterwards, so a long-running worker needs a restart (or
  * extend(), which empties the cache) to pick it up. The application
@@ -61,32 +66,80 @@ final class EInvoicingManager
 
     private ?FakeTransport $fake = null;
 
+    private ?PeppolPayloadValidator $peppolValidator = null;
+
     public function __construct(Application $app)
     {
         $this->app = static fn (): Application => $app;
     }
 
     /**
-     * The transport with this name, or the default one, validated when validation is enabled.
+     * The transport with this name, or the default one. It validates every document before
+     * sending when validation is enabled, unless $validated is false: then it is the bare driver,
+     * for a caller that has validated the document itself.
      *
      * @throws ConfigurationException when the transport is not configured or its configuration is invalid
-     * @throws RulesNotInstalled when validation is enabled and the Peppol rules are not installed
+     * @throws RulesNotInstalled when the document is validated and the Peppol rules are not installed
      */
-    public function transport(?string $name = null): Transport
+    public function transport(?string $name = null, bool $validated = true): Transport
     {
         if ($this->fake !== null) {
             return $this->fake;
         }
         $name ??= $this->defaultName();
 
+        if (! $validated) {
+            return $this->driver($name);
+        }
+
         if (! isset($this->transports[$name])) {
             $driver = $this->driver($name);
-            $this->transports[$name] = $this->validationEnabled()
-                ? new ValidatingTransport($driver, Validator::peppol($this->rulesDir()))
-                : $driver;
+            $validator = $this->validator();
+            $this->transports[$name] = $validator !== null ? new ValidatingTransport($driver, $validator) : $driver;
         }
 
         return $this->transports[$name];
+    }
+
+    /**
+     * The validator documents are checked with before sending, or null when validation is
+     * disabled or the transports are faked. A DocumentValidator bound in the container replaces
+     * the default one, the Peppol payload validator of the installed rules.
+     *
+     * @throws RulesNotInstalled when the default validator is used and the Peppol rules are not installed
+     */
+    public function validator(): ?DocumentValidator
+    {
+        if ($this->fake !== null || ! $this->validationEnabled()) {
+            return null;
+        }
+
+        $app = ($this->app)();
+        if ($app->bound(DocumentValidator::class)) {
+            return $app->make(DocumentValidator::class);
+        }
+
+        return $this->peppolValidator ??= PeppolPayloadValidator::create($this->rulesDir());
+    }
+
+    /**
+     * The XRechnung validator of the KoSIT rules in intragile/einvoicing-rules-xrechnung.
+     *
+     * @throws RulesNotInstalled when that package is not installed
+     */
+    public function xrechnung(): XRechnungValidator
+    {
+        return XRechnungValidator::create();
+    }
+
+    /**
+     * The Factur-X validator of the rules in intragile/einvoicing-rules-facturx.
+     *
+     * @throws RulesNotInstalled when that package is not installed
+     */
+    public function facturx(): FacturXValidator
+    {
+        return FacturXValidator::create();
     }
 
     /**
@@ -94,12 +147,14 @@ final class EInvoicingManager
      * transaction, if any, commits. The returned message reflects the row as stored here; on the
      * sync queue connection the send has already run, so refresh() it to see the outcome.
      *
-     * @param  OutboundDocument|Invoice|string  $document  a routed document, an invoice written as UBL, or UBL XML
+     * @param  OutboundDocument|Invoice|string  $document  a routed document, an invoice written as UBL, or UBL or CII XML
      * @param  string|null  $reference  the application's own reference, e.g. the invoice number
      * @param  string|null  $transport  the transport name; the default one when null
      *
      * @throws UnsafeXml when the XML carries a DOCTYPE declaration
-     * @throws UnsupportedDocument when the document is not a UBL Invoice or CreditNote or lacks an electronic address
+     * @throws UnsupportedDocument when the document is not a sendable Peppol BIS or XRechnung document (an invoice
+     *                             needs the process control of one, see OutboundDocument::fromXml()) or lacks an
+     *                             electronic address
      * @throws InvalidArgumentException when the invoice cannot be written or an identifier is malformed
      * @throws ConfigurationException when the transport is not configured or a numeric job setting is invalid
      */
