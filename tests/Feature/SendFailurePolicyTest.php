@@ -18,6 +18,7 @@ use IntrAgile\EInvoicing\Laravel\Events\DocumentDelivered;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentFailed;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentSent;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentUnconfirmed;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Jobs\ExpireSendingClaim;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
@@ -713,6 +714,33 @@ final class SendFailurePolicyTest extends TestCase
         $this->assertSame(OutboundState::Queued, $row->state);
         $this->assertSame(0, $row->attempts);
         $this->assertSame([], $this->fake->sent());
+    }
+
+    public function test_mid_flow_setting_is_validated_before_the_claim(): void
+    {
+        Queue::fake();
+        $message = $this->queued();
+        $sent = 0;
+        $manager = $this->transportThat(function () use (&$sent): SendResult {
+            $sent++;
+
+            throw new TransportUnavailable('Connection refused.');
+        });
+        // Read only after a refused send, yet checked before anything is claimed or sent.
+        config()->set('einvoicing.sending.max_attempts', 'many');
+
+        try {
+            $this->sendJob($message, $manager);
+            $this->fail('A non-numeric sending.max_attempts was accepted.');
+        } catch (ConfigurationException $e) {
+            $this->assertStringContainsString('einvoicing.sending.max_attempts', $e->getMessage());
+        }
+
+        $row = $this->stored($message);
+        $this->assertSame(OutboundState::Queued, $row->state);
+        $this->assertSame(0, $row->attempts);
+        $this->assertSame(0, $sent);
+        Queue::assertNothingPushed();
     }
 
     public function test_late_unknown_outcome_fires_unconfirmed_once(): void

@@ -67,6 +67,9 @@ final class SendDocument extends MessageJob
 
     public function handle(EInvoicingManager $manager): void
     {
+        // Before the claim: a setting read after the transport answered must not fail there.
+        self::assertSettings();
+
         $message = OutboundMessage::query()->find($this->messageId);
         if ($message === null || $message->state !== OutboundState::Queued) {
             return;

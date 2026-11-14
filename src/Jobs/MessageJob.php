@@ -35,7 +35,47 @@ abstract class MessageJob implements ShouldQueue
 
         $this->onConnection(is_string($connection) && $connection !== '' ? $connection : null);
         $this->onQueue(is_string($queue) && $queue !== '' ? $queue : null);
+        self::assertSettings();
         $this->timeout = static::jobTimeout();
+    }
+
+    /** Numeric settings the jobs read, some of them only midway through a job. */
+    private const NUMERIC_SETTINGS = ['http.timeout', 'http.connect_timeout', 'sending.max_attempts', 'status.max_attempts'];
+
+    private const DEFAULT_MAX_FETCH_ATTEMPTS = 10;
+
+    /** The largest accepted inbound attempt cap, so the counter fits a small unsigned column everywhere. */
+    private const MAX_FETCH_ATTEMPTS_LIMIT = 65535;
+
+    /**
+     * Checks every numeric setting the jobs read. It runs before a row is written, when a job is
+     * built and when a job starts, before any claim or other state change, so a setting that a
+     * job reads only after the transport has answered can never fail at that point.
+     *
+     * @throws ConfigurationException naming the first invalid setting
+     */
+    public static function assertSettings(): void
+    {
+        foreach (self::NUMERIC_SETTINGS as $key) {
+            self::setting($key, 0);
+        }
+        self::attemptCap();
+    }
+
+    /**
+     * The total number of failed fetches and acknowledgements after which an inbound document is
+     * no longer tried automatically.
+     *
+     * @throws ConfigurationException when inbound.max_fetch_attempts is not a whole number from 1 to 65535
+     */
+    public static function attemptCap(): int
+    {
+        return ConfigValue::integer(
+            config('einvoicing.inbound.max_fetch_attempts') ?? self::DEFAULT_MAX_FETCH_ATTEMPTS,
+            'einvoicing.inbound.max_fetch_attempts',
+            1,
+            self::MAX_FETCH_ATTEMPTS_LIMIT,
+        );
     }
 
     /** The longest delay, in seconds, that Amazon SQS accepts for a message. */

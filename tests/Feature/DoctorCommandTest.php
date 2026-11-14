@@ -375,18 +375,29 @@ final class DoctorCommandTest extends TestCase
         $this->assertStringContainsString('--include-capped', $output);
     }
 
-    public function test_doctor_fails_on_a_non_numeric_setting(): void
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function numericJobSettings(): iterable
+    {
+        foreach (['einvoicing.http.timeout', 'einvoicing.http.connect_timeout', 'einvoicing.sending.max_attempts', 'einvoicing.status.max_attempts', 'einvoicing.inbound.max_fetch_attempts'] as $key) {
+            yield $key => [$key];
+        }
+    }
+
+    #[DataProvider('numericJobSettings')]
+    public function test_doctor_fails_on_a_non_numeric_setting(string $key): void
     {
         $this->configureRecommand();
         config()->set('einvoicing.validation.enabled', false);
         config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'default', 'retry_after' => 300]);
         config()->set('queue.default', 'db');
-        config()->set('einvoicing.http.timeout', 'soon');
+        config()->set($key, 'soon');
 
         [$code, $output] = $this->doctor();
 
         $this->assertSame(1, $code, $output);
-        $this->assertRow($output, 'queue', 'fail', 'einvoicing.http.timeout');
+        $this->assertRow($output, 'job settings', 'fail', $key);
     }
 
     public function test_doctor_never_prints_secrets(): void

@@ -294,11 +294,17 @@ final class DoctorCommand extends Command
     private function checkQueue(): void
     {
         try {
-            $this->checkQueueConnection();
+            MessageJob::assertSettings();
         } catch (ConfigurationException $exception) {
-            // The message names the setting, never its value.
-            $this->row('queue', self::FAIL, $exception->getMessage());
+            // The message names the setting, never its value. The queue checks derive timeouts
+            // from these settings, so they are skipped.
+            $this->row('job settings', self::FAIL, $exception->getMessage());
+
+            return;
         }
+        $this->row('job settings', self::OK, 'http timeouts, attempts and the inbound cap are numbers');
+
+        $this->checkQueueConnection();
     }
 
     private function checkQueueConnection(): void

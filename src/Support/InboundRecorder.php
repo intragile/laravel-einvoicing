@@ -7,6 +7,7 @@ namespace IntrAgile\EInvoicing\Laravel\Support;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Transport\InboundReference;
@@ -30,6 +31,7 @@ final class InboundRecorder
      * violation is then rethrown, and the document is picked up on the next notification or poll.
      *
      * @throws UniqueConstraintViolationException when a concurrent insert won but its row is not visible here
+     * @throws ConfigurationException when a numeric job setting is invalid; nothing is stored then
      */
     public function notify(string $transport, string $documentId, ?InboundReference $reference = null): InboundMessage
     {
@@ -37,6 +39,9 @@ final class InboundRecorder
         if ($existing !== null) {
             return $existing;
         }
+
+        // Before the row is written, so an invalid setting leaves no notified row without a job.
+        FetchInboundDocument::assertSettings();
 
         try {
             // A savepoint inside an open transaction keeps it usable after a duplicate insert.

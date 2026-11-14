@@ -101,7 +101,7 @@ final class EInvoicingManager
      * @throws UnsafeXml when the XML carries a DOCTYPE declaration
      * @throws UnsupportedDocument when the document is not a UBL Invoice or CreditNote or lacks an electronic address
      * @throws InvalidArgumentException when the invoice cannot be written or an identifier is malformed
-     * @throws ConfigurationException when the transport is not configured
+     * @throws ConfigurationException when the transport is not configured or a numeric job setting is invalid
      */
     public function send(OutboundDocument|Invoice|string $document, ?string $reference = null, ?string $transport = null): OutboundMessage
     {
@@ -112,6 +112,8 @@ final class EInvoicingManager
         };
         $transport ??= $this->defaultName();
         $this->transportConfig($transport);
+        // Before the row is written, so an invalid setting leaves no queued row without a job.
+        SendDocument::assertSettings();
 
         $message = OutboundMessage::fromDocument($document, $transport, $reference);
         $message->state = OutboundState::Queued;

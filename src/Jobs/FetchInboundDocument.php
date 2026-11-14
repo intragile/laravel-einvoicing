@@ -10,9 +10,7 @@ use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentReceived;
-use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
-use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Laravel\Support\InboundRecorder;
 use IntrAgile\EInvoicing\Transport\Exception\OutcomeUnknown;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
@@ -47,27 +45,6 @@ final class FetchInboundDocument extends MessageJob
 
     private const DEFAULT_MAX_ATTEMPTS = 5;
 
-    private const DEFAULT_MAX_FETCH_ATTEMPTS = 10;
-
-    /** The largest accepted cap, so the counter fits a small unsigned column on every database. */
-    private const MAX_FETCH_ATTEMPTS_LIMIT = 65535;
-
-    /**
-     * The total number of failed fetches and acknowledgements after which a document is no
-     * longer tried automatically.
-     *
-     * @throws ConfigurationException when inbound.max_fetch_attempts is not a whole number from 1 to 65535
-     */
-    public static function attemptCap(): int
-    {
-        return ConfigValue::integer(
-            config('einvoicing.inbound.max_fetch_attempts') ?? self::DEFAULT_MAX_FETCH_ATTEMPTS,
-            'einvoicing.inbound.max_fetch_attempts',
-            1,
-            self::MAX_FETCH_ATTEMPTS_LIMIT,
-        );
-    }
-
     /**
      * Two requests, each with its connect and response timeouts, plus a margin.
      */
@@ -78,6 +55,8 @@ final class FetchInboundDocument extends MessageJob
 
     public function handle(EInvoicingManager $manager): void
     {
+        self::assertSettings();
+
         // The stored XML is never needed here.
         $message = InboundMessage::queryWithoutXml()->find($this->messageId);
         if ($message === null || $message->state === InboundState::Acknowledged || $message->fetch_attempts >= self::attemptCap()) {

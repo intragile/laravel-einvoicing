@@ -403,7 +403,7 @@ configured secret while faked.
 
 | Command | Purpose |
 |---|---|
-| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, inbound documents at the attempt cap, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
+| `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, tables, inbound documents at the attempt cap, numeric job settings, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
 | `einvoicing:install-rules [--from=DIR]` | install the Peppol BIS Billing validation rules |
 | `einvoicing:poll-inbound [--transport=] [--include-capped]` | record waiting inbound documents and queue their intake; schedule it. `--include-capped` gives each document at `inbound.max_fetch_attempts` one more attempt |
 | `einvoicing:resolve ID (--sent=DOCUMENT-ID \| --resend) [--force]` | resolve an `unconfirmed` send, or queue a document again |

@@ -827,6 +827,38 @@ final class InboundTest extends TestCase
         $this->assertSame([], $this->fetched);
     }
 
+    public function test_invalid_job_setting_on_notify_stores_nothing(): void
+    {
+        config()->set('einvoicing.sending.max_attempts', 'many');
+
+        try {
+            $this->app->make(InboundRecorder::class)->notify('recommand', 'in-1');
+            $this->fail('A non-numeric sending.max_attempts was accepted.');
+        } catch (ConfigurationException $e) {
+            $this->assertStringContainsString('einvoicing.sending.max_attempts', $e->getMessage());
+        }
+
+        $this->assertSame(0, InboundMessage::query()->count());
+    }
+
+    public function test_fetch_job_validates_settings_before_fetching(): void
+    {
+        $this->stubSource();
+        $message = $this->notified();
+        $this->fetches = [new TransportUnavailable('down')];
+        config()->set('einvoicing.sending.max_attempts', 'many');
+
+        try {
+            $this->runFetch($message);
+            $this->fail('A non-numeric sending.max_attempts was accepted.');
+        } catch (ConfigurationException $e) {
+            $this->assertStringContainsString('einvoicing.sending.max_attempts', $e->getMessage());
+        }
+
+        $this->assertSame([], $this->fetched);
+        $this->assertSame(0, $this->stored($message)->fetch_attempts);
+    }
+
     public function test_poll_skips_capped_rows(): void
     {
         config()->set('einvoicing.inbound.max_fetch_attempts', 3);

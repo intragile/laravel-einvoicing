@@ -60,6 +60,9 @@ final class PollDeliveryStatus extends MessageJob
 
     public function handle(EInvoicingManager $manager, DeliveryRecorder $recorder): void
     {
+        // Before the check is counted, so an invalid setting never ends the poll chain midway.
+        self::assertSettings();
+
         $message = OutboundMessage::query()->find($this->messageId);
         if ($message === null
             || $message->state !== OutboundState::Pending

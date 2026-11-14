@@ -176,6 +176,24 @@ final class SendDocumentTest extends TestCase
         $this->assertSame(0, OutboundMessage::query()->count());
     }
 
+    public function test_invalid_job_setting_throws_and_stores_nothing(): void
+    {
+        foreach (['einvoicing.http.timeout', 'einvoicing.sending.max_attempts', 'einvoicing.status.max_attempts'] as $key) {
+            config()->set($key, 'soon');
+            try {
+                EInvoicing::send($this->fixture());
+                $this->fail("A non-numeric {$key} was accepted.");
+            } catch (ConfigurationException $e) {
+                $this->assertStringContainsString($key, $e->getMessage());
+            }
+            config()->set($key, null);
+        }
+
+        // Validated before the row is written, so a retrying caller leaves no orphaned rows.
+        $this->assertSame(0, OutboundMessage::query()->count());
+        $this->assertSame([], $this->fake->sent());
+    }
+
     public function test_second_job_for_same_message_does_not_send(): void
     {
         Queue::fake();
