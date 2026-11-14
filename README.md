@@ -25,7 +25,8 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 - **Delivery status** by polling and by webhook, with events at every step.
 - **Inbound documents** from webhooks or polling: fetched, stored, announced once, and only
   then acknowledged at the access point.
-- **Signed webhooks** verified on the raw request body, without the `web` middleware group.
+- **Signed webhooks**, verified against the request exactly as received, without the `web`
+  middleware group.
 - `EInvoicing::fake()` for your tests, and `einvoicing:doctor` to check an installation.
 
 > **No driver is live-tested yet.** Everything is tested offline; see
@@ -439,7 +440,10 @@ with a built-in driver (or a custom driver with a parser registered with
 3. Nothing else: the route does not run the `web` middleware group, so no CSRF token or
    session is involved, and you need no CSRF exception.
 
-The driver's parser checks the signature (HMAC-SHA256) on the raw body exactly as received.
+Pass the body exactly as received; each driver's parser verifies it its provider's way, with an
+HMAC-SHA256 keyed with the webhook secret: Recommand over the raw body, B2Brouter over
+`<t>.<raw body>` (the timestamp from its signature header, a dot, then the raw body), and
+e-invoice.be over a canonical JSON form of the event, not over the raw body.
 Answers have an empty body: `401` for a missing or wrong signature, `404` for a transport
 without a webhook secret, `204` for everything else, including notifications that are ignored
 (another provider account, an unknown document, a non-document event), so the access point does
@@ -453,8 +457,9 @@ or on a `sync` queue connection, nothing is polled and the row stays `pending`, 
 regular status poll. Check such a row at the access point: `einvoicing:resolve` does not handle a
 `pending` row (it resolves `unconfirmed` and abandoned `sending` rows).
 
-B2Brouter's `X-B2Brouter-Delivery-Id` header, which the package uses to recognise a repeated
-delivery, is not covered by B2Brouter's signature, and `webhook_tolerance` is off by default, so
+B2Brouter's `X-B2Brouter-Delivery-Id` header, which the core offers as `deduplicationKey` to
+your `WebhookReceived` listeners (the package itself does not deduplicate on it), is not
+covered by B2Brouter's signature, and `webhook_tolerance` is off by default, so
 a captured notification can be replayed later. A replay can only repeat a state B2Brouter really
 reported, and `delivered` and `failed` never change again. Set `webhook_tolerance` if replays
 matter more to you than late retries (see the core's TRANSPORT.md). Webhooks are not live-tested,
@@ -607,7 +612,7 @@ configured secret while faked.
 
 | Area | How | Status |
 |---|---|---|
-| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 231 tests, 1239 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 | Run on every test run |
+| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 276 tests, 1587 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 (1583 with `--prefer-lowest` dependencies) | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description | **Live transmission not verified** |
 | B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference; manager, config, doctor and webhook routing tested here | **Not live-tested** |

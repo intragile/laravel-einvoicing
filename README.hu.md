@@ -27,7 +27,8 @@ alkalmazásból.
 - **Kézbesítési státusz** lekérdezéssel és webhookkal, minden lépésnél eseménnyel.
 - **Bejövő dokumentumok** webhookból vagy lekérdezésből: letöltés, tárolás, egyszeri esemény,
   és csak ezután nyugtázás az access pointnál.
-- **Aláírt webhookok**, a nyers kéréstörzsön ellenőrizve, a `web` middleware-csoport nélkül.
+- **Aláírt webhookok**, pontosan a beérkezett kérésen ellenőrizve, a `web` middleware-csoport
+  nélkül.
 - `EInvoicing::fake()` a saját tesztekhez, `einvoicing:doctor` a telepítés ellenőrzéséhez.
 
 > **Egyik drivert sem teszteltük még élesben.** Minden teszt offline fut; lásd:
@@ -453,9 +454,12 @@ driverű (vagy `EInvoicing::extendWebhook()`-kal regisztrált parserű saját dr
 3. Más teendő nincs: az útvonal nem futtatja a `web` middleware-csoportot, így sem CSRF-token,
    sem session nem kell hozzá, és CSRF-kivételt sem kell felvenni.
 
-Az aláírást (HMAC-SHA256) a driver parsere a nyers kéréstörzsön ellenőrzi, pontosan úgy, ahogy
-megérkezett. A válaszok törzse üres: `401` hiányzó vagy hibás aláírásra, `404` webhook
-secret nélküli transportra, minden másra `204`, a figyelmen kívül hagyott értesítésekre is
+A kéréstörzset pontosan úgy add át, ahogy megérkezett; minden driver parsere a saját
+szolgáltatója módján ellenőrzi, a webhook secrettel kulcsolt HMAC-SHA256-tal: a Recommand a nyers
+törzsön, a B2Brouter a `<t>.<nyers törzs>` szövegen (az aláírásfejléc időbélyege, egy pont, majd
+a nyers törzs), az e-invoice.be pedig az esemény kanonikus JSON-alakján, nem a nyers törzsön.
+A válaszok törzse üres: `401` hiányzó vagy hibás aláírásra, `404` webhook secret nélküli
+transportra, minden másra `204`, a figyelmen kívül hagyott értesítésekre is
 (másik szolgáltatói fiók, ismeretlen dokumentum, nem dokumentumra vonatkozó esemény), hogy az
 access point ne próbálja újra őket. Az ismételt vagy rossz sorrendben érkező értesítések
 ártalmatlanok: a bejövő dokumentum azonosítónként egyszer tárolódik, a `delivered` és `failed`
@@ -469,9 +473,10 @@ lekérdezés, és a sor `pending` marad, ahogy az utolsó rendes státuszlekérd
 sort az access pointnál ellenőrizd: az `einvoicing:resolve` nem kezeli a `pending` sort (az
 `unconfirmed` és az elhagyott `sending` sort rendezi).
 
-A B2Brouter `X-B2Brouter-Delivery-Id` fejlécét, amelyből a csomag az ismételt kézbesítést
-felismeri, a B2Brouter aláírása nem fedi le, a `webhook_tolerance` pedig alapból ki van kapcsolva,
-így egy elfogott értesítés később újra beküldhető. Az újrajátszás csak olyan állapotot ismételhet
+A B2Brouter `X-B2Brouter-Delivery-Id` fejlécét, amelyet a core `deduplicationKey`-ként ad át a
+`WebhookReceived` listenereidnek (maga a csomag nem szűr rá ismétlést), a B2Brouter aláírása
+nem fedi le, a `webhook_tolerance` pedig alapból ki van kapcsolva, így egy elfogott értesítés
+később újra beküldhető. Az újrajátszás csak olyan állapotot ismételhet
 meg, amelyet a B2Brouter valóban jelentett, a `delivered` és `failed` állapot pedig már nem
 változik. Állítsd be a `webhook_tolerance` értékét, ha az újrajátszás fontosabb szempont a késői
 újrapróbálásoknál (lásd a core TRANSPORT.md leírását). A webhookokat élesben nem teszteltük,
@@ -634,7 +639,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Terület | Hogyan | Állapot |
 |---|---|---|
-| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 231 teszt, 1239 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
+| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 276 teszt, 1587 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción (`--prefer-lowest` függőségekkel 1583) | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
 | B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben nem tesztelt** |
