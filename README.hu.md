@@ -15,7 +15,8 @@ alkalmazásból.
 
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
   beépített `recommand` driver a [Recommand](https://recommand.eu) access pointhoz csatlakozik,
-  saját drivert az `EInvoicing::extend()` regisztrál.
+  saját drivert az `EInvoicing::extend()` regisztrál. Elérhető driver a Recommand; a Storecove,
+  az e-invoice.be és a B2Brouter driver az 1.0.0-ra tervezett.
 - **Validáció minden küldés előtt**, alapból bekapcsolva: a Peppol BIS dokumentumokat a
   hivatalos szabályok ellenőrzik (egyetlen artisan parancs telepíti őket), az XRechnung
   dokumentumokat a KoSIT-szabályok.
@@ -53,13 +54,16 @@ php artisan einvoicing:doctor                          # mindent ellenőriz, ami
 >
 > ```json
 > "repositories": [
->     { "type": "path", "url": "../php-einvoicing" },
->     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931" },
->     { "type": "path", "url": "../laravel-einvoicing" }
+>     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931", "options": { "versions": { "intragile/einvoicing-rules-en16931": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing/packages/rules-xrechnung", "options": { "versions": { "intragile/einvoicing-rules-xrechnung": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing/packages/rules-facturx", "options": { "versions": { "intragile/einvoicing-rules-facturx": "1.0.0" } } },
+>     { "type": "path", "url": "../laravel-einvoicing", "options": { "versions": { "intragile/laravel-einvoicing": "1.0.0" } } }
 > ]
 > ```
 >
-> majd kérd be így: `"intragile/laravel-einvoicing": "@dev"`.
+> majd kérd be így: `"intragile/laravel-einvoicing": "^1.0"`. A `versions` beállítás minden path
+> csomagnak azt a verziót adja, amelyet az öt csomag egymás közötti feltételei várnak.
 
 A migrációt a csomag maga tölti be. Ha saját példányt szeretnél belőle az alkalmazásban:
 `php artisan vendor:publish --tag=einvoicing-migrations`.
@@ -167,6 +171,13 @@ use IntrAgile\EInvoicing\Validation\DocumentValidator;
 
 $this->app->singleton(DocumentValidator::class, fn () => new MyValidator());
 ```
+
+Az alapértelmezett validátor létrehozáskor betölti a Peppol BIS szabályokat akkor is, ha csak
+XRechnung dokumentumot küldesz, ezért az `einvoicing:install-rules` ilyenkor is kell. Kikapcsolt
+validációnál (`validation.enabled` hamis) a bekötött `DocumentValidator` nem fut. Az
+`EInvoicing::transport()` által már felépített transport azt a validátort tartja meg, amellyel
+felépült, ezért a sajátodat az első hívás előtt kösd be, például egy service provider
+`register()` metódusában.
 
 Az `EInvoicing::transport()` minden dokumentumot validáló transportot ad vissza, az
 `EInvoicing::transport($name, validated: false)` a nyers drivert. Ha magad validálnál egy
@@ -391,9 +402,12 @@ EInvoicing::extend('my-ap', fn ($app, #[\SensitiveParameter] array $config) => n
 
 ```php
 // config/einvoicing.php
-'transports' => [
-    'other' => ['driver' => 'my-ap', 'token' => env('MY_AP_TOKEN')],
-],
+return [
+    // ...
+    'transports' => [
+        'other' => ['driver' => 'my-ap', 'token' => env('MY_AP_TOKEN')],
+    ],
+];
 ```
 
 A factory egy core `Transport`-ot ad vissza (és `InboundSource`-ot is, ha dokumentumot fogad).
@@ -470,7 +484,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Terület | Hogyan | Állapot |
 |---|---|---|
-| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 165 teszt, 1022 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
+| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 231 teszt, 1239 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
 
@@ -479,6 +493,16 @@ A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
 A csomag egyik tesztje sem használ hálózatot. A core-ban van egy opcionális `recommand-live`
 csoport Recommand playground csapathoz; lásd a core
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md) leírását.
+
+## Verziókezelés
+
+Az öt csomag (`intragile/php-einvoicing`, az `intragile/einvoicing-rules-en16931`,
+`intragile/einvoicing-rules-xrechnung` és `intragile/einvoicing-rules-facturx` szabálycsomag,
+valamint az `intragile/laravel-einvoicing`) mindig együtt, azonos verziószámmal jelenik meg, a
+szemantikus verziózás (Semantic Versioning) szerint. Mindegyikből ugyanazt a minor verziót
+használd. A szabálycsomagok Composer `conflict` bejegyzéssel kizárják a saját minor verziójuknál
+régebbi (és a következő major) magot, így új szabályok sosem kerülnek olyan motor mellé, amely
+nem tudja futtatni őket.
 
 ## Fejlesztés
 

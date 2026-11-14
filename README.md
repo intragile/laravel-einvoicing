@@ -14,7 +14,8 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 
 - **Configured transports.** Named connections in `config/einvoicing.php`; the built-in
   `recommand` driver talks to the [Recommand](https://recommand.eu) access point, and
-  `EInvoicing::extend()` adds your own.
+  `EInvoicing::extend()` adds your own. Recommand is the available driver; Storecove,
+  e-invoice.be and B2Brouter are planned for 1.0.0.
 - **Validation before every send**, on by default: Peppol BIS documents with the official rules,
   installed by one artisan command, and XRechnung documents with the KoSIT rules.
 - **Queued sending with a guarded state machine.** A send is claimed with a conditional update,
@@ -51,13 +52,16 @@ php artisan einvoicing:doctor                          # checks everything below
 >
 > ```json
 > "repositories": [
->     { "type": "path", "url": "../php-einvoicing" },
->     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931" },
->     { "type": "path", "url": "../laravel-einvoicing" }
+>     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931", "options": { "versions": { "intragile/einvoicing-rules-en16931": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing/packages/rules-xrechnung", "options": { "versions": { "intragile/einvoicing-rules-xrechnung": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing/packages/rules-facturx", "options": { "versions": { "intragile/einvoicing-rules-facturx": "1.0.0" } } },
+>     { "type": "path", "url": "../laravel-einvoicing", "options": { "versions": { "intragile/laravel-einvoicing": "1.0.0" } } }
 > ]
 > ```
 >
-> and require `"intragile/laravel-einvoicing": "@dev"`.
+> and require `"intragile/laravel-einvoicing": "^1.0"`. The `versions` option gives each path
+> package the version the constraints between the five packages expect.
 
 The migration is loaded from the package. To keep a copy in your application, publish it with
 `php artisan vendor:publish --tag=einvoicing-migrations`.
@@ -163,6 +167,12 @@ use IntrAgile\EInvoicing\Validation\DocumentValidator;
 
 $this->app->singleton(DocumentValidator::class, fn () => new MyValidator());
 ```
+
+The default validator loads the Peppol BIS rules when it is built, even if you send only
+XRechnung documents, so run `einvoicing:install-rules` in that case too. A bound
+`DocumentValidator` is ignored when `validation.enabled` is false. A transport already built by
+`EInvoicing::transport()` keeps the validator it was built with, so bind yours before the first
+call, for example in a service provider's `register()`.
 
 `EInvoicing::transport()` returns a transport that validates every document;
 `EInvoicing::transport($name, validated: false)` returns the bare driver. To validate a document
@@ -374,9 +384,12 @@ EInvoicing::extend('my-ap', fn ($app, #[\SensitiveParameter] array $config) => n
 
 ```php
 // config/einvoicing.php
-'transports' => [
-    'other' => ['driver' => 'my-ap', 'token' => env('MY_AP_TOKEN')],
-],
+return [
+    // ...
+    'transports' => [
+        'other' => ['driver' => 'my-ap', 'token' => env('MY_AP_TOKEN')],
+    ],
+];
 ```
 
 The factory returns a core `Transport` (and an `InboundSource` if it receives documents). With
@@ -450,7 +463,7 @@ configured secret while faked.
 
 | Area | How | Status |
 |---|---|---|
-| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 165 tests, 1022 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 | Run on every test run |
+| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 231 tests, 1239 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description | **Live transmission not verified** |
 
@@ -459,6 +472,15 @@ The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
 No test of this package makes a network call. The core has an opt-in `recommand-live` group
 for a Recommand playground team; see its
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
+
+## Versioning
+
+The five packages, `intragile/php-einvoicing`, the rule packages
+`intragile/einvoicing-rules-en16931`, `intragile/einvoicing-rules-xrechnung` and
+`intragile/einvoicing-rules-facturx`, and `intragile/laravel-einvoicing`, are released together
+with the same version number and follow Semantic Versioning. Use the same minor version of each.
+A rule package declares a Composer `conflict` with cores older than its own minor version (and
+with the next major), so new rules are never installed next to an engine that cannot run them.
 
 ## Development
 
