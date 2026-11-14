@@ -131,6 +131,9 @@ final class ResolveCommand extends Command
             return $this->wrongState($message, 'only an unconfirmed, failed or queued document can be queued again');
         }
 
+        // Before the row is queued again, so an invalid setting leaves no queued row without a job.
+        SendDocument::assertSettings();
+
         // The earlier send is cleared, so a late notification for it no longer finds this row.
         if (! $message->transition($from, OutboundState::Queued, [
             'provider_document_id' => null,

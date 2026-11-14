@@ -7,10 +7,12 @@ namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentSent;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
@@ -239,6 +241,24 @@ final class ResolveCommandTest extends TestCase
         $this->assertNull($row->provider_document_id);
         Queue::assertNothingPushed();
         Event::assertNotDispatched(DocumentSent::class);
+    }
+
+    public function test_resend_with_an_invalid_job_setting_changes_nothing(): void
+    {
+        $message = $this->message(OutboundState::Failed, 2);
+        $before = $this->stored($message)->getAttributes();
+        config()->set('einvoicing.http.timeout', 'soon');
+
+        try {
+            Artisan::call('einvoicing:resolve', ['id' => $message->id, '--resend' => true, '--no-interaction' => true]);
+            $this->fail('A resend with a non-numeric job setting was accepted.');
+        } catch (ConfigurationException $exception) {
+            $this->assertStringContainsString('einvoicing.http.timeout', $exception->getMessage());
+        }
+
+        // Checked before the row is queued again, so no queued row is left without a job.
+        $this->assertSame($before, $this->stored($message)->getAttributes());
+        Queue::assertNothingPushed();
     }
 
     public function test_resolve_resend_queued_dispatches_again(): void
