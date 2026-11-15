@@ -11,6 +11,7 @@ use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentReceived;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\InboundRecorder;
 use IntrAgile\EInvoicing\Transport\Exception\OutcomeUnknown;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
@@ -145,7 +146,7 @@ final class FetchInboundDocument extends MessageJob
 
     private function acknowledge(InboundSource $source, InboundMessage $message): void
     {
-        if (! config('einvoicing.inbound.acknowledge', true)) {
+        if (! ConfigFlag::enabled('inbound.acknowledge')) {
             return;
         }
 

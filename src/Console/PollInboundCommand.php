@@ -9,6 +9,7 @@ use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\InboundRecorder;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
 
@@ -45,7 +46,7 @@ final class PollInboundCommand extends Command
         }
 
         // Without acknowledgements a fetched document is finished, though it stays pending.
-        $acknowledge = (bool) config('einvoicing.inbound.acknowledge', true);
+        $acknowledge = ConfigFlag::enabled('inbound.acknowledge');
         $includeCapped = (bool) $this->option('include-capped');
         $new = 0;
         $retried = 0;

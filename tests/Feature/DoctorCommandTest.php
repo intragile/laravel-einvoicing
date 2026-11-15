@@ -104,19 +104,26 @@ final class DoctorCommandTest extends TestCase
     public function test_non_boolean_flag_warns(): void
     {
         $this->configureRecommand();
+        $this->app->instance(DocumentValidator::class, new CallbackValidator(static fn () => CallbackValidator::valid()));
         config()->set('einvoicing.webhooks.enabled', 'ture');
         config()->set('einvoicing.validation.enabled', 'maybe');
+        config()->set('einvoicing.inbound.acknowledge', 'yse');
+        config()->set('einvoicing.status.poll', [true]);
 
         [$code, $output] = $this->doctor();
 
         $this->assertSame(0, $code, $output);
         $this->assertRow($output, 'config flags', 'warn', 'einvoicing.webhooks.enabled is not a boolean; treated as off');
-        $this->assertRow($output, 'config flags', 'warn', 'einvoicing.validation.enabled is not a boolean; treated as off');
-        // The unparseable validation flag is read as off, like everywhere else.
-        $this->assertRow($output, 'validation', 'warn', 'without rule checks');
+        $this->assertRow($output, 'config flags', 'warn', 'einvoicing.validation.enabled is not a boolean; treated as on');
+        $this->assertRow($output, 'config flags', 'warn', 'einvoicing.inbound.acknowledge is not a boolean; treated as on');
+        $this->assertRow($output, 'config flags', 'warn', 'einvoicing.status.poll is not a boolean; treated as on');
+        // The unreadable validation flag keeps validation on.
+        $this->assertRow($output, 'validation', 'ok', 'bound in the container');
 
         config()->set('einvoicing.webhooks.enabled', ' FALSE ');
         config()->set('einvoicing.validation.enabled', 'off');
+        config()->set('einvoicing.inbound.acknowledge', '0');
+        config()->set('einvoicing.status.poll', 'false');
         [, $output] = $this->doctor();
 
         $this->assertStringNotContainsString('config flags', $output);

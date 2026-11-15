@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace IntrAgile\EInvoicing\Laravel\Tests\Unit;
 
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
+use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
-use PHPUnit\Framework\TestCase;
 use stdClass;
 
 final class ConfigFlagTest extends TestCase
@@ -32,6 +32,36 @@ final class ConfigFlagTest extends TestCase
     {
         self::assertSame($expected, ConfigFlag::read($value, true));
         self::assertSame($expected, ConfigFlag::read($value, false));
+    }
+
+    /**
+     * @return iterable<string, array{string, bool}>
+     */
+    public static function settings(): iterable
+    {
+        yield 'validation stays on' => ['validation.enabled', true];
+        yield 'webhook route stays off' => ['webhooks.enabled', false];
+        yield 'acknowledgements stay on' => ['inbound.acknowledge', true];
+        yield 'status polls stay on' => ['status.poll', true];
+    }
+
+    #[DataProvider('settings')]
+    public function test_settings_fall_back_to_their_safe_value(string $key, bool $whenUnreadable): void
+    {
+        config()->set("einvoicing.{$key}", null);
+        self::assertTrue(ConfigFlag::enabled($key));
+
+        foreach (['false', '0', 'off', ''] as $off) {
+            config()->set("einvoicing.{$key}", $off);
+            self::assertFalse(ConfigFlag::enabled($key), $off);
+        }
+        config()->set("einvoicing.{$key}", 'true');
+        self::assertTrue(ConfigFlag::enabled($key));
+
+        foreach (['ture', 2, ['on']] as $unreadable) {
+            config()->set("einvoicing.{$key}", $unreadable);
+            self::assertSame($whenUnreadable, ConfigFlag::enabled($key));
+        }
     }
 
     public function test_null_gives_the_default(): void

@@ -546,6 +546,34 @@ final class WebhookTest extends TestCase
         $this->assertSame(0, InboundMessage::query()->count());
     }
 
+    #[DefineEnvironment('garbleWebhooksFlag')]
+    public function test_unreadable_webhooks_flag_registers_no_route(): void
+    {
+        $this->assertNull(Route::getRoutes()->getByName('einvoicing.webhook'));
+    }
+
+    #[DefineEnvironment('disableWebhooksByString')]
+    public function test_webhooks_disabled_by_an_environment_string_registers_no_route(): void
+    {
+        $this->assertNull(Route::getRoutes()->getByName('einvoicing.webhook'));
+    }
+
+    /**
+     * @param  Application  $app
+     */
+    protected function garbleWebhooksFlag($app): void
+    {
+        $app['config']->set('einvoicing.webhooks.enabled', 'ture');
+    }
+
+    /**
+     * @param  Application  $app
+     */
+    protected function disableWebhooksByString($app): void
+    {
+        $app['config']->set('einvoicing.webhooks.enabled', 'false');
+    }
+
     /**
      * @param  Application  $app
      */

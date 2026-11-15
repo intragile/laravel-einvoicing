@@ -758,8 +758,8 @@ final class EInvoicingManager
 
     private function validationEnabled(): bool
     {
-        // A value that cannot be read as a flag means off; einvoicing:doctor warns about it.
-        return ConfigFlag::read($this->config()->get('einvoicing.validation.enabled'), true) === true;
+        // A value that cannot be read as a flag keeps validation on; einvoicing:doctor warns about it.
+        return ConfigFlag::enabled('validation.enabled');
     }
 
     private function config(): Repository

@@ -34,7 +34,7 @@ final class EInvoicingServiceProvider extends ServiceProvider
 
         // Registering the route reads configuration only; transports are built per request. The
         // setting may come from an environment variable; a value that is not a flag means off.
-        if (ConfigFlag::read($this->app->make('config')->get('einvoicing.webhooks.enabled'), true) === true) {
+        if (ConfigFlag::enabled('webhooks.enabled')) {
             $this->loadRoutesFrom(self::ROUTES);
         }
 

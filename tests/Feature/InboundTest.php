@@ -36,6 +36,7 @@ use IntrAgile\EInvoicing\Transport\Sbdh\Envelope;
 use IntrAgile\EInvoicing\Transport\SendResult;
 use IntrAgile\EInvoicing\Transport\Transport;
 use LogicException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use Throwable;
 
@@ -247,9 +248,21 @@ final class InboundTest extends TestCase
         Event::assertDispatchedTimes(DocumentReceived::class, 1);
     }
 
-    public function test_repeated_poll_fires_one_event(): void
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function offValues(): iterable
     {
-        config()->set('einvoicing.inbound.acknowledge', false);
+        yield 'false' => [false];
+        yield 'string false' => ['false'];
+        yield 'string 0' => ['0'];
+        yield 'string off' => [' OFF '];
+    }
+
+    #[DataProvider('offValues')]
+    public function test_repeated_poll_fires_one_event(mixed $acknowledge): void
+    {
+        config()->set('einvoicing.inbound.acknowledge', $acknowledge);
         Event::fake([DocumentReceived::class]);
         $fake = EInvoicing::fake();
         $fake->receive($this->document('in-1'));

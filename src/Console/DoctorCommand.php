@@ -299,20 +299,20 @@ final class DoctorCommand extends Command
     }
 
     /**
-     * Warns about on/off settings that cannot be read as a flag; they are treated as off.
+     * Warns about on/off settings that cannot be read as a flag; each falls back to its safe value.
      */
     private function checkFlags(): void
     {
-        foreach (['webhooks.enabled', 'validation.enabled'] as $key) {
-            if (ConfigFlag::read(config("einvoicing.{$key}"), true) === null) {
-                $this->row('config flags', self::WARN, "einvoicing.{$key} is not a boolean; treated as off");
+        foreach (ConfigFlag::SETTINGS as $key => [$default, $unparseable]) {
+            if (ConfigFlag::read(config("einvoicing.{$key}"), $default) === null) {
+                $this->row('config flags', self::WARN, sprintf('einvoicing.%s is not a boolean; treated as %s', $key, $unparseable ? 'on' : 'off'));
             }
         }
     }
 
     private function checkValidation(EInvoicingManager $manager): void
     {
-        if (ConfigFlag::read(config('einvoicing.validation.enabled'), true) !== true) {
+        if (! ConfigFlag::enabled('validation.enabled')) {
             $this->row('validation', self::WARN, 'off: documents are sent without rule checks; only documents that are not a sendable Peppol BIS or XRechnung type are refused');
 
             return;
@@ -384,7 +384,7 @@ final class DoctorCommand extends Command
         try {
             $cap = FetchInboundDocument::attemptCap();
             $states = [InboundState::Notified->value];
-            if ((bool) config('einvoicing.inbound.acknowledge', true)) {
+            if (ConfigFlag::enabled('inbound.acknowledge')) {
                 $states[] = InboundState::Fetched->value;
             }
             $capped = InboundMessage::query()->whereIn('state', $states)->where('fetch_attempts', '>=', $cap)->count();
@@ -491,7 +491,7 @@ final class DoctorCommand extends Command
             'einvoicing.sending.backoff (send and inbound retries)' => SendDocument::longestBackoff(),
             'sending claim expiry (from einvoicing.http timeouts)' => SendDocument::claimLifetime(),
         ];
-        if ((bool) config('einvoicing.status.poll', true)) {
+        if (ConfigFlag::enabled('status.poll')) {
             $delays['einvoicing.status.delays'] = PollDeliveryStatus::longestDelay();
         }
         $over = array_filter($delays, static fn (int $delay): bool => $delay > MessageJob::SQS_MAX_DELAY);

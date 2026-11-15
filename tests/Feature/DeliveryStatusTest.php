@@ -29,6 +29,7 @@ use IntrAgile\EInvoicing\Transport\OutboundDocument;
 use IntrAgile\EInvoicing\Transport\SendResult;
 use IntrAgile\EInvoicing\Transport\Transport;
 use LogicException;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 final class DeliveryStatusTest extends TestCase
 {
@@ -452,9 +453,21 @@ final class DeliveryStatusTest extends TestCase
         Queue::assertNotPushed(PollDeliveryStatus::class);
     }
 
-    public function test_no_poll_when_disabled(): void
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function offValues(): iterable
     {
-        config()->set('einvoicing.status.poll', false);
+        yield 'false' => [false];
+        yield 'string false' => ['false'];
+        yield 'string 0' => ['0'];
+        yield 'string off' => [' OFF '];
+    }
+
+    #[DataProvider('offValues')]
+    public function test_no_poll_when_disabled(mixed $poll): void
+    {
+        config()->set('einvoicing.status.poll', $poll);
         $fake = EInvoicing::fake();
         $fake->willReturn(new SendResult('doc-1', DeliveryState::Pending));
         $message = $this->message(OutboundState::Queued, null);

@@ -477,14 +477,21 @@ final class ManagerTest extends TestCase
         $this->configureRecommand();
         config()->set('einvoicing.validation.rules_dir', $this->emptyDir());
 
-        foreach (['false', '0', 'off', '', 'ture'] as $value) {
+        foreach (['false', '0', 'off', ''] as $value) {
             config()->set('einvoicing.validation.enabled', $value);
             self::assertNotInstanceOf(ValidatingTransport::class, $this->freshManager()->transport(), var_export($value, true));
         }
 
-        config()->set('einvoicing.validation.enabled', 'true');
-        $this->expectException(RulesNotInstalled::class);
-        $this->freshManager()->transport();
+        // An unreadable value keeps validation on, like "true".
+        foreach (['true', 'ture'] as $value) {
+            config()->set('einvoicing.validation.enabled', $value);
+            try {
+                $this->freshManager()->transport();
+                self::fail('Validation must stay on for '.var_export($value, true).'.');
+            } catch (RulesNotInstalled) {
+                self::addToAssertionCount(1);
+            }
+        }
     }
 
     public function test_webhook_requires_recommand_driver_and_secret(): void

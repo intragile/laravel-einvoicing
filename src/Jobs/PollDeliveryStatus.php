@@ -7,6 +7,7 @@ namespace IntrAgile\EInvoicing\Laravel\Jobs;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\DeliveryRecorder;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
 
@@ -43,7 +44,7 @@ final class PollDeliveryStatus extends MessageJob
      */
     public static function start(int $messageId, int $attempts, ?string $connection = null): void
     {
-        if (! config('einvoicing.status.poll', true) || self::runsSynchronously($connection)) {
+        if (! ConfigFlag::enabled('status.poll') || self::runsSynchronously($connection)) {
             return;
         }
 
