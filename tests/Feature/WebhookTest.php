@@ -435,25 +435,25 @@ final class WebhookTest extends TestCase
 
     public function test_einvoicebe_received_event_notifies_inbound(): void
     {
-        $this->receive('in-1');
+        $this->receive('doc-in1');
         Event::fake([WebhookReceived::class]);
 
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1', 'tenant-1')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1', 'tenant-1')), 204);
 
-        $row = InboundMessage::query()->where('transport', 'einvoicebe')->where('provider_document_id', 'in-1')->sole();
+        $row = InboundMessage::query()->where('transport', 'einvoicebe')->where('provider_document_id', 'doc-in1')->sole();
         $this->assertSame(InboundState::Acknowledged, $row->state);
         Event::assertDispatched(WebhookReceived::class, fn (WebhookReceived $event): bool => $event->event->kind === WebhookKind::DocumentReceived
             && $event->event->accountId === 'tenant-1');
 
         // Other events are acknowledged and ignored.
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received.failed', 'in-2')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received.failed', 'doc-in2')), 204);
         $this->assertSame(1, InboundMessage::query()->count());
     }
 
     public function test_foreign_account_is_ignored(): void
     {
-        $this->receive('in-1');
-        $this->receive('in-2');
+        $this->receive('doc-in1');
+        $this->receive('doc-in2');
         Event::fake([WebhookReceived::class, DocumentDelivered::class]);
         $message = $this->pending('4711', 'b2brouter');
 
@@ -465,17 +465,17 @@ final class WebhookTest extends TestCase
         $this->assertSame(OutboundState::Delivered, OutboundMessage::query()->findOrFail($message->id)->state);
 
         // e-invoice.be without a configured tenant id: every tenant is processed.
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1', 'tenant-1')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1', 'tenant-1')), 204);
         $this->assertSame(1, InboundMessage::query()->where('transport', 'einvoicebe')->count());
 
         // With a tenant id configured, another tenant is dropped and the configured one processed.
         config()->set('einvoicing.transports.einvoicebe.tenant_id', 'tenant-2');
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-2', 'tenant-1')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in2', 'tenant-1')), 204);
         $this->assertSame(1, InboundMessage::query()->where('transport', 'einvoicebe')->count());
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-2', 'tenant-2')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in2', 'tenant-2')), 204);
         $this->assertSame(2, InboundMessage::query()->where('transport', 'einvoicebe')->count());
         // An event that names no tenant is processed.
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.sent', '4711')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.sent', 'doc-4711')), 204);
         Event::assertDispatchedTimes(WebhookReceived::class, 4);
     }
 
@@ -493,18 +493,18 @@ final class WebhookTest extends TestCase
     #[DataProvider('invalidAccountIds')]
     public function test_invalid_configured_account_id_fails_closed(mixed $tenantId): void
     {
-        $this->receive('in-1');
+        $this->receive('doc-in1');
         Event::fake([WebhookReceived::class]);
         config()->set('einvoicing.transports.einvoicebe.tenant_id', $tenantId);
 
         // A configured but invalid account id does not switch the filter off: every event naming
         // an account is acknowledged and ignored.
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1', 'tenant-1')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1', 'tenant-1')), 204);
         $this->assertSame(0, InboundMessage::query()->count());
         Event::assertNotDispatched(WebhookReceived::class);
 
         // An event naming no account is still applied.
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1')), 204);
         $this->assertSame(1, InboundMessage::query()->count());
     }
 
@@ -522,13 +522,13 @@ final class WebhookTest extends TestCase
 
     public function test_configured_account_id_is_trimmed(): void
     {
-        $this->receive('in-1');
+        $this->receive('doc-in1');
         Event::fake([WebhookReceived::class]);
         $message = $this->pending('doc-1');
         config()->set('einvoicing.transports.einvoicebe.tenant_id', " tenant-1\n");
         config()->set('einvoicing.transports.recommand.company_id', ' c_test ');
 
-        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1', 'tenant-1')), 204);
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1', 'tenant-1')), 204);
         self::assertEmptyResponse($this->signed('{"eventType":"document.sent","documentId":"doc-1","companyId":"c_test","deliveryStatus":"delivered"}'), 204);
 
         $this->assertSame(1, InboundMessage::query()->count());
