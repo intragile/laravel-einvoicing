@@ -7,6 +7,7 @@ namespace IntrAgile\EInvoicing\Laravel\Tests\Live;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use IntrAgile\EInvoicing\CodeList\ElectronicAddressScheme;
+use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
@@ -15,9 +16,14 @@ use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Model\ElectronicAddress;
 use IntrAgile\EInvoicing\Model\Party;
 use IntrAgile\EInvoicing\Transport\Peppol\ParticipantId;
+use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
 use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\XRechnung\XRechnungValidator;
+use PHPUnit\Framework\AssertionFailedError;
 use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\IncompleteTest;
+use PHPUnit\Framework\SkippedTest;
+use Throwable;
 
 /**
  * Sends an XRechnung invoice through the installed bridge to the Peppol test network with the
@@ -78,6 +84,28 @@ final class RecommandSmokeTest extends TestCase
     public function test_send_through_the_bridge_reaches_delivered(): void
     {
         $this->assertTestNetworkPlayground();
+
+        // Exception and failure messages may carry the company id in a URL, so every failure
+        // is redacted; a skip passes through unchanged.
+        $config = app(EInvoicingManager::class)->driverConfig('recommand');
+        self::assertInstanceOf(RecommandConfig::class, $config);
+        $redactor = $config->redactor()->with([$config->companyId]);
+        try {
+            $this->sendAndPoll();
+        } catch (SkippedTest|IncompleteTest $mark) {
+            throw $mark;
+        } catch (AssertionFailedError $failure) {
+            self::fail($redactor->redact($failure->getMessage()));
+        } catch (Throwable $exception) {
+            self::fail($redactor->redact($exception::class.': '.$exception->getMessage()));
+        }
+    }
+
+    /**
+     * Sends the invoice and polls the outbound row until it is no longer pending.
+     */
+    private function sendAndPoll(): void
+    {
         app()->instance(DocumentValidator::class, XRechnungValidator::create());
 
         $sender = ParticipantId::parse((string) getenv('RECOMMAND_SENDER_ID'));
@@ -126,7 +154,7 @@ final class RecommandSmokeTest extends TestCase
         self::assertSame(200, $response->status(), 'GET /api/v1/playgrounds/current answered HTTP '.$response->status().'.');
         $playground = $response->json('playground');
         self::assertTrue(
-            is_array($playground),
+            $response->json('success') === true && is_array($playground),
             'The API key does not belong to a playground team; the live test refuses to send from a production team.',
         );
         self::assertTrue(
