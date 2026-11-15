@@ -9,9 +9,10 @@
     <testsuites>
         <testsuite name="Unit"><directory>tests/Unit</directory></testsuite>
         <testsuite name="Feature"><directory>tests/Feature</directory></testsuite>
+        <testsuite name="Live"><directory>tests/Live</directory></testsuite>
     </testsuites>
     <groups>
-        <exclude><group>peppol-rules</group></exclude>
+        <exclude><group>peppol-rules</group><group>recommand-live</group></exclude>
     </groups>
     <source>
         <include><directory>src</directory></include>
