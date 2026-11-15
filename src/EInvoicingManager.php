@@ -15,6 +15,7 @@ use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
@@ -72,6 +73,18 @@ final class EInvoicingManager
         'recommand' => ['api_key_id', 'secret', 'company_id'],
         'b2brouter' => ['api_key', 'account_id'],
         'einvoicebe' => ['api_key'],
+    ];
+
+    /**
+     * The setting of each built-in driver that names the provider account webhook events are
+     * matched against.
+     *
+     * @var array<string, string>
+     */
+    public const ACCOUNT_KEYS = [
+        'recommand' => 'company_id',
+        'b2brouter' => 'account_id',
+        'einvoicebe' => 'tenant_id',
     ];
 
     /** Longest webhook timestamp tolerance accepted, one year in seconds. */
@@ -273,7 +286,12 @@ final class EInvoicingManager
     /**
      * The provider account configured for the transport with this name, which webhook events
      * are matched against: the Recommand company id, the B2Brouter account id or the e-invoice.be
-     * tenant id. Null when there is none, the setting is invalid, or the driver is not built in.
+     * tenant id, without surrounding whitespace. Null when the setting is absent or null, when
+     * the transport is not configured, or when the driver is not built in.
+     *
+     * @throws ConfigurationException when the setting is given but is no valid account id, such
+     *                                as a blank string or a list; webhook events naming an account
+     *                                are then ignored rather than accepted from any account
      */
     public function accountId(string $name): ?string
     {
@@ -283,12 +301,26 @@ final class EInvoicingManager
             return null;
         }
 
-        return match ($config['driver'] ?? null) {
-            'recommand' => self::nonBlank($config['company_id'] ?? null),
-            'b2brouter' => $this->b2brouterAccount($config['account_id'] ?? null),
-            'einvoicebe' => self::nonBlank($config['tenant_id'] ?? null),
-            default => null,
+        $driver = $config['driver'] ?? null;
+        $key = is_string($driver) ? (self::ACCOUNT_KEYS[$driver] ?? null) : null;
+        if ($key === null) {
+            return null;
+        }
+        $value = $config[$key] ?? null;
+        if ($value === null) {
+            return null;
+        }
+
+        $account = match ($driver) {
+            'b2brouter' => $this->b2brouterAccount($value),
+            default => is_string($value) || is_int($value) ? self::nonBlank(trim((string) $value)) : null,
         };
+
+        return $account ?? throw new ConfigurationException(sprintf(
+            'einvoicing.transports.%s.%s is not a valid account id; webhook events are ignored.',
+            $name,
+            $key,
+        ));
     }
 
     /**
@@ -726,7 +758,8 @@ final class EInvoicingManager
 
     private function validationEnabled(): bool
     {
-        return (bool) $this->config()->get('einvoicing.validation.enabled', true);
+        // A value that cannot be read as a flag means off; einvoicing:doctor warns about it.
+        return ConfigFlag::read($this->config()->get('einvoicing.validation.enabled'), true) === true;
     }
 
     private function config(): Repository

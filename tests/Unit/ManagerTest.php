@@ -444,6 +444,49 @@ final class ManagerTest extends TestCase
         self::assertNull($this->manager()->accountId('missing'));
     }
 
+    public function test_account_id_is_trimmed_and_an_invalid_one_is_refused(): void
+    {
+        config()->set('einvoicing.transports', [
+            'recommand' => ['driver' => 'recommand', 'company_id' => " c_test\t"],
+            'b2brouter' => ['driver' => 'b2brouter', 'account_id' => ' 78234 '],
+            'einvoicebe' => ['driver' => 'einvoicebe', 'tenant_id' => null],
+            'blank' => ['driver' => 'einvoicebe', 'tenant_id' => '  '],
+            'listed' => ['driver' => 'recommand', 'company_id' => ['c_test']],
+            'wordy' => ['driver' => 'b2brouter', 'account_id' => 'abc'],
+        ]);
+
+        self::assertSame('c_test', $this->manager()->accountId('recommand'));
+        self::assertSame('78234', $this->manager()->accountId('b2brouter'));
+        self::assertNull($this->manager()->accountId('einvoicebe'));
+
+        foreach (['blank' => 'tenant_id', 'listed' => 'company_id', 'wordy' => 'account_id'] as $name => $key) {
+            try {
+                $this->manager()->accountId($name);
+                self::fail("An invalid {$key} must be refused.");
+            } catch (ConfigurationException $exception) {
+                self::assertSame(
+                    "einvoicing.transports.{$name}.{$key} is not a valid account id; webhook events are ignored.",
+                    $exception->getMessage(),
+                );
+            }
+        }
+    }
+
+    public function test_validation_flag_reads_environment_strings(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.rules_dir', $this->emptyDir());
+
+        foreach (['false', '0', 'off', '', 'ture'] as $value) {
+            config()->set('einvoicing.validation.enabled', $value);
+            self::assertNotInstanceOf(ValidatingTransport::class, $this->freshManager()->transport(), var_export($value, true));
+        }
+
+        config()->set('einvoicing.validation.enabled', 'true');
+        $this->expectException(RulesNotInstalled::class);
+        $this->freshManager()->transport();
+    }
+
     public function test_webhook_requires_recommand_driver_and_secret(): void
     {
         $this->configureRecommand();

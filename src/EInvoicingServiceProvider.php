@@ -10,6 +10,7 @@ use IntrAgile\EInvoicing\Laravel\Console\DoctorCommand;
 use IntrAgile\EInvoicing\Laravel\Console\InstallRulesCommand;
 use IntrAgile\EInvoicing\Laravel\Console\PollInboundCommand;
 use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 
 final class EInvoicingServiceProvider extends ServiceProvider
 {
@@ -32,9 +33,8 @@ final class EInvoicingServiceProvider extends ServiceProvider
         $this->loadMigrationsFrom(self::MIGRATION);
 
         // Registering the route reads configuration only; transports are built per request. The
-        // setting may come from an environment variable, where "false" and "0" mean off.
-        $enabled = $this->app->make('config')->get('einvoicing.webhooks.enabled') ?? true;
-        if (filter_var($enabled, FILTER_VALIDATE_BOOL)) {
+        // setting may come from an environment variable; a value that is not a flag means off.
+        if (ConfigFlag::read($this->app->make('config')->get('einvoicing.webhooks.enabled'), true) === true) {
             $this->loadRoutesFrom(self::ROUTES);
         }
 

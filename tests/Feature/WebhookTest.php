@@ -37,6 +37,7 @@ use IntrAgile\EInvoicing\Transport\Peppol\PeppolBis3;
 use IntrAgile\EInvoicing\Transport\Webhook\WebhookEvent;
 use IntrAgile\EInvoicing\Transport\Webhook\WebhookKind;
 use Orchestra\Testbench\Attributes\DefineEnvironment;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 final class WebhookTest extends TestCase
 {
@@ -476,6 +477,63 @@ final class WebhookTest extends TestCase
         // An event that names no tenant is processed.
         self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.sent', '4711')), 204);
         Event::assertDispatchedTimes(WebhookReceived::class, 4);
+    }
+
+    /**
+     * @return iterable<string, array{mixed}>
+     */
+    public static function invalidAccountIds(): iterable
+    {
+        yield 'blank' => ['  '];
+        yield 'empty' => [''];
+        yield 'list' => [['tenant-1']];
+        yield 'object' => [new \stdClass];
+    }
+
+    #[DataProvider('invalidAccountIds')]
+    public function test_invalid_configured_account_id_fails_closed(mixed $tenantId): void
+    {
+        $this->receive('in-1');
+        Event::fake([WebhookReceived::class]);
+        config()->set('einvoicing.transports.einvoicebe.tenant_id', $tenantId);
+
+        // A configured but invalid account id does not switch the filter off: every event naming
+        // an account is acknowledged and ignored.
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1', 'tenant-1')), 204);
+        $this->assertSame(0, InboundMessage::query()->count());
+        Event::assertNotDispatched(WebhookReceived::class);
+
+        // An event naming no account is still applied.
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1')), 204);
+        $this->assertSame(1, InboundMessage::query()->count());
+    }
+
+    public function test_invalid_b2brouter_account_id_fails_closed(): void
+    {
+        Event::fake([WebhookReceived::class]);
+        $message = $this->pending('4711', 'b2brouter');
+        config()->set('einvoicing.transports.b2brouter.account_id', '   ');
+
+        self::assertEmptyResponse($this->signedB2Brouter('{"code":"issued_invoice.state_change","data":{"invoice_id":4711,"account_id":78234,"state":"sent"}}'), 204);
+
+        $this->assertSame(OutboundState::Pending, OutboundMessage::query()->findOrFail($message->id)->state);
+        Event::assertNotDispatched(WebhookReceived::class);
+    }
+
+    public function test_configured_account_id_is_trimmed(): void
+    {
+        $this->receive('in-1');
+        Event::fake([WebhookReceived::class]);
+        $message = $this->pending('doc-1');
+        config()->set('einvoicing.transports.einvoicebe.tenant_id', " tenant-1\n");
+        config()->set('einvoicing.transports.recommand.company_id', ' c_test ');
+
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'in-1', 'tenant-1')), 204);
+        self::assertEmptyResponse($this->signed('{"eventType":"document.sent","documentId":"doc-1","companyId":"c_test","deliveryStatus":"delivered"}'), 204);
+
+        $this->assertSame(1, InboundMessage::query()->count());
+        $this->assertSame(OutboundState::Delivered, OutboundMessage::query()->findOrFail($message->id)->state);
+        Event::assertDispatchedTimes(WebhookReceived::class, 2);
     }
 
     #[DefineEnvironment('disableWebhooks')]

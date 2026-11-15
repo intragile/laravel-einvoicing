@@ -17,6 +17,7 @@ use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
 use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeConfig;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
@@ -95,10 +96,12 @@ final class DoctorCommand extends Command
         $this->secrets = $this->secrets();
 
         $this->checkDefault($manager);
+        $this->checkFlags();
         foreach ($manager->names() as $name) {
             $this->checkTransport($manager, $name);
         }
         $this->checkValidation($manager);
+        $this->checkCore();
         $this->checkRulePackages();
         $this->checkTables();
         $this->checkQueue();
@@ -165,8 +168,15 @@ final class DoctorCommand extends Command
             return;
         }
 
-        $this->checkDriverConfig($manager, $name, $driver, $config);
-        $this->checkBaseUrl($name, $driver, $config['base_url'] ?? null);
+        $failure = $this->checkDriverConfig($manager, $name, $driver, $config);
+        // A config row that failed on the base URL already reports it; a second row would repeat it.
+        if ($failure === null || ! str_contains($failure, "einvoicing.transports.{$name}.base_url")) {
+            $this->checkBaseUrl($name, $driver, $config['base_url'] ?? null);
+        }
+        // A required account id that is invalid already fails the config row.
+        if ($failure === null || ! in_array(EInvoicingManager::ACCOUNT_KEYS[$driver], EInvoicingManager::REQUIRED_KEYS[$driver], true)) {
+            $this->checkAccount($manager, $name, $driver);
+        }
         $this->checkWebhook($manager, $name, $config);
         if ($driver === 'einvoicebe') {
             $this->row("{$check}: acknowledge", self::OK, 'local only: e-invoice.be has no acknowledgement call, so a received '
@@ -179,8 +189,9 @@ final class DoctorCommand extends Command
      * one as the manager reports it when building the transport. The values are never printed.
      *
      * @param  array<array-key, mixed>  $config
+     * @return string|null the detail of the failed config row, or null when the row is ok
      */
-    private function checkDriverConfig(EInvoicingManager $manager, string $name, string $driver, #[SensitiveParameter] array $config): void
+    private function checkDriverConfig(EInvoicingManager $manager, string $name, string $driver, #[SensitiveParameter] array $config): ?string
     {
         $check = "transport {$name}";
         $missing = array_values(array_filter(
@@ -188,23 +199,44 @@ final class DoctorCommand extends Command
             static fn (string $key): bool => ! self::present($config[$key] ?? null),
         ));
         if ($missing !== []) {
-            $this->row("{$check}: config", self::FAIL, 'missing or empty: '.self::keyPaths($name, $missing));
+            $detail = 'missing or empty: '.self::keyPaths($name, $missing);
+            $this->row("{$check}: config", self::FAIL, $detail);
 
-            return;
+            return $detail;
         }
 
         try {
             $driverConfig = $manager->driverConfig($name);
         } catch (ConfigurationException $exception) {
-            $this->row("{$check}: config", self::FAIL, $this->describe($exception, withClass: false));
+            $detail = $this->describe($exception, withClass: false);
+            $this->row("{$check}: config", self::FAIL, $detail);
 
-            return;
+            return $detail;
         }
         $this->row("{$check}: config", self::OK, self::CONFIG_SUMMARIES[$driver] ?? 'set');
 
         if ($driverConfig instanceof B2BrouterConfig && $driverConfig->isSandboxKey()) {
             $this->row("{$check}: sandbox", self::WARN, 'the API key starts with "test_", so B2Brouter routes every request to '
                 .'its sandbox: nothing reaches the Peppol network');
+        }
+
+        return null;
+    }
+
+    /**
+     * Warns when the account id that webhook events are matched against is given but invalid,
+     * which makes the webhook ignore every event naming an account. The value is never printed.
+     */
+    private function checkAccount(EInvoicingManager $manager, string $name, string $driver): void
+    {
+        try {
+            $manager->accountId($name);
+        } catch (ConfigurationException) {
+            $this->row("transport {$name}: account", self::WARN, sprintf(
+                'einvoicing.transports.%s.%s is not a valid account id; webhook events are ignored',
+                $name,
+                EInvoicingManager::ACCOUNT_KEYS[$driver] ?? 'account_id',
+            ));
         }
     }
 
@@ -266,9 +298,21 @@ final class DoctorCommand extends Command
         $this->row($check, self::OK, route('einvoicing.webhook', ['transport' => $name]));
     }
 
+    /**
+     * Warns about on/off settings that cannot be read as a flag; they are treated as off.
+     */
+    private function checkFlags(): void
+    {
+        foreach (['webhooks.enabled', 'validation.enabled'] as $key) {
+            if (ConfigFlag::read(config("einvoicing.{$key}"), true) === null) {
+                $this->row('config flags', self::WARN, "einvoicing.{$key} is not a boolean; treated as off");
+            }
+        }
+    }
+
     private function checkValidation(EInvoicingManager $manager): void
     {
-        if (! (bool) config('einvoicing.validation.enabled', true)) {
+        if (ConfigFlag::read(config('einvoicing.validation.enabled'), true) !== true) {
             $this->row('validation', self::WARN, 'off: documents are sent without rule checks; only documents that are not a sendable Peppol BIS or XRechnung type are refused');
 
             return;
@@ -289,6 +333,11 @@ final class DoctorCommand extends Command
         } catch (Throwable $exception) {
             $this->row('validation', self::FAIL, $this->describe($exception).'; run php artisan einvoicing:install-rules');
         }
+    }
+
+    private function checkCore(): void
+    {
+        $this->row('core php-einvoicing', self::OK, (string) InstalledVersions::getPrettyVersion('intragile/php-einvoicing'));
     }
 
     private function checkRulePackages(): void

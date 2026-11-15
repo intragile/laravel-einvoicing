@@ -26,8 +26,9 @@ use IntrAgile\EInvoicing\Transport\Webhook\WebhookKind;
  * before anything else is read from it. Every answer has an empty body: 404 for a transport that
  * takes no webhooks, 401 for a missing or wrong signature, and 204 otherwise, also for
  * notifications that are ignored, so the sender does not retry them. A notification naming
- * another provider account than the configured one is ignored; one naming no account, or arriving
- * for a transport without a configured account, is applied.
+ * another provider account than the configured one is ignored, and so is every notification naming
+ * an account when the configured account id is invalid; one naming no account, or arriving for a
+ * transport without a configured account, is applied.
  *
  * A received document is recorded once per id and fetched. A delivery change with a state moves
  * a pending document to its final state; a final state is never changed again, so a replayed or
@@ -66,8 +67,7 @@ final class WebhookController
             return new Response('', 204);
         }
 
-        $account = $this->manager->accountId($transport);
-        if ($event->accountId !== null && $account !== null && $event->accountId !== $account) {
+        if ($event->accountId !== null && ! $this->acceptsAccount($transport, $event->accountId)) {
             return new Response('', 204);
         }
 
@@ -80,6 +80,21 @@ final class WebhookController
         };
 
         return new Response('', 204);
+    }
+
+    /**
+     * Whether an event naming this provider account belongs to the transport. A configured
+     * account id that is invalid matches no account, so the filter fails closed instead of off.
+     */
+    private function acceptsAccount(string $transport, string $eventAccount): bool
+    {
+        try {
+            $account = $this->manager->accountId($transport);
+        } catch (ConfigurationException) {
+            return false;
+        }
+
+        return $account === null || $eventAccount === $account;
     }
 
     private function deliveryChanged(string $transport, WebhookEvent $event): void

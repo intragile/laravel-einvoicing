@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
+use Composer\InstalledVersions;
 use DateTimeImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
@@ -83,7 +84,73 @@ final class DoctorCommandTest extends TestCase
 
         $this->assertSame(1, $code);
         $this->assertRow($output, 'default transport', 'fail', 'einvoicing.transports.missing');
-        $this->assertRow($output, 'recommand: base URL', 'fail', 'https://');
+        $this->assertRow($output, 'recommand: config', 'fail', 'einvoicing.transports.recommand.base_url must be an https:// URL');
+    }
+
+    public function test_bad_base_url_reports_one_row(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports.recommand.base_url', 'http://app.recommand.eu');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code);
+        $this->assertSame(1, preg_match_all('/\|\s*fail\s*\|[^\n]*base_url/', $output), $output);
+        $this->assertStringNotContainsString('recommand: base URL', $output);
+        $this->assertStringNotContainsString('app.recommand.eu', $output);
+    }
+
+    public function test_non_boolean_flag_warns(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.webhooks.enabled', 'ture');
+        config()->set('einvoicing.validation.enabled', 'maybe');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'config flags', 'warn', 'einvoicing.webhooks.enabled is not a boolean; treated as off');
+        $this->assertRow($output, 'config flags', 'warn', 'einvoicing.validation.enabled is not a boolean; treated as off');
+        // The unparseable validation flag is read as off, like everywhere else.
+        $this->assertRow($output, 'validation', 'warn', 'without rule checks');
+
+        config()->set('einvoicing.webhooks.enabled', ' FALSE ');
+        config()->set('einvoicing.validation.enabled', 'off');
+        [, $output] = $this->doctor();
+
+        $this->assertStringNotContainsString('config flags', $output);
+        $this->assertRow($output, 'validation', 'warn', 'without rule checks');
+    }
+
+    public function test_invalid_account_id_warns(): void
+    {
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports', [
+            'einvoicebe' => ['driver' => 'einvoicebe', 'api_key' => 'ak-'.self::SECRET_MARK, 'tenant_id' => '   '],
+            'listed' => ['driver' => 'einvoicebe', 'api_key' => 'ak-'.self::SECRET_MARK, 'tenant_id' => ['t1']],
+            'open' => ['driver' => 'einvoicebe', 'api_key' => 'ak-'.self::SECRET_MARK],
+        ]);
+        config()->set('einvoicing.default', 'einvoicebe');
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'einvoicebe: account', 'warn', 'einvoicing.transports.einvoicebe.tenant_id is not a valid account id; webhook events are ignored');
+        $this->assertRow($output, 'listed: account', 'warn', 'einvoicing.transports.listed.tenant_id is not a valid account id; webhook events are ignored');
+        $this->assertStringNotContainsString('open: account', $output);
+    }
+
+    public function test_reports_installed_core_version(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+
+        [, $output] = $this->doctor();
+
+        $version = InstalledVersions::getPrettyVersion('intragile/php-einvoicing');
+        $this->assertIsString($version);
+        $this->assertRow($output, 'core php-einvoicing', 'ok', $version);
     }
 
     public function test_doctor_warns_on_sync_and_disabled_validation(): void
@@ -218,7 +285,9 @@ final class DoctorCommandTest extends TestCase
         [, $output] = $this->doctor();
 
         foreach (['en16931', 'xrechnung', 'facturx'] as $package) {
-            $this->assertRow($output, "rules einvoicing-rules-{$package}", 'ok', '1.0.0');
+            $version = InstalledVersions::getPrettyVersion("intragile/einvoicing-rules-{$package}");
+            $this->assertIsString($version);
+            $this->assertRow($output, "rules einvoicing-rules-{$package}", 'ok', $version);
         }
     }
 
@@ -543,7 +612,7 @@ final class DoctorCommandTest extends TestCase
         [$code, $output] = $this->doctor();
 
         $this->assertSame(1, $code);
-        $this->assertRow($output, 'userinfo: base URL', 'fail');
+        $this->assertRow($output, 'userinfo: config', 'fail', 'einvoicing.transports.userinfo.base_url');
         $this->assertStringNotContainsString(self::SECRET_MARK, $output);
 
         // The live check reports the exception message, from which every configured secret is cut.
