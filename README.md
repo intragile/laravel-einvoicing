@@ -12,6 +12,10 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 
 [Magyar nyelvű leírás → README.hu.md](README.hu.md)
 
+> **Status:** version 1.0.0, in preparation, not yet released (the release date is filled in at tag
+> time). What is verified, and how, is in [What is verified](#what-is-verified) and
+> [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
 - **Configured transports.** Named connections in `config/einvoicing.php`; the built-in drivers
   `recommand`, `b2brouter` and `einvoicebe` talk to the [Recommand](https://recommand.eu),
   [B2Brouter](https://www.b2brouter.net) and [e-invoice.be](https://e-invoice.be) access points,
@@ -61,7 +65,7 @@ Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is pl
 | Recommand (`recommand`) | yes (playground team with `useTestNetwork`) | yes | live-tested on the Peppol test network |
 | B2Brouter (`b2brouter`) | no (the sandbox simulates the network) | yes, free | live-tested against the provider sandbox (simulated network) |
 | e-invoice.be (`einvoicebe`) | no (the sandbox simulates the network) | yes, free | live-tested against the provider sandbox (simulated network) |
-| Storecove | unverified | 30-day, on request | planned |
+| Storecove | unverified | on request (sales contact) | planned |
 
 A test against a provider sandbox that simulates the network proves the provider's API contract,
 not delivery over Peppol; only Recommand can reach the Peppol test network. e-invoice.be sends
@@ -191,7 +195,8 @@ e-invoice.be has no call to acknowledge a received document, so acknowledgement 
 a document stays in its inbox and each poll lists the last `inbound_lookback_days` days (1 to
 365), at most `inbound_max_pages` pages of 100 (1 to 100); the package stores and fetches each
 document once. With `tenant_id` set, webhook notifications naming another tenant are ignored;
-without it, every signed notification is applied.
+without it (or with an empty `EINVOICEBE_TENANT_ID=` line), every signed notification is
+applied.
 
 The rest of `config/einvoicing.php`: HTTP timeouts and the response size cap (`http`),
 validation on or off (`validation.enabled`), send retries (`sending.max_attempts`,

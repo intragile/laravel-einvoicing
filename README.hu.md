@@ -13,6 +13,10 @@ alkalmazásból.
 
 [English documentation → README.md](README.md)
 
+> **Állapot:** 1.0.0-s verzió, előkészítés alatt, még nincs kiadva (a dátumot a címkézéskor töltjük
+> ki). Mit és hogyan ellenőriztünk: [Mi van ellenőrizve](#mi-van-ellenőrizve) és
+> [docs/VERIFICATION.md](docs/VERIFICATION.md) (angolul).
+
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
   beépített `recommand`, `b2brouter` és `einvoicebe` driver a [Recommand](https://recommand.eu),
   a [B2Brouter](https://www.b2brouter.net) és az [e-invoice.be](https://e-invoice.be) access
@@ -63,7 +67,7 @@ Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove terv
 | Recommand (`recommand`) | igen (playground csapat `useTestNetwork` beállítással) | igen | élesben tesztelve a Peppol teszthálózaton |
 | B2Brouter (`b2brouter`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat) |
 | e-invoice.be (`einvoicebe`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat) |
-| Storecove | nem ellenőrzött | 30 napos, kérésre | tervezett |
+| Storecove | nem ellenőrzött | kérésre (értékesítői kapcsolat) | tervezett |
 
 A hálózatot csak szimuláló szolgáltatói sandbox elleni teszt a szolgáltató API-szerződését
 igazolja, nem a Peppolon történő kézbesítést; a Peppol teszthálót csak a Recommand éri el. Az
@@ -197,7 +201,7 @@ helyi: a dokumentum a beérkező mappájában marad, és minden lekérdezés az 
 `inbound_lookback_days` nap (1–365) dokumentumait listázza, legfeljebb `inbound_max_pages`
 százas oldalon (1–100); a csomag minden dokumentumot egyszer tárol és tölt le. Ha a `tenant_id`
 be van állítva, a más tenantot megnevező webhook-értesítéseket figyelmen kívül hagyja; nélküle
-minden aláírt értesítést feldolgoz.
+minden aláírt értesítést feldolgoz (üres `EINVOICEBE_TENANT_ID=` sor esetén is).
 
 A `config/einvoicing.php` további részei: HTTP-időkorlátok és a válaszméret felső határa
 (`http`), a validáció ki- és bekapcsolása (`validation.enabled`), a küldés újrapróbálása
