@@ -42,44 +42,6 @@
         "orchestra/testbench": "^10.0|^11.0",
         "phpunit/phpunit": "^12.5.8"
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../php-einvoicing",
-            "options": {
-                "versions": {
-                    "intragile/php-einvoicing": "1.0.0"
-                }
-            }
-        },
-        {
-            "type": "path",
-            "url": "../php-einvoicing/packages/rules-en16931",
-            "options": {
-                "versions": {
-                    "intragile/einvoicing-rules-en16931": "1.0.0"
-                }
-            }
-        },
-        {
-            "type": "path",
-            "url": "../php-einvoicing/packages/rules-facturx",
-            "options": {
-                "versions": {
-                    "intragile/einvoicing-rules-facturx": "1.0.0"
-                }
-            }
-        },
-        {
-            "type": "path",
-            "url": "../php-einvoicing/packages/rules-xrechnung",
-            "options": {
-                "versions": {
-                    "intragile/einvoicing-rules-xrechnung": "1.0.0"
-                }
-            }
-        }
-    ],
     "autoload": {
         "psr-4": {
             "IntrAgile\\EInvoicing\\Laravel\\": "src/"
