@@ -42,6 +42,18 @@ alkalmazásból.
 - Laravel 12 vagy 13
 - Éles használathoz queue worker (lásd: [Queue](#queue))
 
+## Csomagok
+
+Ez a csomag a motor Laravel-integrációja. Három vékony belépő csomag viseli azokat a neveket, amelyekre az emberek keresnek; mindegyik Composer metacsomag (nincs kódja), amely ezt a csomagot, és ahol a használati eset megkívánja, a szabálycsomagját is behúzza:
+
+| Csomag | Mire való | Behúzza |
+|---|---|---|
+| [`intragile/laravel-xrechnung`](https://github.com/intragile/laravel-xrechnung) | XRechnung 3.0 Németországhoz | ezt a csomagot, `intragile/einvoicing-rules-xrechnung` |
+| [`intragile/laravel-zugferd`](https://github.com/intragile/laravel-zugferd) | ZUGFeRD 2.x és Factur-X 1.0 hibrid PDF-számlák | ezt a csomagot, `intragile/einvoicing-rules-facturx` |
+| [`intragile/laravel-peppol`](https://github.com/intragile/laravel-peppol) | Küldés és fogadás Peppol hálózaton | ezt a csomagot |
+
+Maga a motor az [`intragile/php-einvoicing`](https://github.com/intragile/php-einvoicing); a szabálycsomagok: `intragile/einvoicing-rules-en16931`, `intragile/einvoicing-rules-xrechnung` és `intragile/einvoicing-rules-facturx`.
+
 ## Driverek
 
 Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove tervezett.

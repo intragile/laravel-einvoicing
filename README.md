@@ -40,6 +40,18 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 - Laravel 12 or 13
 - A queue worker for production use (see [Queues](#queues))
 
+## Packages
+
+This package is the engine's Laravel bridge. Three thin entry packages carry the names people search for; each is a Composer metapackage (no code) that requires this package, and where the use case needs one, its rule package:
+
+| Package | Use it for | Requires |
+|---|---|---|
+| [`intragile/laravel-xrechnung`](https://github.com/intragile/laravel-xrechnung) | XRechnung 3.0 for Germany | this package, `intragile/einvoicing-rules-xrechnung` |
+| [`intragile/laravel-zugferd`](https://github.com/intragile/laravel-zugferd) | ZUGFeRD 2.x and Factur-X 1.0 hybrid PDF invoices | this package, `intragile/einvoicing-rules-facturx` |
+| [`intragile/laravel-peppol`](https://github.com/intragile/laravel-peppol) | Sending and receiving over Peppol | this package |
+
+The engine itself is [`intragile/php-einvoicing`](https://github.com/intragile/php-einvoicing); the rule packages are `intragile/einvoicing-rules-en16931`, `intragile/einvoicing-rules-xrechnung` and `intragile/einvoicing-rules-facturx`.
+
 ## Drivers
 
 Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is planned.
