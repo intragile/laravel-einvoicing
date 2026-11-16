@@ -110,8 +110,9 @@ All notable changes to this project are documented here. The format follows
   environment. The Recommand API key id and secret must be at least eight characters long.
 - **Dependencies (public API):** requires `laravel/framework` `^12.71|^13.0` instead of the
   individual `illuminate/*` packages, `guzzlehttp/guzzle` `^7.15.2 || ^8.0`,
-  `intragile/php-einvoicing` `^1.0` and all three rule packages (`intragile/einvoicing-rules-en16931`, `-xrechnung` and
-  `-facturx`) `^1.0`. Laravel 13 is supported on PHP 8.3 as well.
+  `intragile/php-einvoicing` `^1.0` and all three rule packages
+  (`intragile/einvoicing-rules-en16931`, `-xrechnung` and `-facturx`) `^1.0`. Laravel 13 is
+  supported on PHP 8.3 as well.
 
 ### Fixed
 
