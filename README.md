@@ -630,7 +630,7 @@ configured secret while faked.
 
 | Area | How | Status |
 |---|---|---|
-| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 332 tests, 1811 assertions on PHP 8.5 with the dependencies installed here (CI runs PHP 8.3, 8.4 and 8.5 × Laravel 12 and 13) | Run on every test run |
+| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 338 tests, 1824 assertions on PHP 8.5 with the dependencies installed here (CI runs PHP 8.3, 8.4 and 8.5 × Laravel 12 and 13) | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description; core live group `recommand-live`; bridge live smoke run `RecommandSmokeTest`, which sends an invoice through `EInvoicing::send()` | **Live-tested on the Peppol test network** (2026-11-15: core run and bridge run) |
 | B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference, core live groups `b2brouter-live` and `einvoicebe-live`; manager, config, doctor and webhook routing tested here | **Live-tested against the provider sandbox (simulated network)** (2026-11-15, core) |
