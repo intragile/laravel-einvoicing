@@ -485,7 +485,6 @@ final class WebhookTest extends TestCase
     public static function invalidAccountIds(): iterable
     {
         yield 'blank' => ['  '];
-        yield 'empty' => [''];
         yield 'list' => [['tenant-1']];
         yield 'object' => [new \stdClass];
     }
@@ -505,6 +504,16 @@ final class WebhookTest extends TestCase
 
         // An event naming no account is still applied.
         self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1')), 204);
+        $this->assertSame(1, InboundMessage::query()->count());
+    }
+
+    public function test_empty_account_id_from_an_unset_env_line_applies_every_event(): void
+    {
+        $this->receive('doc-in1');
+        Event::fake([WebhookReceived::class]);
+        config()->set('einvoicing.transports.einvoicebe.tenant_id', '');
+
+        self::assertEmptyResponse($this->signedEInvoiceBe(self::einvoicebeEvent('document.received', 'doc-in1', 'tenant-1')), 204);
         $this->assertSame(1, InboundMessage::query()->count());
     }
 
