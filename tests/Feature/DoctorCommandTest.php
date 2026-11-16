@@ -183,6 +183,17 @@ final class DoctorCommandTest extends TestCase
         $this->assertStringNotContainsString('tenant filter', $output);
     }
 
+    public function test_tenant_filter_is_not_reported_for_a_malformed_tenant_id(): void
+    {
+        $this->einvoiceBeWithWebhook(['tenant_id' => '   ']);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'einvoicebe: account', 'warn');
+        $this->assertStringNotContainsString('tenant filter', $output);
+    }
+
     public function test_tenant_filter_is_not_reported_for_another_driver(): void
     {
         $this->configureRecommand();
