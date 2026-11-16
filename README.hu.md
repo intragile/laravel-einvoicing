@@ -46,7 +46,7 @@ alkalmazásból.
 
 Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove tervezett.
 
-| Driver | Peppol tesztháló | Szolgáltatói sandbox | Állapot a kiadáskor |
+| Driver | Peppol tesztháló | Szolgáltatói sandbox | Állapot |
 |---|---|---|---|
 | Recommand (`recommand`) | igen (playground csapat `useTestNetwork` beállítással) | igen | élesben tesztelve a Peppol teszthálózaton |
 | B2Brouter (`b2brouter`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat) |
@@ -697,4 +697,4 @@ MIT. Lásd: [LICENSE](LICENSE).
 
 ---
 
-Fejlesztő és karbantartó: [IntrAgile Kft.](https://intragile.eu).
+Fejlesztő és karbantartó: [IntrAgile Kft.](https://intragile.eu)

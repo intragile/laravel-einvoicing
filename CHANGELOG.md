@@ -133,4 +133,4 @@ All notable changes to this project are documented here. The format follows
 
 ---
 
-Developed and maintained by [IntrAgile Kft.](https://intragile.eu).
+Developed and maintained by [IntrAgile Kft.](https://intragile.eu)

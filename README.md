@@ -44,7 +44,7 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 
 Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is planned.
 
-| Driver | Peppol test network | Provider sandbox | Status at release |
+| Driver | Peppol test network | Provider sandbox | Status |
 |---|---|---|---|
 | Recommand (`recommand`) | yes (playground team with `useTestNetwork`) | yes | live-tested on the Peppol test network |
 | B2Brouter (`b2brouter`) | no (the sandbox simulates the network) | yes, free | live-tested against the provider sandbox (simulated network) |
@@ -666,4 +666,4 @@ MIT. See [LICENSE](LICENSE).
 
 ---
 
-Developed and maintained by [IntrAgile Kft.](https://intragile.eu).
+Developed and maintained by [IntrAgile Kft.](https://intragile.eu)
