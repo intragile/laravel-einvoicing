@@ -450,6 +450,7 @@ final class ManagerTest extends TestCase
             'recommand' => ['driver' => 'recommand', 'company_id' => " c_test\t"],
             'b2brouter' => ['driver' => 'b2brouter', 'account_id' => ' 78234 '],
             'einvoicebe' => ['driver' => 'einvoicebe', 'tenant_id' => null],
+            'empty' => ['driver' => 'einvoicebe', 'tenant_id' => ''],
             'blank' => ['driver' => 'einvoicebe', 'tenant_id' => '  '],
             'listed' => ['driver' => 'recommand', 'company_id' => ['c_test']],
             'wordy' => ['driver' => 'b2brouter', 'account_id' => 'abc'],
@@ -458,6 +459,7 @@ final class ManagerTest extends TestCase
         self::assertSame('c_test', $this->manager()->accountId('recommand'));
         self::assertSame('78234', $this->manager()->accountId('b2brouter'));
         self::assertNull($this->manager()->accountId('einvoicebe'));
+        self::assertNull($this->manager()->accountId('empty'));
 
         foreach (['blank' => 'tenant_id', 'listed' => 'company_id', 'wordy' => 'account_id'] as $name => $key) {
             try {

@@ -286,7 +286,8 @@ final class EInvoicingManager
     /**
      * The provider account configured for the transport with this name, which webhook events
      * are matched against: the Recommand company id, the B2Brouter account id or the e-invoice.be
-     * tenant id, without surrounding whitespace. Null when the setting is absent or null, when
+     * tenant id, without surrounding whitespace. Null when the setting is absent, null or the empty
+     * string (an unset `KEY=` line in `.env`), when
      * the transport is not configured, or when the driver is not built in.
      *
      * @throws ConfigurationException when the setting is given but is no valid account id, such
@@ -307,7 +308,7 @@ final class EInvoicingManager
             return null;
         }
         $value = $config[$key] ?? null;
-        if ($value === null) {
+        if ($value === null || $value === '') {
             return null;
         }
 
