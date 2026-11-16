@@ -45,6 +45,8 @@ final class DoctorCommand extends Command
 
     private const OK = 'ok';
 
+    private const INFO = 'info';
+
     private const WARN = 'warn';
 
     private const FAIL = 'fail';
@@ -296,6 +298,33 @@ final class DoctorCommand extends Command
         }
 
         $this->row($check, self::OK, route('einvoicing.webhook', ['transport' => $name]));
+        $this->checkTenantFilter($manager, $name, $config);
+    }
+
+    /**
+     * Notes that the optional webhook tenant filter is not set, so every validly signed event of
+     * the provider account is applied. An invalid value is reported by the account row instead.
+     *
+     * @param  array<array-key, mixed>  $config
+     */
+    private function checkTenantFilter(EInvoicingManager $manager, string $name, #[SensitiveParameter] array $config): void
+    {
+        if (($config['driver'] ?? null) !== 'einvoicebe') {
+            return;
+        }
+        try {
+            if ($manager->accountId($name) !== null) {
+                return;
+            }
+        } catch (ConfigurationException) {
+            return;
+        }
+
+        $this->row("transport {$name}: tenant filter", self::INFO, sprintf(
+            'Tenant filter not set: every validly signed webhook event of the provider account is applied. '
+            .'Set EINVOICEBE_TENANT_ID (einvoicing.transports.%s.tenant_id) if the account serves more than one tenant.',
+            $name,
+        ));
     }
 
     /**

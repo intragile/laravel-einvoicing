@@ -130,6 +130,70 @@ final class DoctorCommandTest extends TestCase
         $this->assertRow($output, 'validation', 'warn', 'without rule checks');
     }
 
+    /**
+     * @param  array<string, mixed>  $extra
+     */
+    private function einvoiceBeWithWebhook(array $extra = []): void
+    {
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.transports', [
+            'einvoicebe' => ['driver' => 'einvoicebe', 'api_key' => 'ak-'.self::SECRET_MARK, 'webhook_secret' => 'wh-'.self::SECRET_MARK] + $extra,
+        ]);
+        config()->set('einvoicing.default', 'einvoicebe');
+    }
+
+    public function test_unset_tenant_filter_is_reported_as_info(): void
+    {
+        $this->einvoiceBeWithWebhook();
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'einvoicebe: tenant filter', 'info', 'Set EINVOICEBE_TENANT_ID');
+    }
+
+    public function test_empty_tenant_filter_is_reported_as_info(): void
+    {
+        $this->einvoiceBeWithWebhook(['tenant_id' => '']);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertRow($output, 'einvoicebe: tenant filter', 'info', 'every validly signed webhook event');
+    }
+
+    public function test_set_tenant_filter_is_not_reported(): void
+    {
+        $this->einvoiceBeWithWebhook(['tenant_id' => 't-1']);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertStringNotContainsString('tenant filter', $output);
+    }
+
+    public function test_tenant_filter_is_not_reported_with_webhooks_disabled(): void
+    {
+        $this->einvoiceBeWithWebhook();
+        config()->set('einvoicing.transports.einvoicebe.webhook_secret', null);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(0, $code, $output);
+        $this->assertStringNotContainsString('tenant filter', $output);
+    }
+
+    public function test_tenant_filter_is_not_reported_for_another_driver(): void
+    {
+        $this->configureRecommand();
+        config()->set('einvoicing.validation.enabled', false);
+
+        [, $output] = $this->doctor();
+
+        $this->assertRow($output, 'recommand: webhook', 'ok');
+        $this->assertStringNotContainsString('tenant filter', $output);
+    }
+
     public function test_invalid_account_id_warns(): void
     {
         config()->set('einvoicing.validation.enabled', false);

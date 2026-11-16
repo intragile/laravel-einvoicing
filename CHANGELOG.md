@@ -30,7 +30,8 @@ All notable changes to this project are documented here. The format follows
   operator command for a `pending` row whose status polls are used up, e-invoice.be `date_from`
   is not used, and no guard against a second status-poll chain started by a stateless webhook.
 - **Doctor:** `einvoicing:doctor` reports the installed `php-einvoicing` version and warns about
-  on/off settings that are not a boolean and about an invalid webhook account id.
+  on/off settings that are not a boolean and about an invalid webhook account id, and shows an
+  info row (exit code unchanged) when the optional e-invoice.be `tenant_id` webhook filter is unset.
 - **Testing:** `RecommandSmokeTest` (group `recommand-live`, testsuite `Live`, excluded from the
   default run) sends an invoice through `EInvoicing::send()` and the `recommand` driver to the
   Peppol test network; it refuses a key that does not belong to a test-network playground.

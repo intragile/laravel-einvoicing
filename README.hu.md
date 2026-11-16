@@ -201,7 +201,8 @@ helyi: a dokumentum a beérkező mappájában marad, és minden lekérdezés az 
 `inbound_lookback_days` nap (1–365) dokumentumait listázza, legfeljebb `inbound_max_pages`
 százas oldalon (1–100); a csomag minden dokumentumot egyszer tárol és tölt le. Ha a `tenant_id`
 be van állítva, a más tenantot megnevező webhook-értesítéseket figyelmen kívül hagyja; nélküle
-minden aláírt értesítést feldolgoz (üres `EINVOICEBE_TENANT_ID=` sor esetén is).
+minden aláírt értesítést feldolgoz (üres `EINVOICEBE_TENANT_ID=` sor esetén is), és az
+`einvoicing:doctor` ilyenkor, bekapcsolt webhooknál, egy info sorban jelzi ezt.
 
 A `config/einvoicing.php` további részei: HTTP-időkorlátok és a válaszméret felső határa
 (`http`), a validáció ki- és bekapcsolása (`validation.enabled`), a küldés újrapróbálása

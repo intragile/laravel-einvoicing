@@ -196,7 +196,7 @@ a document stays in its inbox and each poll lists the last `inbound_lookback_day
 365), at most `inbound_max_pages` pages of 100 (1 to 100); the package stores and fetches each
 document once. With `tenant_id` set, webhook notifications naming another tenant are ignored;
 without it (or with an empty `EINVOICEBE_TENANT_ID=` line), every signed notification is
-applied.
+applied, and `einvoicing:doctor` shows an info row for that case when webhooks are on.
 
 The rest of `config/einvoicing.php`: HTTP timeouts and the response size cap (`http`),
 validation on or off (`validation.enabled`), send retries (`sending.max_attempts`,
