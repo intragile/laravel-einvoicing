@@ -12,9 +12,8 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 
 [Magyar nyelvű leírás → README.hu.md](README.hu.md)
 
-> **Status:** version 1.0.0, in preparation, not yet released (the release date is filled in at tag
-> time). What is verified, and how, is in [What is verified](#what-is-verified) and
-> [docs/VERIFICATION.md](docs/VERIFICATION.md).
+> **Status:** version 1.0.0, released 2026-11-16. What is verified, and how, is in
+> [What is verified](#what-is-verified) and [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 - **Configured transports.** Named connections in `config/einvoicing.php`; the built-in drivers
   `recommand`, `b2brouter` and `einvoicebe` talk to the [Recommand](https://recommand.eu),

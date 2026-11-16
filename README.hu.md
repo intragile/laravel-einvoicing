@@ -13,9 +13,8 @@ alkalmazásból.
 
 [English documentation → README.md](README.md)
 
-> **Állapot:** 1.0.0-s verzió, előkészítés alatt, még nincs kiadva (a dátumot a címkézéskor töltjük
-> ki). Mit és hogyan ellenőriztünk: [Mi van ellenőrizve](#mi-van-ellenőrizve) és
-> [docs/VERIFICATION.md](docs/VERIFICATION.md) (angolul).
+> **Állapot:** 1.0.0-s verzió, kiadva 2026-11-16-án. Mit és hogyan ellenőriztünk:
+> [Mi van ellenőrizve](#mi-van-ellenőrizve) és [docs/VERIFICATION.md](docs/VERIFICATION.md) (angolul).
 
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
   beépített `recommand`, `b2brouter` és `einvoicebe` driver a [Recommand](https://recommand.eu),
