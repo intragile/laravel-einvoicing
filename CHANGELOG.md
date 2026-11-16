@@ -69,6 +69,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **Dependencies:** `guzzlehttp/guzzle` is allowed in version 8 (`^7.15.2 || ^8.0`), which fresh
+  Laravel 13 applications ship, so `composer require` needs no `-W`.
 - **Webhooks (public API):** `EInvoicingManager::webhook()` (and `EInvoicing::webhook()`) returns
   the core `WebhookParser` instead of `RecommandWebhook`; `companyId()` is replaced by
   `accountId()`, which returns the Recommand company id, the B2Brouter account id or the
