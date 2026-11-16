@@ -15,7 +15,7 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 - **Configured transports.** Named connections in `config/einvoicing.php`; the built-in drivers
   `recommand`, `b2brouter` and `einvoicebe` talk to the [Recommand](https://recommand.eu),
   [B2Brouter](https://www.b2brouter.net) and [e-invoice.be](https://e-invoice.be) access points,
-  and `EInvoicing::extend()` adds your own. Storecove is planned for 1.0.0 (follow-up); see
+  and `EInvoicing::extend()` adds your own. Storecove is planned; see
   [Drivers](#drivers).
 - **Validation before every send**, on by default: Peppol BIS documents with the official rules,
   installed by one artisan command, and XRechnung documents with the KoSIT rules.
@@ -29,8 +29,10 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
   middleware group.
 - `EInvoicing::fake()` for your tests, and `einvoicing:doctor` to check an installation.
 
-> **No driver is live-tested yet.** Everything is tested offline; see
-> [Drivers](#drivers) and [What is verified](#what-is-verified).
+> **Live testing, per driver.** Recommand is live-tested on the Peppol test network, through this
+> package as well. B2Brouter and e-invoice.be are live-tested against the provider sandbox
+> (simulated network). Everything else is tested offline; see [Drivers](#drivers) and
+> [What is verified](#what-is-verified).
 
 ## Requirements
 
@@ -40,20 +42,19 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
 
 ## Drivers
 
-Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is planned for 1.0.0
-(follow-up).
+Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is planned.
 
 | Driver | Peppol test network | Provider sandbox | Status at release |
 |---|---|---|---|
-| Recommand (`recommand`) | yes (playground team with `useTestNetwork`) | yes | not live-tested (offline contract tests from the public API docs) |
-| B2Brouter (`b2brouter`) | no (the sandbox simulates the network) | yes, free | not live-tested (offline contract tests from the public API docs) |
-| e-invoice.be (`einvoicebe`) | no (the sandbox simulates the network) | yes, free | not live-tested (offline contract tests from the public API docs) |
-| Storecove | unverified | 30-day, on request | planned for 1.0.0 |
+| Recommand (`recommand`) | yes (playground team with `useTestNetwork`) | yes | live-tested on the Peppol test network |
+| B2Brouter (`b2brouter`) | no (the sandbox simulates the network) | yes, free | live-tested against the provider sandbox (simulated network) |
+| e-invoice.be (`einvoicebe`) | no (the sandbox simulates the network) | yes, free | live-tested against the provider sandbox (simulated network) |
+| Storecove | unverified | 30-day, on request | planned |
 
 A test against a provider sandbox that simulates the network proves the provider's API contract,
 not delivery over Peppol; only Recommand can reach the Peppol test network. e-invoice.be sends
 Peppol BIS Billing 3.0 UBL only. B2Brouter renders the document it transmits from its own invoice
-model, so the delivered bytes may differ from your XML. What each driver sends, its status
+model, so the delivered bytes may differ from your XML. Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); webhooks were not live-tested. What each driver sends, its status
 mapping, inbound behaviour and webhook details are in the core's
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
 
@@ -612,18 +613,34 @@ configured secret while faked.
 
 | Area | How | Status |
 |---|---|---|
-| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 276 tests, 1587 assertions on each of PHP 8.3, 8.4, 8.5 × Laravel 12, 13 (1583 with `--prefer-lowest` dependencies) | Run on every test run |
+| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 332 tests, 1815 assertions on PHP 8.5 with the dependencies installed here (CI runs PHP 8.3, 8.4 and 8.5 × Laravel 12 and 13) | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
-| Recommand driver | Core offline tests with fixtures written from Recommand's published API description | **Live transmission not verified** |
-| B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference; manager, config, doctor and webhook routing tested here | **Not live-tested** |
-| Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | **Not live-tested** (needs a public HTTPS endpoint) |
+| Recommand driver | Core offline tests with fixtures written from Recommand's published API description; core live group `recommand-live`; bridge live smoke run `RecommandSmokeTest`, which sends an invoice through `EInvoicing::send()` | **Live-tested on the Peppol test network** (2026-11-15: core run and bridge run) |
+| B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference, core live groups `b2brouter-live` and `einvoicebe-live`; manager, config, doctor and webhook routing tested here | **Live-tested against the provider sandbox (simulated network)** (2026-11-15, core) |
+| Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | Verified offline; **webhooks were not live-tested** (needs a public HTTPS endpoint) |
 
 The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
 
-No test of this package makes a network call. The core has opt-in live groups:
+The run results, with dates and commits, are in the core's
+[VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md). Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); webhooks were not live-tested.
+
+The default test run of this package makes no network call; the live smoke run is excluded from
+it (group `recommand-live`, testsuite `Live`) and refuses unless the key belongs to a Recommand
+playground on the Peppol test network. The core has opt-in live groups:
 `recommand-live` for a Recommand playground team, `b2brouter-live` for a B2Brouter sandbox and
 `einvoicebe-live` for an e-invoice.be sandbox company; see its
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
+
+### Known limits (deferred to 1.x)
+
+- No operator command yet for a `pending` row whose status polls are used up; check such a row at
+  the access point (`einvoicing:resolve` handles `unconfirmed` and abandoned `sending` rows).
+- e-invoice.be: the inbox is cut at the look-back on our side; the provider's `date_from` filter
+  is not used yet.
+- No guard against a second status-poll chain started by a stateless webhook; the extra chain
+  shares the document's `status_checks` budget, so the total stays within `status.max_attempts`.
+
+None of them is a correctness issue.
 
 ## Versioning
 

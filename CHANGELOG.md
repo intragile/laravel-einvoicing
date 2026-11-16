@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] - YYYY-MM-DD
 
 ### Added
 
@@ -16,14 +16,24 @@ All notable changes to this project are documented here. The format follows
   `config/einvoicing.php`, because `einvoicing:doctor` checks every listed transport: uncomment
   the ones you use. New keys: `api_key`, `account_id`, `document_type_codes` and
   `webhook_tolerance` (B2Brouter); `api_key`, `tenant_id`, `inbound_lookback_days` and
-  `inbound_max_pages` (e-invoice.be). Storecove is planned for 1.0.0. No driver is live-tested
-  yet.
+  `inbound_max_pages` (e-invoice.be). Storecove is planned. Recommand is live-tested on the Peppol
+  test network, B2Brouter and e-invoice.be against the provider sandbox (simulated network); see the
+  core's `docs/VERIFICATION.md`.
 - **Webhooks:** provider-neutral webhooks on the core's `Transport\Webhook\WebhookParser`;
   `EInvoicing::extendWebhook($driver, $factory)` registers the parser of a custom driver (or
   replaces a built-in one), so the webhook route accepts it.
 - **Facade:** `EInvoicing::accountId()`, `EInvoicing::extendWebhook()` and
   `EInvoicing::hasDriver()` in the facade's method list.
-- **Documentation:** a driver table and per-driver webhook setup in the README.
+- **Documentation:** a driver table and per-driver webhook setup in the README. Webhook signatures
+  are verified offline against each provider's documented scheme (e-invoice.be also against its
+  published test vector); webhooks were not live-tested. Known limits deferred to 1.x: no
+  operator command for a `pending` row whose status polls are used up, e-invoice.be `date_from`
+  is not used, and no guard against a second status-poll chain started by a stateless webhook.
+- **Doctor:** `einvoicing:doctor` reports the installed `php-einvoicing` version and warns about
+  on/off settings that are not a boolean and about an invalid webhook account id.
+- **Testing:** `RecommandSmokeTest` (group `recommand-live`, testsuite `Live`, excluded from the
+  default run) sends an invoice through `EInvoicing::send()` and the `recommand` driver to the
+  Peppol test network; it refuses a key that does not belong to a test-network playground.
 - **Validation:** `EInvoicing::xrechnung()` and `EInvoicing::facturx()` return the core
   XRechnung and Factur-X validators; `EInvoicing::validator()` returns the validator the send job
   uses: a `DocumentValidator` bound in the container, or else the core `PeppolPayloadValidator`
@@ -103,6 +113,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- On/off settings (`einvoicing.validation.enabled`, `inbound.acknowledge`, `status.poll`,
+  `einvoicing.webhooks.enabled`) are read by one reader: `"false"`, `"0"` and `"off"` from the
+  environment now turn the feature off, and a value that is not a boolean falls back to its safe
+  value (validation, acknowledgements and status polls on; the webhook route off), with a doctor
+  warning.
+- A blank or non-scalar `company_id`, `account_id` or `tenant_id` no longer turns the webhook
+  account filter off: events naming an account are ignored, and the configured value is trimmed
+  before it is compared. `EInvoicingManager::accountId()` throws `ConfigurationException` when the
+  setting is given but invalid.
+- `einvoicing:doctor` reports an invalid base URL in one row instead of two.
 - `einvoicing:resolve --sent` checks the job settings before the row becomes pending, so an
   invalid setting no longer leaves a pending row without a status poll.
 - A Recommand credential that is too short is reported as such, naming the key, instead of as an

@@ -16,8 +16,8 @@ alkalmazásból.
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
   beépített `recommand`, `b2brouter` és `einvoicebe` driver a [Recommand](https://recommand.eu),
   a [B2Brouter](https://www.b2brouter.net) és az [e-invoice.be](https://e-invoice.be) access
-  pointhoz csatlakozik, saját drivert az `EInvoicing::extend()` regisztrál. A Storecove az
-  1.0.0-ra tervezett (külön lépésben); lásd: [Driverek](#driverek).
+  pointhoz csatlakozik, saját drivert az `EInvoicing::extend()` regisztrál. A Storecove
+  tervezett; lásd: [Driverek](#driverek).
 - **Validáció minden küldés előtt**, alapból bekapcsolva: a Peppol BIS dokumentumokat a
   hivatalos szabályok ellenőrzik (egyetlen artisan parancs telepíti őket), az XRechnung
   dokumentumokat a KoSIT-szabályok.
@@ -31,8 +31,10 @@ alkalmazásból.
   nélkül.
 - `EInvoicing::fake()` a saját tesztekhez, `einvoicing:doctor` a telepítés ellenőrzéséhez.
 
-> **Egyik drivert sem teszteltük még élesben.** Minden teszt offline fut; lásd:
-> [Driverek](#driverek) és [Mi van ellenőrizve](#mi-van-ellenőrizve).
+> **Éles tesztelés driverenként.** A Recommandot a Peppol teszthálózaton teszteltük élesben, e
+> csomagon keresztül is. A B2Brouter és az e-invoice.be a szolgáltatói sandbox ellen van élesben
+> tesztelve (szimulált hálózat). Minden más offline tesztelt; lásd: [Driverek](#driverek) és
+> [Mi van ellenőrizve](#mi-van-ellenőrizve).
 
 ## Követelmények
 
@@ -42,20 +44,19 @@ alkalmazásból.
 
 ## Driverek
 
-Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove az 1.0.0-ra tervezett
-(külön lépésben).
+Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove tervezett.
 
 | Driver | Peppol tesztháló | Szolgáltatói sandbox | Állapot a kiadáskor |
 |---|---|---|---|
-| Recommand (`recommand`) | igen (playground csapat `useTestNetwork` beállítással) | igen | élesben nem tesztelt (offline szerződéstesztek a nyilvános API-dokumentációból) |
-| B2Brouter (`b2brouter`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben nem tesztelt (offline szerződéstesztek a nyilvános API-dokumentációból) |
-| e-invoice.be (`einvoicebe`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben nem tesztelt (offline szerződéstesztek a nyilvános API-dokumentációból) |
-| Storecove | nem ellenőrzött | 30 napos, kérésre | az 1.0.0-ra tervezett |
+| Recommand (`recommand`) | igen (playground csapat `useTestNetwork` beállítással) | igen | élesben tesztelve a Peppol teszthálózaton |
+| B2Brouter (`b2brouter`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat) |
+| e-invoice.be (`einvoicebe`) | nem (a sandbox szimulálja a hálózatot) | igen, ingyenes | élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat) |
+| Storecove | nem ellenőrzött | 30 napos, kérésre | tervezett |
 
 A hálózatot csak szimuláló szolgáltatói sandbox elleni teszt a szolgáltató API-szerződését
 igazolja, nem a Peppolon történő kézbesítést; a Peppol teszthálót csak a Recommand éri el. Az
 e-invoice.be csak Peppol BIS Billing 3.0 UBL-t küld. A B2Brouter a továbbított dokumentumot a
-saját számlamodelljéből állítja elő, így a kézbesített bájtok eltérhetnek a te XML-edtől. Hogy
+saját számlamodelljéből állítja elő, így a kézbesített bájtok eltérhetnek a te XML-edtől. A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); a webhookokat nem teszteltük élesben. Hogy
 melyik driver mit küld, hogyan képezi le az állapotokat, hogyan fogad és mit tud a webhookja, azt
 a core [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md)
 leírása tartalmazza (angolul).
@@ -639,18 +640,37 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Terület | Hogyan | Állapot |
 |---|---|---|
-| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 276 teszt, 1587 ellenőrzés mind a hat PHP 8.3, 8.4, 8.5 × Laravel 12, 13 kombináción (`--prefer-lowest` függőségekkel 1583) | Minden tesztfuttatáskor |
+| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal: 332 teszt, 1815 ellenőrzés PHP 8.5-ön az itt telepített függőségekkel (a CI PHP 8.3, 8.4 és 8.5 × Laravel 12 és 13 kombinációkat futtat) | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
-| Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel | **Az éles küldés nincs kipróbálva** |
-| B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben nem tesztelt** |
-| Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | **Élesben nem tesztelt** (nyilvános HTTPS-végpont kellene) |
+| Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel; a core `recommand-live` éles csoportja; a híd `RecommandSmokeTest` éles futtatása, amely számlát küld az `EInvoicing::send()`-del | **Élesben tesztelve a Peppol teszthálózaton** (2026-11-15: core- és hídfuttatás) |
+| B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel, a core `b2brouter-live` és `einvoicebe-live` éles csoportjai; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat)** (2026-11-15, core) |
+| Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | Offline ellenőrizve; **a webhookokat nem teszteltük élesben** (nyilvános HTTPS-végpont kellene) |
 
 A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
 
-A csomag egyik tesztje sem használ hálózatot. A core-ban opcionális éles csoportok vannak:
+A futtatások eredménye dátummal és commitokkal a core
+[VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md) fájljában van (angolul). A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); a webhookokat nem teszteltük élesben.
+
+A csomag alapértelmezett tesztfuttatása nem használ hálózatot; az éles smoke-futtatás ki van
+zárva belőle (`recommand-live` csoport, `Live` testsuite), és csak akkor indul, ha a kulcs a
+Peppol teszthálózaton lévő Recommand playgroundhoz tartozik. A core-ban opcionális éles csoportok
+vannak:
 `recommand-live` Recommand playground csapathoz, `b2brouter-live` B2Brouter sandboxhoz és
 `einvoicebe-live` e-invoice.be sandbox céghez; lásd a core
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md) leírását.
+
+### Ismert korlátok (1.x-re halasztva)
+
+- Még nincs operátori parancs olyan `pending` sorra, amelynek az állapotlekérései elfogytak; az
+  ilyen sort a hozzáférési pontnál ellenőrizd (az `einvoicing:resolve` az `unconfirmed` és az
+  elhagyott `sending` sorokat kezeli).
+- e-invoice.be: a postafiókot nálunk vágjuk a visszatekintési időnél; a szolgáltató `date_from`
+  szűrőjét még nem használjuk.
+- Nincs védelem arra, hogy egy állapotmentes webhook második állapotlekérési láncot indítson; az
+  extra lánc a dokumentum `status_checks` keretén osztozik, így az összes lekérés a
+  `status.max_attempts` keretén belül marad.
+
+Egyik sem helyességi hiba.
 
 ## Verziókezelés
 
