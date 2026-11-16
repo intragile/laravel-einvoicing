@@ -1,6 +1,6 @@
 {
     "name": "intragile/laravel-einvoicing",
-    "description": "Laravel bridge for intragile/php-einvoicing: send and receive EN 16931 invoices over Peppol, with configured transports, queued sending under a guarded delivery state machine, inbound documents and signed Recommand webhooks.",
+    "description": "Laravel bridge for intragile/php-einvoicing: send and receive EN 16931 invoices over Peppol, with configured transports, queued sending under a guarded delivery state machine, inbound documents and signed webhooks (Recommand, B2Brouter, e-invoice.be).",
     "keywords": [
         "laravel",
         "e-invoicing",
@@ -9,6 +9,7 @@
         "en16931",
         "ubl",
         "recommand",
+        "b2brouter",
         "webhook",
         "queue"
     ],
