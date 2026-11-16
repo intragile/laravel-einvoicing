@@ -95,7 +95,7 @@ php artisan einvoicing:doctor                          # checks everything below
 > ```
 >
 > and require `"intragile/laravel-einvoicing": "^1.0"`. The `versions` option gives each path
-> package the version the constraints between the five packages expect.
+> package the version the constraints between the packages expect.
 
 The migration is loaded from the package. To keep a copy in your application, publish it with
 `php artisan vendor:publish --tag=einvoicing-migrations`.
@@ -656,10 +656,12 @@ None of them is a correctness issue.
 
 ## Versioning
 
-The five packages, `intragile/php-einvoicing`, the rule packages
+The eight packages are released together with the same version number and follow Semantic
+Versioning: the five engine packages, `intragile/php-einvoicing`, the rule packages
 `intragile/einvoicing-rules-en16931`, `intragile/einvoicing-rules-xrechnung` and
-`intragile/einvoicing-rules-facturx`, and `intragile/laravel-einvoicing`, are released together
-with the same version number and follow Semantic Versioning. Use the same minor version of each.
+`intragile/einvoicing-rules-facturx`, and `intragile/laravel-einvoicing`, and the three entry
+packages `intragile/laravel-xrechnung`, `intragile/laravel-zugferd` and `intragile/laravel-peppol`.
+Use the same minor version of each.
 A rule package declares a Composer `conflict` with cores older than its own minor version (and
 with the next major), so new rules are never installed next to an engine that cannot run them.
 

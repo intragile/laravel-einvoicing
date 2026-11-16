@@ -98,7 +98,7 @@ php artisan einvoicing:doctor                          # mindent ellenőriz, ami
 > ```
 >
 > majd kérd be így: `"intragile/laravel-einvoicing": "^1.0"`. A `versions` beállítás minden path
-> csomagnak azt a verziót adja, amelyet az öt csomag egymás közötti feltételei várnak.
+> csomagnak azt a verziót adja, amelyet a csomagok egymás közötti feltételei várnak.
 
 A migrációt a csomag maga tölti be. Ha saját példányt szeretnél belőle az alkalmazásban:
 `php artisan vendor:publish --tag=einvoicing-migrations`.
@@ -686,11 +686,12 @@ Egyik sem helyességi hiba.
 
 ## Verziókezelés
 
-Az öt csomag (`intragile/php-einvoicing`, az `intragile/einvoicing-rules-en16931`,
-`intragile/einvoicing-rules-xrechnung` és `intragile/einvoicing-rules-facturx` szabálycsomag,
-valamint az `intragile/laravel-einvoicing`) mindig együtt, azonos verziószámmal jelenik meg, a
-szemantikus verziózás (Semantic Versioning) szerint. Mindegyikből ugyanazt a minor verziót
-használd. A szabálycsomagok Composer `conflict` bejegyzéssel kizárják a saját minor verziójuknál
+A nyolc csomag mindig együtt, azonos verziószámmal jelenik meg, a szemantikus verziózás
+(Semantic Versioning) szerint: az öt motorcsomag (`intragile/php-einvoicing`, az
+`intragile/einvoicing-rules-en16931`, `intragile/einvoicing-rules-xrechnung` és
+`intragile/einvoicing-rules-facturx` szabálycsomag, valamint az `intragile/laravel-einvoicing`) és a
+három belépő csomag (`intragile/laravel-xrechnung`, `intragile/laravel-zugferd` és
+`intragile/laravel-peppol`). Mindegyikből ugyanazt a minor verziót használd. A szabálycsomagok Composer `conflict` bejegyzéssel kizárják a saját minor verziójuknál
 régebbi (és a következő major) magot, így új szabályok sosem kerülnek olyan motor mellé, amely
 nem tudja futtatni őket.
 
