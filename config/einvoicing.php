@@ -42,8 +42,8 @@ return [
 
         // B2Brouter. A key starting with "test_" is routed to the B2Brouter
         // sandbox. document_type_codes maps further Peppol document type
-        // identifiers to B2Brouter codes; BIS Billing 3.0 invoices and credit
-        // notes need none. webhook_tolerance (seconds, or null) refuses
+        // identifiers to B2Brouter codes; BIS Billing 3.0 and XRechnung 3.0
+        // documents need none. webhook_tolerance (seconds, or null) refuses
         // notifications whose signed timestamp is further off; B2Brouter
         // retries for about a week, so leave it null unless replays matter more.
         //

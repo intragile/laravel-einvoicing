@@ -159,7 +159,8 @@ B2BROUTER_WEBHOOK_SECRET=...            # only when you receive webhooks
 B2Brouter sends a key starting with `test_` to its sandbox, which never reaches the Peppol
 network; the doctor shows a warning for it. `account_id` is a positive whole number.
 `document_type_codes` maps further Peppol document type identifiers to B2Brouter document type
-codes; Peppol BIS Billing 3.0 invoices and credit notes need none. `webhook_tolerance`, in
+codes; Peppol BIS Billing 3.0 and XRechnung 3.0 documents need none (with intragile/php-einvoicing
+1.0.1 or later). `webhook_tolerance`, in
 seconds, refuses notifications whose signed timestamp is further from now; it is off (`null`) by
 default, because B2Brouter retries a notification for about a week.
 
