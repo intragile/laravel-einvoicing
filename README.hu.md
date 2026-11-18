@@ -92,7 +92,7 @@ php artisan einvoicing:doctor                          # mindent ellenőriz, ami
 >
 > ```json
 > "repositories": [
->     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.1.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931", "options": { "versions": { "intragile/einvoicing-rules-en16931": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-xrechnung", "options": { "versions": { "intragile/einvoicing-rules-xrechnung": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-facturx", "options": { "versions": { "intragile/einvoicing-rules-facturx": "1.0.0" } } },
@@ -510,6 +510,68 @@ Ha egy kézbesítési státuszról szóló webhook még azelőtt érkezik, hogy 
 volna az access point dokumentum-azonosítóját, nem talál sort, és elvész. Valódi queue mellett a
 státuszlekérdezés pótolja; `sync` kapcsolaton semmi, ezért ezeket a sorokat kézzel kell
 ellenőrizni.
+
+## Francia e-számlázás (B2Brouter)
+
+Egy `b2brouter` transport francia plateforme agréée-ként is használható. Nevezd meg az
+`einvoicing.france.transport` beállításban (`EINVOICING_FRANCE_TRANSPORT`); az
+`einvoicing.transports` alatt `b2brouter` driverrel kell szerepelnie, és a kulcsát, account id-ját,
+base URL-jét és az `einvoicing.http` beállításokat ugyanúgy használja, mint a Peppol-küldés. Az
+`intragile/php-einvoicing` 1.1 vagy újabb kell hozzá.
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Transport\B2Brouter\France\BuyerResponse;
+use IntrAgile\EInvoicing\Transport\B2Brouter\France\FrenchDocument;
+
+$result = EInvoicing::france()->send(FrenchDocument::fromXml($ublOrCiiXml));
+$status = EInvoicing::france()->lifecycle($result->documentId);   // PlatformStatus, CDV-kód: ->lifecycle
+EInvoicing::france()->respond($receivedInvoiceId, BuyerResponse::approved());
+EInvoicing::france()->recordPayment($issuedInvoiceId);           // teljes összeg kifizetve
+$deposit = EInvoicing::france()->depositEReport($flux10Xml);      // EReportDeposit, ->ledgerId
+```
+
+Az `EInvoicing::france($transport)` és az `EInvoicing::annuaire($transport)` név szerint egy
+másik B2Brouter transportot is elfogad; hiányzó vagy nem B2Brouter transportra
+`ConfigurationException` jön, amely megnevezi az `einvoicing.france.transport` kulcsot. Ezek a
+kliensek valódi kéréseket küldenek: az `EInvoicing::fake()` nem cseréli le őket, és semmi nem kerül
+sorba vagy adatbázisba. Az összes metódus leírása a core TRANSPORT.md-jében van.
+
+**Útválasztás.** A core `France\Routing\Annuaire` interfésze csak akkor kötődik az adott transport
+élő `B2BrouterAnnuaire`-jához, ha az `einvoicing.france.transport` be van állítva; így a router a
+konténerből feloldható (az alkalmazás saját `Annuaire`-kötése megmarad):
+
+```php
+use IntrAgile\EInvoicing\France\Routing\Router;
+
+$decision = app(Router::class)->route($invoice);   // RoutingDecision: ->channel, ->needsDirectoryCheck
+```
+
+A hideg Annuaire-lekérdezést a csomag megismétli, amíg a B2Brouter még dolgozik rajta: legfeljebb
+`einvoicing.france.annuaire_attempts` kérés (alapértelmezés 4), `annuaire_retry_delay`
+másodpercenként (alapértelmezés 3), így a `route()` nagyjából kilenc másodpercig is blokkolhat.
+A helyi ellenőrzésen elbukó SIREN (például szóközökkel írva), az utolsó próbálkozás után is
+feldolgozás alatt álló lekérdezés és az elérhetetlen címtár `Unknown`-t ad; a router ekkor megtartja
+az e-számlát, és címtár-ellenőrzést kér. **A `route()` így is dobhat kivételt:**
+`InvalidArgumentException`-t, ha a B2Brouter elutasítja a SIREN-t (HTTP 422), és
+`AuthenticationFailed`-et, ha az API-kulcsot utasítja el (HTTP 401/403). Fogd el mindkettőt a
+`route()` körül, ha egy elutasított lekérdezés nem állíthatja meg a folyamatot.
+
+**Webhookok.** A B2Brouternél regisztráld az `issued_invoice.state_change`, a
+`received_invoice.state_change` és a `ledger.state_change` eseményt is. A szokásos feldolgozás után
+a webhook ezeket az eseményeket váltja ki:
+
+| Esemény | Mikor |
+|---|---|
+| `LifecycleStatusChanged` | az értesítés francia életciklus-státuszt hoz: `$transport`, `$documentId` (a B2Brouter számla-id), `$status` (`LifecycleStatus`), `$received` (true a kapott számlánál, amelynek státusza a saját válaszod) |
+| `EReportStateChanged` | egy beküldött e-reporting fájl állapota változott: `$transport`, `$ledgerId`; az állapotot az `EInvoicing::france($event->transport)->eReportStatus($event->ledgerId)` olvassa ki |
+
+Mindkettő kézbesítésenként egyszer fut, így egy ismételt vagy késő értesítés újra kiváltja őket;
+cselekvés előtt vesd össze azzal, amit már eltároltál.
+
+**Doctor.** Beállított `einvoicing.france.transport` mellett az `einvoicing:doctor` egy `france`
+sort is kiír: a transportnak érvényes B2Brouter transportnak kell lennie, és a sor megmondja, hogy
+a kulcsa sandbox (`test_`), staging (`stag_`) vagy éles kulcs. Kérést nem küld.
 
 ## Queue
 

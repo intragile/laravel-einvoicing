@@ -8,6 +8,8 @@ use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
+use IntrAgile\EInvoicing\Laravel\Events\EReportStateChanged;
+use IntrAgile\EInvoicing\Laravel\Events\LifecycleStatusChanged;
 use IntrAgile\EInvoicing\Laravel\Events\WebhookReceived;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
@@ -41,9 +43,15 @@ use IntrAgile\EInvoicing\Transport\Webhook\WebhookKind;
  * no row and is dropped; the status polls recover it, except on a synchronous queue connection.
  * On the sync connection the fetch and acknowledgement of a received document run inside this
  * request, so an error there answers with 500.
+ *
+ * After that, a notification carrying a French lifecycle status fires LifecycleStatusChanged, and
+ * one about a deposited e-reporting file fires EReportStateChanged.
  */
 final class WebhookController
 {
+    /** The event type of a deposited e-reporting file (a B2Brouter ledger) changing state. */
+    private const LEDGER_STATE_CHANGE = 'ledger.state_change';
+
     public function __construct(
         private readonly EInvoicingManager $manager,
         private readonly InboundRecorder $inbound,
@@ -78,6 +86,8 @@ final class WebhookController
             WebhookKind::DeliveryChanged => $this->deliveryChanged($transport, $event),
             WebhookKind::Other => null,
         };
+
+        $this->france($transport, $event);
 
         return new Response('', 204);
     }
@@ -114,6 +124,25 @@ final class WebhookController
 
         foreach ($messages->get() as $message) {
             $this->delivery->record($message, $event->deliveryState, $event->failure, $event->documentId);
+        }
+    }
+
+    /**
+     * Announces the French facts a notification carries: a lifecycle status, or a change of a
+     * deposited e-reporting file, whose state is then read from the provider.
+     */
+    private function france(string $transport, WebhookEvent $event): void
+    {
+        if ($event->lifecycleStatus !== null) {
+            event(new LifecycleStatusChanged(
+                $transport,
+                $event->documentId,
+                $event->lifecycleStatus,
+                str_starts_with($event->type, 'received_invoice.'),
+            ));
+        }
+        if ($event->type === self::LEDGER_STATE_CHANGE) {
+            event(new EReportStateChanged($transport, $event->documentId));
         }
     }
 

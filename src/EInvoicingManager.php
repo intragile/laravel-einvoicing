@@ -13,6 +13,7 @@ use IntrAgile\EInvoicing\Exception\UnsafeXml;
 use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
@@ -21,6 +22,8 @@ use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterTransport;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterWebhook;
+use IntrAgile\EInvoicing\Transport\B2Brouter\France\B2BrouterAnnuaire;
+use IntrAgile\EInvoicing\Transport\B2Brouter\France\B2BrouterFrance;
 use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeConfig;
 use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeTransport;
 use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeWebhook;
@@ -181,6 +184,31 @@ final class EInvoicingManager
     public function facturx(): FacturXValidator
     {
         return FacturXValidator::create();
+    }
+
+    /**
+     * The French flow client (sending as plateforme agréée, lifecycle statuses, buyer responses,
+     * payments and e-reporting) of the B2Brouter transport with this name, or of the one in
+     * einvoicing.france.transport. It is never faked.
+     *
+     * @throws ConfigurationException when the transport is not set, not configured or not B2Brouter,
+     *                                or a setting is invalid
+     */
+    public function france(?string $transport = null): B2BrouterFrance
+    {
+        return $this->franceManager()->france($transport);
+    }
+
+    /**
+     * The live French directory (Annuaire) of the B2Brouter transport with this name, or of the
+     * one in einvoicing.france.transport. It is never faked.
+     *
+     * @throws ConfigurationException when the transport is not set, not configured or not B2Brouter,
+     *                                or a setting is invalid
+     */
+    public function annuaire(?string $transport = null): B2BrouterAnnuaire
+    {
+        return $this->franceManager()->annuaire($transport);
     }
 
     /**
@@ -606,9 +634,11 @@ final class EInvoicingManager
      * drivers follow the ones they trust themselves. It carries no secrets; each transport adds
      * its own.
      *
+     * @internal used by the French flow clients
+     *
      * @throws ConfigurationException when an einvoicing.http setting is invalid
      */
-    private function httpClient(): HttpClient
+    public function httpClient(): HttpClient
     {
         $factory = new HttpFactory;
         $client = new Client([
@@ -761,6 +791,11 @@ final class EInvoicingManager
     {
         // A value that cannot be read as a flag keeps validation on; einvoicing:doctor warns about it.
         return ConfigFlag::enabled('validation.enabled');
+    }
+
+    private function franceManager(): FranceManager
+    {
+        return ($this->app)()->make(FranceManager::class);
     }
 
     private function config(): Repository

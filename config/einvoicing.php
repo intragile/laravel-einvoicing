@@ -75,6 +75,28 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | French e-invoicing (B2Brouter)
+    |--------------------------------------------------------------------------
+    |
+    | "transport" names a transport above with the "b2brouter" driver that
+    | acts as the French plateforme agréée: EInvoicing::france() and
+    | EInvoicing::annuaire() use it when no name is given. Only when it is set
+    | is the live B2Brouter Annuaire bound to the core's Annuaire interface,
+    | so France\Routing\Router can be resolved from the container. A cold
+    | Annuaire lookup is repeated while B2Brouter is still resolving it:
+    | annuaire_attempts requests at most (1 to 10), annuaire_retry_delay
+    | seconds apart (0 to 30).
+    |
+    */
+
+    'france' => [
+        'transport' => env('EINVOICING_FRANCE_TRANSPORT'),
+        'annuaire_attempts' => 4,
+        'annuaire_retry_delay' => 3,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | HTTP client
     |--------------------------------------------------------------------------
     |

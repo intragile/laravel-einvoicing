@@ -6,10 +6,12 @@ namespace IntrAgile\EInvoicing\Laravel;
 
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Support\ServiceProvider;
+use IntrAgile\EInvoicing\France\Routing\Annuaire;
 use IntrAgile\EInvoicing\Laravel\Console\DoctorCommand;
 use IntrAgile\EInvoicing\Laravel\Console\InstallRulesCommand;
 use IntrAgile\EInvoicing\Laravel\Console\PollInboundCommand;
 use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
+use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 
 final class EInvoicingServiceProvider extends ServiceProvider
@@ -26,11 +28,20 @@ final class EInvoicingServiceProvider extends ServiceProvider
 
         $this->app->singleton(EInvoicingManager::class, fn (Application $app): EInvoicingManager => new EInvoicingManager($app));
         $this->app->alias(EInvoicingManager::class, 'einvoicing');
+        $this->app->singleton(FranceManager::class, fn (Application $app): FranceManager => new FranceManager($app));
     }
 
     public function boot(): void
     {
         $this->loadMigrationsFrom(self::MIGRATION);
+
+        // The live Annuaire is bound only for an application that names its French transport, so
+        // a router resolved from the container never reaches the network unasked. The setting is
+        // read once, at boot, like the webhook flag; the client itself is built on first use. An
+        // Annuaire the application bound itself is kept.
+        if (FranceManager::transportName(config('einvoicing.france.transport')) !== null && ! $this->app->bound(Annuaire::class)) {
+            $this->app->singleton(Annuaire::class, fn (Application $app): Annuaire => $app->make(FranceManager::class)->annuaire());
+        }
 
         // Registering the route reads configuration only; transports are built per request. The
         // setting may come from an environment variable; a value that is not a flag means off.

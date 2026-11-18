@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **French e-invoicing (B2Brouter):** `EInvoicing::france(?string $transport = null)` returns the
+  core's `B2BrouterFrance` (send as plateforme agréée, lifecycle statuses, buyer responses,
+  payments, e-reporting) and `EInvoicing::annuaire(?string $transport = null)` the live
+  `B2BrouterAnnuaire`, both for a `b2brouter` transport, by default the one named in the new
+  `einvoicing.france.transport` setting (`EINVOICING_FRANCE_TRANSPORT`). A missing or
+  non-B2Brouter transport throws a `ConfigurationException` naming that setting. Built by the new
+  `France\FranceManager` singleton.
+- **Annuaire binding:** only when `einvoicing.france.transport` is set, the core's
+  `France\Routing\Annuaire` is bound to that transport's `B2BrouterAnnuaire`, so
+  `France\Routing\Router` resolves from the container; an `Annuaire` the application bound itself
+  is kept. New settings `einvoicing.france.annuaire_attempts` (default 4, 1 to 10) and
+  `annuaire_retry_delay` (seconds, default 3, 0 to 30).
+- **Events:** the webhook fires `LifecycleStatusChanged` (transport, B2Brouter invoice id,
+  `LifecycleStatus`, received or issued) for a notification carrying a French lifecycle status,
+  and `EReportStateChanged` (transport, ledger id) for `ledger.state_change`.
+- **Doctor:** a `france` row when `einvoicing.france.transport` is set: the transport must be a
+  valid B2Brouter transport; the row names its key kind (sandbox, staging or production).
+
+### Changed
+
+- Requires `intragile/php-einvoicing` ^1.1.
+
 ## [1.0.0] - 2026-11-16
 
 ### Added

@@ -11,6 +11,7 @@ use Illuminate\Support\Str;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Jobs\MessageJob;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
@@ -102,6 +103,7 @@ final class DoctorCommand extends Command
         foreach ($manager->names() as $name) {
             $this->checkTransport($manager, $name);
         }
+        $this->checkFrance();
         $this->checkValidation($manager);
         $this->checkCore();
         $this->checkRulePackages();
@@ -337,6 +339,35 @@ final class DoctorCommand extends Command
                 $this->row('config flags', self::WARN, sprintf('einvoicing.%s is not a boolean; treated as %s', $key, $unparseable ? 'on' : 'off'));
             }
         }
+    }
+
+    /**
+     * The transport of the French flow, when einvoicing.france.transport names one: a B2Brouter
+     * transport, and which environment its key belongs to. No request is made.
+     */
+    private function checkFrance(): void
+    {
+        $france = app(FranceManager::class);
+        $transport = $france->configuredTransport();
+        if ($transport === null) {
+            return;
+        }
+
+        try {
+            $config = $france->b2brouterConfig($transport);
+            $france->annuaireSettings();
+        } catch (ConfigurationException $exception) {
+            $this->row('france', self::FAIL, $this->describe($exception, withClass: false));
+
+            return;
+        }
+
+        $kind = match (true) {
+            $config->isSandboxKey() => 'sandbox key: nothing reaches the French network',
+            $config->isStagingKey() => 'staging key',
+            default => 'production key: invoices are sent for real',
+        };
+        $this->row('france', self::OK, "transport {$transport} (b2brouter), {$kind}");
     }
 
     private function checkValidation(EInvoicingManager $manager): void

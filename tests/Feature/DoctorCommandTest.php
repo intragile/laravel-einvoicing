@@ -529,6 +529,52 @@ final class DoctorCommandTest extends TestCase
         $this->assertStringNotContainsString(self::SECRET_MARK, $output);
     }
 
+    public function test_doctor_reports_france_transport(): void
+    {
+        config()->set('einvoicing.validation.enabled', false);
+        config()->set('einvoicing.default', 'b2brouter');
+        $b2brouter = ['driver' => 'b2brouter', 'account_id' => 78234];
+        config()->set('einvoicing.transports', [
+            'b2brouter' => $b2brouter + ['api_key' => 'test_'.self::SECRET_MARK],
+            'staging' => $b2brouter + ['api_key' => 'stag_'.self::SECRET_MARK, 'base_url' => 'https://api-staging.b2brouter.net'],
+            'production' => $b2brouter + ['api_key' => 'live-'.self::SECRET_MARK],
+            'recommand' => ['driver' => 'recommand', 'api_key_id' => 'key-'.self::SECRET_MARK, 'secret' => 'sec-'.self::SECRET_MARK, 'company_id' => 'c_test'],
+        ]);
+
+        // Without einvoicing.france.transport the French flow is off and has no row.
+        [$code, $output] = $this->doctor();
+        $this->assertSame(0, $code, $output);
+        $this->assertDoesNotMatchRegularExpression('/\|\s*france\s*\|/', $output);
+
+        foreach (['b2brouter' => 'sandbox', 'staging' => 'staging', 'production' => 'production'] as $transport => $kind) {
+            config()->set('einvoicing.france.transport', $transport);
+
+            [$code, $output] = $this->doctor();
+
+            $this->assertSame(0, $code, $output);
+            $this->assertRow($output, 'france', 'ok', "transport {$transport} (b2brouter), {$kind} key");
+            $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+        }
+
+        foreach (['recommand', 'nowhere'] as $transport) {
+            config()->set('einvoicing.france.transport', $transport);
+
+            [$code, $output] = $this->doctor();
+
+            $this->assertSame(1, $code, $output);
+            $this->assertRow($output, 'france', 'fail', 'einvoicing.france.transport');
+            $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+        }
+
+        config()->set('einvoicing.france.transport', 'b2brouter');
+        config()->set('einvoicing.france.annuaire_attempts', 0);
+
+        [$code, $output] = $this->doctor();
+
+        $this->assertSame(1, $code, $output);
+        $this->assertRow($output, 'france', 'fail', 'einvoicing.france.annuaire_attempts');
+    }
+
     public function test_doctor_cuts_an_api_key_out_of_messages(): void
     {
         $this->useStubTransports(['stub' => ['api_key' => 'ak-'.self::SECRET_MARK]]);

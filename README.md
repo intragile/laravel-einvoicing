@@ -89,7 +89,7 @@ php artisan einvoicing:doctor                          # checks everything below
 >
 > ```json
 > "repositories": [
->     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.0.0" } } },
+>     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.1.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931", "options": { "versions": { "intragile/einvoicing-rules-en16931": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-xrechnung", "options": { "versions": { "intragile/einvoicing-rules-xrechnung": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-facturx", "options": { "versions": { "intragile/einvoicing-rules-facturx": "1.0.0" } } },
@@ -493,6 +493,67 @@ removes the route.
 A delivery-status webhook that arrives before the send job has stored the access point's
 document id finds no row and is dropped. On a real queue the status polls catch up; on a `sync`
 connection nothing does, so check such rows by hand.
+
+## French e-invoicing (B2Brouter)
+
+A `b2brouter` transport can also act as your French plateforme agréée. Name it in
+`einvoicing.france.transport` (`EINVOICING_FRANCE_TRANSPORT`); it must be configured in
+`einvoicing.transports` with the `b2brouter` driver, and its key, account id, base URL and the
+`einvoicing.http` settings are used as for Peppol sending. Requires `intragile/php-einvoicing`
+1.1 or later.
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Transport\B2Brouter\France\BuyerResponse;
+use IntrAgile\EInvoicing\Transport\B2Brouter\France\FrenchDocument;
+
+$result = EInvoicing::france()->send(FrenchDocument::fromXml($ublOrCiiXml));
+$status = EInvoicing::france()->lifecycle($result->documentId);   // PlatformStatus, CDV code in ->lifecycle
+EInvoicing::france()->respond($receivedInvoiceId, BuyerResponse::approved());
+EInvoicing::france()->recordPayment($issuedInvoiceId);           // paid in full
+$deposit = EInvoicing::france()->depositEReport($flux10Xml);      // EReportDeposit, ->ledgerId
+```
+
+`EInvoicing::france($transport)` and `EInvoicing::annuaire($transport)` take another B2Brouter
+transport by name; a transport that is missing or not B2Brouter throws a
+`ConfigurationException` naming `einvoicing.france.transport`. These clients make real requests:
+`EInvoicing::fake()` does not replace them, and nothing is queued or stored. See the core's
+TRANSPORT.md for every method.
+
+**Routing.** Only when `einvoicing.france.transport` is set, the core's
+`France\Routing\Annuaire` interface is bound to the live `B2BrouterAnnuaire` of that transport,
+so the router can be resolved from the container (an `Annuaire` your application binds itself is
+kept):
+
+```php
+use IntrAgile\EInvoicing\France\Routing\Router;
+
+$decision = app(Router::class)->route($invoice);   // RoutingDecision: ->channel, ->needsDirectoryCheck
+```
+
+A cold Annuaire lookup is repeated while B2Brouter is still resolving it, up to
+`einvoicing.france.annuaire_attempts` requests (default 4) `annuaire_retry_delay` seconds apart
+(default 3), so `route()` can block for about nine seconds. A SIREN that fails the local check
+(for example one written with spaces), a lookup still unresolved after the last attempt and an
+unavailable directory give `Unknown`, and the router then keeps the e-invoice and asks for a
+directory check. **`route()` can still throw:** an `InvalidArgumentException` when B2Brouter
+refuses the SIREN (HTTP 422), and `AuthenticationFailed` when it refuses the API key
+(HTTP 401/403). Catch both around `route()` if a refused lookup must not stop your flow.
+
+**Webhooks.** Register `issued_invoice.state_change`, `received_invoice.state_change` and
+`ledger.state_change` at B2Brouter as well. After the usual handling the webhook fires:
+
+| Event | When |
+|---|---|
+| `LifecycleStatusChanged` | the notification carries a French lifecycle status: `$transport`, `$documentId` (the B2Brouter invoice id), `$status` (`LifecycleStatus`), `$received` (true for an invoice you received, whose status is your own response) |
+| `EReportStateChanged` | a deposited e-reporting file changed state: `$transport`, `$ledgerId`; read the state with `EInvoicing::france($event->transport)->eReportStatus($event->ledgerId)` |
+
+Both fire once per delivery, so a repeated or late notification fires them again; compare with
+what you stored before acting.
+
+**Doctor.** With `einvoicing.france.transport` set, `einvoicing:doctor` adds a `france` row: the
+transport must be a valid B2Brouter transport, and the row says whether its key is a sandbox
+(`test_`), staging (`stag_`) or production key. It makes no request.
 
 ## Queues
 

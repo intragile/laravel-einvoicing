@@ -34,7 +34,7 @@
         "intragile/einvoicing-rules-en16931": "^1.0",
         "intragile/einvoicing-rules-facturx": "^1.0",
         "intragile/einvoicing-rules-xrechnung": "^1.0",
-        "intragile/php-einvoicing": "^1.0",
+        "intragile/php-einvoicing": "^1.1",
         "laravel/framework": "^12.71|^13.0"
     },
     "require-dev": {
