@@ -519,8 +519,8 @@ Egy `b2brouter` transport francia plateforme agréée-ként is használható. Ne
 base URL-jét és az `einvoicing.http` beállításokat ugyanúgy használja, mint a Peppol-küldés. Az
 `intragile/php-einvoicing` 1.1 vagy újabb kell hozzá.
 
-> **Élőben (a B2Brouter sandboxban) tesztelve: a címtár-lekérdezés, a küldés és az életciklus a
-> `Deposited` állapotig; a válaszok, a fizetések és az elfogadott beküldés csak offline tesztelt.**
+> **Élőben (a B2Brouter sandboxban) tesztelve: a címtár-lekérdezés, a küldés, az életciklus, a
+> vevői jóváhagyás és a fizetés; az elfogadott beküldés csak offline tesztelt.**
 
 ```php
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
