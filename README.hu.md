@@ -71,7 +71,7 @@ Elérhető driver a Recommand, a B2Brouter és az e-invoice.be; a Storecove terv
 A hálózatot csak szimuláló szolgáltatói sandbox elleni teszt a szolgáltató API-szerződését
 igazolja, nem a Peppolon történő kézbesítést; a Peppol teszthálót csak a Recommand éri el. Az
 e-invoice.be csak Peppol BIS Billing 3.0 UBL-t küld. A B2Brouter a továbbított dokumentumot a
-saját számlamodelljéből állítja elő, így a kézbesített bájtok eltérhetnek a te XML-edtől. A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); a webhookokat nem teszteltük élesben. Hogy
+saját számlamodelljéből állítja elő, így a kézbesített bájtok eltérhetnek a te XML-edtől. A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); élesben csak a B2Brouter webhookjait teszteltük (2026-11-18, sandbox-kézbesítések a Laravel hídon visszajátszva). Hogy
 melyik driver mit küld, hogyan képezi le az állapotokat, hogyan fogad és mit tud a webhookja, azt
 a core [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md)
 leírása tartalmazza (angolul).
@@ -582,6 +582,9 @@ cselekvés előtt vesd össze azzal, amit már eltároltál. Akkor is lefutnak, 
 fióknál is kiváltódik, mert az életciklus-státusz a számla `data.state` mezőjéből származik. Egy
 `ledger.state_change` webhook mostantól a `WebhookReceived` eseményig is eljut, `Other` típusú
 eseményként, amelynek dokumentum-id-ja a ledger id.
+Amikor egy rögzített fizetés `paid` állapotba viszi a számlát, a B2Brouter nem küld értesítést
+(a sandboxban megfigyelve), így a `Collected` sosem érkezik `LifecycleStatusChanged`-ként: a
+`recordPayment()` visszatérési értékéből vagy a `lifecycle()`-ből olvasd ki.
 
 **Doctor.** Beállított `einvoicing.france.transport` mellett az `einvoicing:doctor` egy `france`
 sort is kiír: a transportnak érvényes B2Brouter transportnak kell lennie, és a sor megmondja, hogy
@@ -737,19 +740,21 @@ fake módban is a beállított kulccsal ellenőrzi.
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel; a core `recommand-live` éles csoportja; a híd `RecommandSmokeTest` éles futtatása, amely számlát küld az `EInvoicing::send()`-del | **Élesben tesztelve a Peppol teszthálózaton** (2026-11-15: core- és hídfuttatás) |
 | B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel, a core `b2brouter-live` és `einvoicebe-live` éles csoportjai; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat)** (2026-11-15, core) |
 | Francia folyamat (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | A core offline szerződéstesztjei és `b2brouter-france-live` éles csoportja; a híd `B2BrouterFranceSmokeTest` éles futtatása: az `Annuaire` binding, egy küldés `Deposited` állapotig és egy teljes fizetés, amely `Collected`-ként olvasható vissza | **Élesben tesztelve a B2Brouter sandbox ellen** (2026-11-18: core- és hídfuttatás, francia sandboxfiók); az elfogadott Flux 10 beküldést még nem teszteltük élesben |
-| Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | Offline ellenőrizve; **a webhookokat nem teszteltük élesben** (nyilvános HTTPS-végpont kellene) |
+| Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | Offline ellenőrizve; **a B2Brouter webhookjait élesben teszteltük** (2026-11-18: valódi, aláírt sandbox-kézbesítések a hídon visszajátszva); a Recommand és az e-invoice.be webhookjait nem |
 
 A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
 
 A futtatások eredménye dátummal és commitokkal a core
-[VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md) fájljában van (angolul). A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); a webhookokat nem teszteltük élesben.
+[VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md) fájljában van (angolul). A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); élesben csak a B2Brouter webhookjait teszteltük (2026-11-18, sandbox-kézbesítések a Laravel hídon visszajátszva).
 
 A csomag alapértelmezett tesztfuttatása nem használ hálózatot; az éles smoke-futtatás ki van
 zárva belőle (`recommand-live` és `b2brouter-france-live` csoport, `Live` testsuite). A Recommand
 futtatás csak akkor indul, ha a kulcs a Peppol teszthálózaton lévő Recommand playgroundhoz
 tartozik; a francia futtatás (egy francia B2Brouter-fiók `B2BROUTER_API_KEY` és
 `B2BROUTER_ACCOUNT_ID` értékével) csak sandbox hoston `test_`, staging hoston `stag_` kulccsal
-indul. A core-ban opcionális éles csoportok
+indul. Ugyanebben a csoportban a `B2BrouterWebhookReplayTest` a B2Brouter-től elmentett
+webhook-kézbesítéseket (`B2BROUTER_WEBHOOK_CAPTURE_DIR`, `B2BROUTER_WEBHOOK_SECRET`) játssza vissza
+a webhook-útvonalon, hálózati hívás nélkül. A core-ban opcionális éles csoportok
 vannak:
 `recommand-live` Recommand playground csapathoz, `b2brouter-live` B2Brouter sandboxhoz és
 `einvoicebe-live` e-invoice.be sandbox céghez; lásd a core

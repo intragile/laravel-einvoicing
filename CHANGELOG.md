@@ -29,6 +29,8 @@ All notable changes to this project are documented here. The format follows
   excluded from the default run) runs the French flow through the bridge against a French
   B2Brouter sandbox or staging account: the `Annuaire` binding, a send that must reach `Deposited`
   and a full payment that must read back as `Collected`; it refuses any other key or host.
+  `B2BrouterWebhookReplayTest` (same group) replays captured B2Brouter webhook deliveries through
+  the webhook route: real signatures must verify and fire `LifecycleStatusChanged`.
 - **Doctor:** a `france` row when `einvoicing.france.transport` is set: the transport must be a
   valid B2Brouter transport; the row names its key kind (sandbox, staging or production).
 

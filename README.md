@@ -69,7 +69,7 @@ Recommand, B2Brouter and e-invoice.be are the available drivers; Storecove is pl
 A test against a provider sandbox that simulates the network proves the provider's API contract,
 not delivery over Peppol; only Recommand can reach the Peppol test network. e-invoice.be sends
 Peppol BIS Billing 3.0 UBL only. B2Brouter renders the document it transmits from its own invoice
-model, so the delivered bytes may differ from your XML. Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); webhooks were not live-tested. What each driver sends, its status
+model, so the delivered bytes may differ from your XML. Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); only B2Brouter's webhooks were live-tested (2026-11-18, sandbox deliveries replayed through the Laravel bridge). What each driver sends, its status
 mapping, inbound behaviour and webhook details are in the core's
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
 
@@ -561,6 +561,9 @@ what you stored before acting. They fire whether or not `einvoicing.france.trans
 `LifecycleStatusChanged` also fires for a B2Brouter account that is not French, because the
 lifecycle status is derived from the invoice's `data.state`. A `ledger.state_change` webhook now
 reaches `WebhookReceived` as well, as an event of kind `Other` whose document id is the ledger id.
+B2Brouter sends no notification when a recorded payment turns an invoice `paid` (observed in the
+sandbox), so `Collected` never arrives as `LifecycleStatusChanged`: read it from what
+`recordPayment()` returns or from `lifecycle()`.
 
 **Doctor.** With `einvoicing.france.transport` set, `einvoicing:doctor` adds a `france` row: the
 transport must be a valid B2Brouter transport, and the row says whether its key is a sandbox
@@ -707,18 +710,21 @@ configured secret while faked.
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description; core live group `recommand-live`; bridge live smoke run `RecommandSmokeTest`, which sends an invoice through `EInvoicing::send()` | **Live-tested on the Peppol test network** (2026-11-15: core run and bridge run) |
 | B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference, core live groups `b2brouter-live` and `einvoicebe-live`; manager, config, doctor and webhook routing tested here | **Live-tested against the provider sandbox (simulated network)** (2026-11-15, core) |
 | French flow (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | Core offline contract tests and core live group `b2brouter-france-live`; bridge live smoke run `B2BrouterFranceSmokeTest`: the `Annuaire` binding, a send that reaches `Deposited` and a full payment that reads `Collected` | **Live-tested against the B2Brouter sandbox** (2026-11-18: core run and bridge run, French sandbox account); an accepted Flux 10 deposit is not yet live-tested |
-| Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | Verified offline; **webhooks were not live-tested** (needs a public HTTPS endpoint) |
+| Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | Verified offline; **B2Brouter webhooks live-tested** (2026-11-18: real signed sandbox deliveries replayed through the bridge); Recommand and e-invoice.be webhooks not live-tested |
 
 The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
 
 The run results, with dates and commits, are in the core's
-[VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md). Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); webhooks were not live-tested.
+[VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md). Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); only B2Brouter's webhooks were live-tested (2026-11-18, sandbox deliveries replayed through the Laravel bridge).
 
 The default test run of this package makes no network call; the live smoke run is excluded from
 it (groups `recommand-live` and `b2brouter-france-live`, testsuite `Live`). The Recommand run
 refuses unless the key belongs to a Recommand playground on the Peppol test network; the French
 run (`B2BROUTER_API_KEY` and `B2BROUTER_ACCOUNT_ID` of a French B2Brouter account) refuses any key
-but a `test_` key on the sandbox host or a `stag_` key on the staging host. The core has opt-in live groups:
+but a `test_` key on the sandbox host or a `stag_` key on the staging host.
+`B2BrouterWebhookReplayTest` in the same group replays webhook deliveries captured from B2Brouter
+(`B2BROUTER_WEBHOOK_CAPTURE_DIR`, `B2BROUTER_WEBHOOK_SECRET`) through the webhook route without
+any network call. The core has opt-in live groups:
 `recommand-live` for a Recommand playground team, `b2brouter-live` for a B2Brouter sandbox and
 `einvoicebe-live` for an e-invoice.be sandbox company; see its
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
