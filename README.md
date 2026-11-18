@@ -502,6 +502,9 @@ A `b2brouter` transport can also act as your French plateforme agréée. Name it
 `einvoicing.http` settings are used as for Peppol sending. Requires `intragile/php-einvoicing`
 1.1 or later.
 
+> **Live-tested: directory lookup only; send, lifecycle, responses, payments and deposit are
+> tested offline, pending a B2Brouter French staging account.**
+
 ```php
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
 use IntrAgile\EInvoicing\Transport\B2Brouter\France\BuyerResponse;
@@ -517,8 +520,11 @@ $deposit = EInvoicing::france()->depositEReport($flux10Xml);      // EReportDepo
 `EInvoicing::france($transport)` and `EInvoicing::annuaire($transport)` take another B2Brouter
 transport by name; a transport that is missing or not B2Brouter throws a
 `ConfigurationException` naming `einvoicing.france.transport`. These clients make real requests:
-`EInvoicing::fake()` does not replace them, and nothing is queued or stored. See the core's
-TRANSPORT.md for every method.
+`EInvoicing::fake()` does not replace them, and nothing is queued or stored. The clients are
+cached per transport name for the lifetime of the process, so long-running processes (Octane,
+queue workers) must be restarted after a configuration change. For every method, see the core's
+[FRANCE.md](https://github.com/intragile/php-einvoicing/blob/main/docs/countries/FRANCE.md),
+section "Sending through a plateforme agréée (B2Brouter)".
 
 **Routing.** Only when `einvoicing.france.transport` is set, the core's
 `France\Routing\Annuaire` interface is bound to the live `B2BrouterAnnuaire` of that transport,
@@ -533,10 +539,12 @@ $decision = app(Router::class)->route($invoice);   // RoutingDecision: ->channel
 
 A cold Annuaire lookup is repeated while B2Brouter is still resolving it, up to
 `einvoicing.france.annuaire_attempts` requests (default 4) `annuaire_retry_delay` seconds apart
-(default 3), so `route()` can block for about nine seconds. A SIREN that fails the local check
-(for example one written with spaces), a lookup still unresolved after the last attempt and an
-unavailable directory give `Unknown`, and the router then keeps the e-invoice and asks for a
-directory check. **`route()` can still throw:** an `InvalidArgumentException` when B2Brouter
+(default 3), so `route()` can block for about nine seconds; that figure is the polling case
+only, and a lookup that hangs costs one HTTP timeout (`einvoicing.http`) before it reads as
+`Unknown`. Spaces in a SIREN are ignored. A SIREN that fails the local check, a company B2Brouter
+flags `FR_ASSUJETTI_UNKNOWN`, a lookup still unresolved after the last attempt and an unavailable
+directory give `Unknown`, and the router then keeps the e-invoice and asks for a directory
+check. **`route()` can still throw:** an `InvalidArgumentException` when B2Brouter
 refuses the SIREN (HTTP 422), and `AuthenticationFailed` when it refuses the API key
 (HTTP 401/403). Catch both around `route()` if a refused lookup must not stop your flow.
 
@@ -549,7 +557,10 @@ refuses the SIREN (HTTP 422), and `AuthenticationFailed` when it refuses the API
 | `EReportStateChanged` | a deposited e-reporting file changed state: `$transport`, `$ledgerId`; read the state with `EInvoicing::france($event->transport)->eReportStatus($event->ledgerId)` |
 
 Both fire once per delivery, so a repeated or late notification fires them again; compare with
-what you stored before acting.
+what you stored before acting. They fire whether or not `einvoicing.france.transport` is set:
+`LifecycleStatusChanged` also fires for a B2Brouter account that is not French, because the
+lifecycle status is derived from the invoice's `data.state`. A `ledger.state_change` webhook now
+reaches `WebhookReceived` as well, as an event of kind `Other` whose document id is the ledger id.
 
 **Doctor.** With `einvoicing.france.transport` set, `einvoicing:doctor` adds a `france` row: the
 transport must be a valid B2Brouter transport, and the row says whether its key is a sandbox
