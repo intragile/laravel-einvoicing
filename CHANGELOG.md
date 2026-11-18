@@ -25,6 +25,10 @@ All notable changes to this project are documented here. The format follows
 - **Events:** the webhook fires `LifecycleStatusChanged` (transport, B2Brouter invoice id,
   `LifecycleStatus`, received or issued) for a notification carrying a French lifecycle status,
   and `EReportStateChanged` (transport, ledger id) for `ledger.state_change`.
+- **Testing:** `B2BrouterFranceSmokeTest` (group `b2brouter-france-live`, testsuite `Live`,
+  excluded from the default run) runs the French flow through the bridge against a French
+  B2Brouter sandbox or staging account: the `Annuaire` binding, a send that must reach `Deposited`
+  and a full payment that must read back as `Collected`; it refuses any other key or host.
 - **Doctor:** a `france` row when `einvoicing.france.transport` is set: the transport must be a
   valid B2Brouter transport; the row names its key kind (sandbox, staging or production).
 

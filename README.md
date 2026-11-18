@@ -702,10 +702,11 @@ configured secret while faked.
 
 | Area | How | Status |
 |---|---|---|
-| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 338 tests, 1824 assertions on PHP 8.5 with the dependencies installed here (CI runs PHP 8.3, 8.4 and 8.5 × Laravel 12 and 13) | Run on every test run |
+| State machine, send policy, retries, claim expiry, status polling, inbound intake, webhooks, commands | Offline feature tests with `FakeTransport` and stub transports: 367 tests, 1936 assertions on PHP 8.5 with the dependencies installed here (CI runs PHP 8.3, 8.4 and 8.5 × Laravel 12 and 13) | Run on every test run |
 | Peppol validation through the manager | Opt-in group `peppol-rules`: installs the official rules from a local copy and sends the Peppol base example through a validating transport | Run before releases |
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description; core live group `recommand-live`; bridge live smoke run `RecommandSmokeTest`, which sends an invoice through `EInvoicing::send()` | **Live-tested on the Peppol test network** (2026-11-15: core run and bridge run) |
 | B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference, core live groups `b2brouter-live` and `einvoicebe-live`; manager, config, doctor and webhook routing tested here | **Live-tested against the provider sandbox (simulated network)** (2026-11-15, core) |
+| French flow (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | Core offline contract tests and core live group `b2brouter-france-live`; bridge live smoke run `B2BrouterFranceSmokeTest`: the `Annuaire` binding, a send that reaches `Deposited` and a full payment that reads `Collected` | **Live-tested against the B2Brouter sandbox** (2026-11-18: core run and bridge run, French sandbox account); an accepted Flux 10 deposit is not yet live-tested |
 | Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | Verified offline; **webhooks were not live-tested** (needs a public HTTPS endpoint) |
 
 The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
@@ -714,8 +715,10 @@ The run results, with dates and commits, are in the core's
 [VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md). Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); webhooks were not live-tested.
 
 The default test run of this package makes no network call; the live smoke run is excluded from
-it (group `recommand-live`, testsuite `Live`) and refuses unless the key belongs to a Recommand
-playground on the Peppol test network. The core has opt-in live groups:
+it (groups `recommand-live` and `b2brouter-france-live`, testsuite `Live`). The Recommand run
+refuses unless the key belongs to a Recommand playground on the Peppol test network; the French
+run (`B2BROUTER_API_KEY` and `B2BROUTER_ACCOUNT_ID` of a French B2Brouter account) refuses any key
+but a `test_` key on the sandbox host or a `stag_` key on the staging host. The core has opt-in live groups:
 `recommand-live` for a Recommand playground team, `b2brouter-live` for a B2Brouter sandbox and
 `einvoicebe-live` for an e-invoice.be sandbox company; see its
 [TRANSPORT.md](https://github.com/intragile/php-einvoicing/blob/main/docs/TRANSPORT.md).
