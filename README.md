@@ -502,8 +502,8 @@ A `b2brouter` transport can also act as your French plateforme agréée. Name it
 `einvoicing.http` settings are used as for Peppol sending. Requires `intragile/php-einvoicing`
 1.1 or later.
 
-> **Live-tested: directory lookup only; send, lifecycle, responses, payments and deposit are
-> tested offline, pending a B2Brouter French staging account.**
+> **Live-tested in the B2Brouter sandbox: directory lookup, send and lifecycle up to `Deposited`;
+> responses, payments and an accepted deposit are tested offline only.**
 
 ```php
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
