@@ -655,15 +655,22 @@ final class EInvoicingManager
      *
      * @param  int|null  $maxResponseBytes  a checked response size cap; null reads einvoicing.http.max_response_bytes
      * @param  list<string>  $secrets  values kept out of exception messages and body excerpts
+     * @param  int|float|null  $timeoutCap  seconds both timeouts are capped at, for a quick check; null keeps them
      *
      * @throws ConfigurationException when an einvoicing.http setting is invalid
      */
-    public function httpClient(?int $maxResponseBytes = null, #[SensitiveParameter] array $secrets = []): HttpClient
+    public function httpClient(?int $maxResponseBytes = null, #[SensitiveParameter] array $secrets = [], int|float|null $timeoutCap = null): HttpClient
     {
         $factory = new HttpFactory;
+        $timeout = $this->number('einvoicing.http.timeout', 60);
+        $connectTimeout = $this->number('einvoicing.http.connect_timeout', 10);
+        if ($timeoutCap !== null) {
+            $timeout = min($timeout, $timeoutCap);
+            $connectTimeout = min($connectTimeout, $timeoutCap);
+        }
         $client = new Client([
-            'timeout' => $this->number('einvoicing.http.timeout', 60),
-            'connect_timeout' => $this->number('einvoicing.http.connect_timeout', 10),
+            'timeout' => $timeout,
+            'connect_timeout' => $connectTimeout,
             'allow_redirects' => false,
             'http_errors' => false,
         ]);

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace IntrAgile\EInvoicing\Laravel\Ksef;
 
 use DateTimeImmutable;
-use Exception;
+use DateTimeInterface;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Transport\Ksef\Inbound\CursorWindow;
@@ -75,17 +75,17 @@ final class DatabaseKsefCursorStore implements KsefCursorStore
         if (! is_string($value)) {
             throw self::corrupt($key);
         }
-        $date = DateTimeImmutable::createFromFormat(self::DATE_FORMAT, $value);
-        if ($date === false) {
-            try {
-                // A value edited by hand in another ISO 8601 form is still accepted.
-                $date = new DateTimeImmutable($value);
-            } catch (Exception) {
-                throw self::corrupt($key);
+        // The stored form, or a value edited by hand in RFC 3339 without fractional seconds.
+        // Relative forms such as "now" are refused: they would move the cursor on every read.
+        foreach ([self::DATE_FORMAT, DateTimeInterface::ATOM] as $format) {
+            $date = DateTimeImmutable::createFromFormat('!'.$format, $value);
+            $errors = DateTimeImmutable::getLastErrors();
+            if ($date !== false && ($errors === false || ($errors['warning_count'] === 0 && $errors['error_count'] === 0))) {
+                return $date;
             }
         }
 
-        return $date;
+        throw self::corrupt($key);
     }
 
     /**

@@ -123,6 +123,13 @@ final class DoctorKsefTest extends TestCase
         [, $output] = $this->doctor();
         $this->assertStringNotContainsString('ksef:', $output);
 
+        // A transport named ksef is shadowed by the built-in name.
+        config()->set('einvoicing.transports.ksef', ['driver' => 'recommand', 'api_key_id' => 'key-'.self::SECRET_MARK, 'secret' => 'sec-'.self::SECRET_MARK, 'company_id' => 'c_test']);
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'ksef: transports', 'warn', 'einvoicing.transports.ksef is shadowed');
+        $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+        config()->set('einvoicing.transports.ksef', null);
+
         config()->set('einvoicing.ksef.environment', 'demo');
         config()->set('einvoicing.ksef.nip', self::KSEF_NIP);
         config()->set('einvoicing.ksef.credentials', ['token' => 'token-'.self::SECRET_MARK]);

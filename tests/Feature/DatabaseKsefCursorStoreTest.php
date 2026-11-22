@@ -75,6 +75,31 @@ final class DatabaseKsefCursorStoreTest extends TestCase
         $store->window('k');
     }
 
+    public function test_dates_read_back_only_in_rfc3339_forms(): void
+    {
+        $store = $this->app->make(KsefCursorStore::class);
+        $store->save('k', CursorWindow::start(new DateTimeImmutable('2026-11-20T00:00:00+00:00')));
+
+        // RFC 3339 without fractional seconds, as edited by hand, is read.
+        DB::table('einvoicing_ksef_cursors')->where('key', 'k')->update(['from' => '2026-11-21T08:00:00+01:00', 'hwm' => '2026-11-22T09:30:00.123+00:00']);
+        $window = $store->window('k');
+        self::assertNotNull($window);
+        self::assertSame('2026-11-21T08:00:00.000000+01:00', $window->from->format('Y-m-d\TH:i:s.uP'));
+        self::assertNotNull($window->hwm);
+        self::assertSame('2026-11-22T09:30:00.123000+00:00', $window->hwm->format('Y-m-d\TH:i:s.uP'));
+
+        foreach (['from' => 'now', 'hwm' => 'yesterday', 'from ' => '2026-11-21 08:00:00', 'hwm ' => '2026-11-21T08:00:00', ' from' => '2026-02-30T08:00:00+00:00'] as $column => $value) {
+            $store->save('k', CursorWindow::start(new DateTimeImmutable('2026-11-20T00:00:00+00:00')));
+            DB::table('einvoicing_ksef_cursors')->where('key', 'k')->update([trim($column) => $value]);
+            try {
+                $store->window('k');
+                self::fail("The stored date \"{$value}\" was accepted.");
+            } catch (UnexpectedValueException $exception) {
+                self::assertStringContainsString('"k"', $exception->getMessage());
+            }
+        }
+    }
+
     public function test_migration_is_idempotent(): void
     {
         self::assertTrue(Schema::hasColumns('einvoicing_outbound_documents', self::OUTBOUND_COLUMNS));

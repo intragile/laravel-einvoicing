@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
+use GuzzleHttp\Client;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
@@ -11,10 +12,12 @@ use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\KsefFiles;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Poland\KsefEnvironment;
+use IntrAgile\EInvoicing\Transport\Http\HttpClient;
 use IntrAgile\EInvoicing\Transport\Ksef\Auth\CertificateCredentials;
 use IntrAgile\EInvoicing\Transport\Ksef\Auth\TokenCredentials;
 use IntrAgile\EInvoicing\Transport\Ksef\KsefTransport;
 use IntrAgile\EInvoicing\Transport\Ksef\Latarnia\Latarnia;
+use ReflectionProperty;
 
 final class KsefManagerTest extends TestCase
 {
@@ -205,6 +208,34 @@ final class KsefManagerTest extends TestCase
         self::assertInstanceOf(Latarnia::class, $this->ksef()->latarnia());
         config()->set('einvoicing.ksef.environment', 'demo');
         self::assertNull($this->ksef()->latarnia(), 'DEMO has no Latarnia.');
+    }
+
+    public function test_latarnia_timeout_caps_the_http_timeouts(): void
+    {
+        self::assertSame([60, 10], self::latarniaTimeouts($this->ksef()->latarnia()));
+        self::assertSame([5, 5], self::latarniaTimeouts($this->ksef()->latarnia(5)));
+
+        // A configured timeout below the cap is kept.
+        config()->set('einvoicing.http.connect_timeout', 2);
+        self::assertSame([5, 2], self::latarniaTimeouts($this->ksef()->latarnia(5)));
+    }
+
+    /**
+     * The total and connect timeouts of the Guzzle client behind a Latarnia client.
+     *
+     * @return array{mixed, mixed}
+     */
+    private static function latarniaTimeouts(?Latarnia $latarnia): array
+    {
+        self::assertNotNull($latarnia);
+        $http = (new ReflectionProperty(Latarnia::class, 'http'))->getValue($latarnia);
+        self::assertInstanceOf(HttpClient::class, $http);
+        $client = (new ReflectionProperty(HttpClient::class, 'client'))->getValue($http);
+        self::assertInstanceOf(Client::class, $client);
+        $config = (new ReflectionProperty(Client::class, 'config'))->getValue($client);
+        self::assertIsArray($config);
+
+        return [$config['timeout'] ?? null, $config['connect_timeout'] ?? null];
     }
 
     public function test_manager_output_hides_credentials(): void

@@ -74,9 +74,12 @@ final class KsefManager
      * The Latarnia client of the configured environment, or null for DEMO, which has none. A
      * Latarnia instance bound in the container is used instead, for any environment.
      *
+     * @param  int|float|null  $timeout  seconds the connection and the whole request may take at
+     *                                   most, below the einvoicing.http timeouts; null keeps those
+     *
      * @throws ConfigurationException when a setting is invalid
      */
-    public function latarnia(): ?Latarnia
+    public function latarnia(int|float|null $timeout = null): ?Latarnia
     {
         $app = ($this->app)();
         if ($app->bound(Latarnia::class)) {
@@ -87,7 +90,9 @@ final class KsefManager
             return null;
         }
 
-        return Latarnia::forEnvironment($environment, $this->httpClient());
+        $http = ($this->app)()->make(EInvoicingManager::class)->httpClient($this->settings()->maxResponseBytes, [], $timeout);
+
+        return Latarnia::forEnvironment($environment, $http);
     }
 
     /**

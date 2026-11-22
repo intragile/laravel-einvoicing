@@ -40,6 +40,11 @@ use Throwable;
  * Checks the configuration, the Peppol rules, the tables and the queue, and with --live asks each
  * transport's inbox once whether the credentials work.
  *
+ * Without --live no provider API is called. The one request made by default is the KSeF
+ * availability status of Latarnia, a public, unauthenticated read, when einvoicing.ksef is in use;
+ * it is capped at LATARNIA_TIMEOUT seconds, so a run without network access is not held up, and
+ * a failure is only a warning. KSeF itself is never called.
+ *
  * Configuration problems are named by their key path only, and the base URL, which may carry
  * credentials, is never printed. Exception messages are printed with every configured credential
  * cut out.
@@ -47,7 +52,7 @@ use Throwable;
 final class DoctorCommand extends Command
 {
     protected $signature = 'einvoicing:doctor
-        {--live : Call each transport\'s inbox once to check the credentials}';
+        {--live : Call each transport\'s API (its inbox) once to check the credentials; the public KSeF Latarnia status is read without it}';
 
     protected $description = 'Check the e-invoicing transports, validation rules, tables and queue';
 
@@ -99,6 +104,9 @@ final class DoctorCommand extends Command
 
     /** Days before the expiry of the KSeF Offline certificate from which the doctor warns. */
     private const KSEF_EXPIRY_WARNING_DAYS = 30;
+
+    /** Seconds the Latarnia status request may take to connect and in total. */
+    private const LATARNIA_TIMEOUT = 5;
 
     /** @var list<array{string, string, string}> */
     private array $rows = [];
@@ -392,6 +400,12 @@ final class DoctorCommand extends Command
     private function checkKsef(): void
     {
         $ksef = app(KsefManager::class);
+        if ($this->transportConfig(EInvoicingManager::KSEF) !== null) {
+            $this->row('ksef: transports', self::WARN, sprintf(
+                'einvoicing.transports.%1$s is shadowed: EInvoicing::inbound("%1$s") always returns the KSeF transport of einvoicing.ksef, so its inbox is never read; rename that transport',
+                EInvoicingManager::KSEF,
+            ));
+        }
         if (! $ksef->isConfigured()) {
             return;
         }
@@ -474,7 +488,7 @@ final class DoctorCommand extends Command
     private function checkLatarnia(KsefManager $ksef): void
     {
         try {
-            $latarnia = $ksef->latarnia();
+            $latarnia = $ksef->latarnia(self::LATARNIA_TIMEOUT);
             if ($latarnia === null) {
                 $this->row('ksef: latarnia', self::INFO, 'the Ministry of Finance publishes no Latarnia for DEMO; availability is not checked');
 
