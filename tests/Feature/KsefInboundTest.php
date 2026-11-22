@@ -192,6 +192,38 @@ final class KsefInboundTest extends TestCase
         Queue::assertPushed(FetchInboundDocument::class, 2);
     }
 
+    public function test_lost_acknowledgement_is_repaired_by_the_next_poll(): void
+    {
+        config()->set('queue.default', 'database');
+        Queue::fake();
+        $other = '5555555555-20261120-010080615741-'.KsefNumber::checksum('5555555555-20261120-010080615741');
+        $this->bindInbox((new FakeKsefApi)->withTokenAuthentication()
+            ->on('POST', '#\A/invoices/query/metadata\z#', self::metadataPage([self::RECEIVED, $other]), self::metadataPage([self::RECEIVED, $other])));
+        $this->artisan('einvoicing:poll-inbound', ['--transport' => 'ksef'])->expectsOutputToContain('2 new')->assertSuccessful();
+        $store = $this->app->make(KsefCursorStore::class);
+        $key = DB::table('einvoicing_ksef_cursors')->value('key');
+        $this->assertIsString($key);
+
+        // Two workers acknowledge one invoice each from the same read of the window; the second
+        // write overwrites the first, so the first acknowledgement is lost.
+        $stale = $store->window($key);
+        $this->assertNotNull($stale);
+        EInvoicing::inbound('ksef')->acknowledge(self::RECEIVED_ID);
+        $store->save($key, $stale->acknowledge($other));
+        InboundMessage::query()->where('transport', 'ksef')->update(['state' => InboundState::Acknowledged->value]);
+        $this->assertSame([self::RECEIVED => false, $other => true], $store->window($key)?->ids);
+
+        $this->travel(16)->minutes();
+        $this->artisan('einvoicing:poll-inbound', ['--transport' => 'ksef'])->assertSuccessful();
+
+        // The next poll acknowledged the listed invoice again, so the window moved on.
+        $window = $store->window($key);
+        $this->assertNotNull($window);
+        $this->assertSame([], $window->ids);
+        $this->assertSame('2026-11-21T09:59:00', $window->from->format('Y-m-d\TH:i:s'));
+        Queue::assertPushed(FetchInboundDocument::class, 2);
+    }
+
     public function test_min_interval_of_zero_never_skips(): void
     {
         config()->set('einvoicing.ksef.inbound_min_interval_minutes', 0);

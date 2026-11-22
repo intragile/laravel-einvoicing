@@ -16,7 +16,9 @@ use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Jobs\MessageJob;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
+use IntrAgile\EInvoicing\Laravel\Jobs\PollKsefStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
+use IntrAgile\EInvoicing\Laravel\Jobs\SendKsefInvoice;
 use IntrAgile\EInvoicing\Laravel\Ksef\DatabaseKsefCursorStore;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
@@ -134,6 +136,13 @@ final class DoctorCommand extends Command
 
         if ((bool) $this->option('live')) {
             foreach ($manager->names() as $name) {
+                if ($name === EInvoicingManager::KSEF) {
+                    // The name resolves to the KSeF transport, and reading its inbox would spend a
+                    // metadata query and save a cursor window; KSeF itself is never called here.
+                    $this->row("transport {$name}: inbox", self::INFO, 'not read: the name is shadowed by einvoicing.ksef, and the doctor never calls KSeF');
+
+                    continue;
+                }
                 $this->checkInbox($manager, $name);
             }
         }
@@ -662,7 +671,7 @@ final class DoctorCommand extends Command
                 .'which holds only if that process was killed, as a queue worker with pcntl does at its timeout',
                 $connection,
                 $driver,
-                SendDocument::claimLifetime(),
+                self::longestClaimLifetime(),
             ));
 
             return;
@@ -710,7 +719,7 @@ final class DoctorCommand extends Command
 
         $delays = [
             'einvoicing.sending.backoff (send and inbound retries)' => SendDocument::longestBackoff(),
-            'sending claim expiry (from einvoicing.http timeouts)' => SendDocument::claimLifetime(),
+            'sending claim expiry (from einvoicing.http timeouts)' => self::longestClaimLifetime(),
         ];
         if (ConfigFlag::enabled('status.poll')) {
             $delays['einvoicing.status.delays'] = PollDeliveryStatus::longestDelay();
@@ -761,7 +770,14 @@ final class DoctorCommand extends Command
         $retryAfter = (int) $retryAfter;
 
         $send = (int) (new SendDocument(0))->timeout;
-        $longest = max($send, (int) (new PollDeliveryStatus(0))->timeout, (int) (new FetchInboundDocument(0))->timeout);
+        $timeouts = [$send, (int) (new PollDeliveryStatus(0))->timeout, (int) (new FetchInboundDocument(0))->timeout];
+        if (self::usesKsef()) {
+            // The KSeF jobs make several requests each, so their timeouts are longer.
+            $send = max($send, (int) (new SendKsefInvoice(0))->timeout);
+            $timeouts[] = (int) (new SendKsefInvoice(0))->timeout;
+            $timeouts[] = (int) (new PollKsefStatus(0))->timeout;
+        }
+        $longest = max($timeouts);
 
         $retryAfter > $longest
             ? $this->row('queue retry_after', self::OK, sprintf('%d s, longer than the longest job timeout of %d s', $retryAfter, $longest))
@@ -774,6 +790,24 @@ final class DoctorCommand extends Command
                 $longest,
                 $longest,
             ));
+    }
+
+    /**
+     * Whether einvoicing.ksef is in use, so the KSeF jobs run on the queue.
+     */
+    private static function usesKsef(): bool
+    {
+        return app(KsefManager::class)->isConfigured();
+    }
+
+    /**
+     * Seconds after which a sending claim is over, for the longest send job in use.
+     */
+    private static function longestClaimLifetime(): int
+    {
+        return self::usesKsef()
+            ? max(SendDocument::claimLifetime(), SendKsefInvoice::claimLifetime())
+            : SendDocument::claimLifetime();
     }
 
     private function checkInbox(EInvoicingManager $manager, string $name): void

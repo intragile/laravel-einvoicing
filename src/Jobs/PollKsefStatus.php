@@ -40,7 +40,10 @@ use LogicException;
  * Status 200 delivers the row with its KSeF number and the invoicing mode KSeF reports; an invoice
  * KSeF classifies as offline gets its offline24 deadline when the row has none. The UPO is then
  * fetched into the row; when KSeF has not issued it yet, later runs fetch it. A final failure
- * fails the row and fires DocumentFailed, as does a document id that is not a KSeF one.
+ * fails the row and fires DocumentFailed, as does a document id that is not a KSeF one. When an
+ * earlier send of the row may have been accepted (provider_code "outcome_unknown"), a final
+ * failure other than a validation failure makes the row unconfirmed instead and keeps the marker,
+ * as SendKsefInvoice does with a refusal at send time.
  *
  * KSeF reports a duplicate (status 440) when an invoice with the same seller NIP, invoice type and
  * number is already accepted, whatever its content. The row is delivered under the original KSeF
@@ -159,9 +162,29 @@ final class PollKsefStatus extends MessageJob
         return match ($status->deliveryState()) {
             DeliveryState::Delivered => $status->ksefNumber !== null
                 && $this->deliver($message, $documentId, $status->ksefNumber, $status->invoicingMode),
-            DeliveryState::Failed => $this->failRow($message, $documentId, $status->failure()),
+            DeliveryState::Failed => $this->failed($message, $documentId, $status->failure()),
             DeliveryState::Pending, DeliveryState::Unknown => false,
         };
+    }
+
+    /**
+     * Fails the row on a final failure status, unless an earlier send of the row may have been
+     * accepted: a processing failure of this copy (cancelled, decryption error, unknown error)
+     * says nothing about that earlier send, so the row becomes unconfirmed and keeps its marker.
+     * A validation failure is decided by the bytes alone, so the earlier send was refused too.
+     */
+    private function failed(OutboundMessage $message, string $documentId, ?DeliveryFailure $failure): bool
+    {
+        if ($message->provider_code === SendKsefInvoice::OUTCOME_UNKNOWN
+            && ($failure->category ?? FailureCategory::Other) !== FailureCategory::Validation) {
+            return $this->unconfirmed($message, $documentId, sprintf(
+                'KSeF ended this send with status %s: %s An earlier send of this invoice may have been accepted, as its outcome was unknown; look for an invoice with the same seller NIP, invoice type and number (P_2) in KSeF and run einvoicing:resolve.',
+                $failure->providerCode ?? 'unknown',
+                rtrim($failure->message ?? 'no description', '.').'.',
+            ), SendKsefInvoice::OUTCOME_UNKNOWN);
+        }
+
+        return $this->failRow($message, $documentId, $failure);
     }
 
     private function deliver(OutboundMessage $message, string $documentId, string $ksefNumber, ?InvoicingMode $mode, ?string $providerCode = null, ?string $upo = null): bool
@@ -263,11 +286,11 @@ final class PollKsefStatus extends MessageJob
         return true;
     }
 
-    private function unconfirmed(OutboundMessage $message, string $documentId, string $reason): bool
+    private function unconfirmed(OutboundMessage $message, string $documentId, string $reason, string $providerCode = '440'): bool
     {
         if (! $message->transition(OutboundState::Pending, OutboundState::Unconfirmed, [
             'failure_message' => $reason,
-            'provider_code' => (string) self::DUPLICATE_STATUS,
+            'provider_code' => $providerCode,
         ], ['provider_document_id' => $documentId])) {
             return false;
         }

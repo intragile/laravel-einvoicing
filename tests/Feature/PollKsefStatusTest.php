@@ -126,6 +126,38 @@ final class PollKsefStatusTest extends TestCase
         Event::assertDispatched(DocumentFailed::class, fn (DocumentFailed $event): bool => $event->message->id === $message->id);
     }
 
+    public function test_resend_after_unknown_outcome_ending_on_a_processing_failure_is_unconfirmed(): void
+    {
+        foreach ([405, 435, 500, 550] as $code) {
+            $this->bindKsef()->onStatus(FakeKsefApi::status($code, 'Przetwarzanie przerwane'));
+            $message = $this->ksefRow(OutboundState::Pending, ['provider_code' => SendKsefInvoice::OUTCOME_UNKNOWN]);
+
+            $row = $this->runPoll($message);
+
+            $this->assertSame(OutboundState::Unconfirmed, $row->state, (string) $code);
+            $this->assertSame(SendKsefInvoice::OUTCOME_UNKNOWN, $row->provider_code, (string) $code);
+            $this->assertStringContainsString((string) $code, (string) $row->failure_message);
+            $this->assertStringContainsString('An earlier send of this invoice may have been accepted', (string) $row->failure_message);
+            $this->assertNull($row->finished_at);
+            Event::assertDispatched(DocumentUnconfirmed::class, fn (DocumentUnconfirmed $event): bool => $event->message->id === $message->id);
+            // The next row reuses the same KSeF document id.
+            $row->delete();
+        }
+        Event::assertNotDispatched(DocumentFailed::class);
+    }
+
+    public function test_resend_after_unknown_outcome_ending_on_a_validation_failure_fails(): void
+    {
+        $this->bindKsef()->onStatus(FakeKsefApi::status(450, 'Błąd weryfikacji semantyki dokumentu faktury'));
+        $message = $this->ksefRow(OutboundState::Pending, ['provider_code' => SendKsefInvoice::OUTCOME_UNKNOWN]);
+
+        $row = $this->runPoll($message);
+
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertSame(FailureCategory::Validation, $row->failure_category);
+        Event::assertNotDispatched(DocumentUnconfirmed::class);
+    }
+
     public function test_duplicate_proven_by_the_original_receipt_is_delivered_with_the_original_number(): void
     {
         // One receipt read for the comparison, one stored on the row.

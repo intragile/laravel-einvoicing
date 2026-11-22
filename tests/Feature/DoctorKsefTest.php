@@ -11,9 +11,11 @@ use GuzzleHttp\Psr7\HttpFactory;
 use GuzzleHttp\Psr7\Response;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
+use IntrAgile\EInvoicing\Laravel\Tests\Support\FakeKsefApi;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\KsefFiles;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Transport\Http\HttpClient;
+use IntrAgile\EInvoicing\Transport\Ksef\KsefTransport;
 use IntrAgile\EInvoicing\Transport\Ksef\Latarnia\Latarnia;
 use Psr\Http\Message\RequestInterface;
 
@@ -115,6 +117,44 @@ final class DoctorKsefTest extends TestCase
         $this->assertRow($output, 'ksef: offline certificate', 'info', 'not set');
         $this->assertRow($output, 'ksef: latarnia', 'warn');
         $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+    }
+
+    public function test_doctor_live_never_reads_the_ksef_inbox_of_a_shadowed_transport(): void
+    {
+        $this->configureKsefCertificate(365);
+        config()->set('einvoicing.transports.ksef', ['driver' => 'recommand', 'api_key_id' => 'key', 'secret' => 'sec', 'company_id' => 'c_test']);
+        $api = (new FakeKsefApi)->withTokenAuthentication()
+            ->on('POST', '#\A/invoices/query/metadata\z#', FakeKsefApi::json(200, ['hasMore' => false, 'isTruncated' => false, 'invoices' => []]));
+        $this->app->instance(KsefTransport::class, $api->transport());
+        $this->fakeLatarnia(new Response(200, ['Content-Type' => 'application/json'], '{"status":"AVAILABLE","messages":[]}'));
+
+        $code = Artisan::call('einvoicing:doctor', ['--live' => true]);
+        $output = Artisan::output();
+
+        $this->assertRow($output, 'transport ksef: inbox', 'info', 'not read');
+        $this->assertSame([], $api->paths());
+        $this->assertCount(1, $this->latarniaRequests);
+        $this->assertSame('/status', $this->latarniaRequests[0]->getUri()->getPath());
+        $this->assertNotSame(2, $code);
+    }
+
+    public function test_doctor_retry_after_accounts_for_the_ksef_job_timeouts(): void
+    {
+        $this->configureKsefCertificate(365);
+        config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'default', 'retry_after' => 300]);
+        config()->set('queue.default', 'db');
+        $this->fakeLatarnia(
+            new Response(200, ['Content-Type' => 'application/json'], '{"status":"AVAILABLE","messages":[]}'),
+            new Response(200, ['Content-Type' => 'application/json'], '{"status":"AVAILABLE","messages":[]}'),
+        );
+
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'queue retry_after', 'warn', 'queue.connections.db.retry_after');
+        $this->assertStringContainsString('longest 310 s', $output);
+
+        config()->set('queue.connections.db.retry_after', 320);
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'queue retry_after', 'ok', 'longest job timeout of 310 s');
     }
 
     public function test_doctor_skips_ksef_when_unused_and_notes_demo_has_no_latarnia(): void

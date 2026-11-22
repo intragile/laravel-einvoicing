@@ -14,9 +14,14 @@ use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
  * reach KSeF by the deadline, which lies within einvoicing.ksef.deadline_warning_hours or has
  * already passed.
  *
+ * It also fires for a row that failed for a reason that does not settle the invoice, such as a
+ * transport error during a KSeF outage (any failure category except validation, duplicate and
+ * document_not_supported): the invoice must still reach KSeF, so resend it with
+ * einvoicing:resolve --resend.
+ *
  * einvoicing:ksef-deadlines fires it again on every run while the row stays inside the window and
- * is neither delivered nor failed, so a listener that notifies people should remember what it has
- * already sent.
+ * is neither delivered nor settled, so a listener that notifies people should remember what it
+ * has already sent.
  */
 final class KsefOfflineDeadlineApproaching
 {

@@ -50,7 +50,12 @@ All notable changes to this project are documented here. The format follows
   `SendDocument`, and repeats a send whose outcome is unknown (KSeF answers a second copy as a
   duplicate). `PollKsefStatus` reads the status once per run along `status.delays`, stores
   `ksef_number`, `invoicing_mode` and the receipt (`upo`); on a synchronous connection it waits for
-  the final status inline (about 60 seconds at most) and tries the receipt once.
+  the final status inline (about 60 seconds at most) and tries the receipt once. After an unknown
+  outcome (`provider_code` `outcome_unknown`), a refusal of the repeated copy other than a
+  validation failure, at send time or as a final status (405, 435, 500, 550), leaves the row
+  `unconfirmed` with the marker kept, never `failed`. `einvoicing:resolve` sends a KSeF row again
+  through `SendKsefInvoice` (keeping the marker when resolved from an unknown outcome), and
+  `ExpireSendingClaim` gives an expired KSeF claim its KSeF message and the marker.
 - **KSeF duplicates:** a status 440 delivers the row under the original KSeF number only when the
   original's receipt proves the same file (`provider_code` `440`, the original's receipt stored); a
   different file fails the row with category `duplicate`; an undecidable comparison is retried and
@@ -59,7 +64,9 @@ All notable changes to this project are documented here. The format follows
   existing intake jobs, at most once per `inbound_min_interval_minutes` (less a minute of slack,
   at least one minute; kept in the default cache store). Inbound ids are
   `<KSeF number>@<storage date>`, and a plain KSeF number matches the same row. The inbox position
-  is kept by `Ksef\DatabaseKsefCursorStore` in the new table `einvoicing_ksef_cursors`.
+  is kept by `Ksef\DatabaseKsefCursorStore` in the new table `einvoicing_ksef_cursors`. A listed
+  invoice whose row is already acknowledged is acknowledged again, which repairs an
+  acknowledgement lost when two workers rewrote the cursor at once.
 - **KSeF migration:** `add_ksef_to_einvoicing_tables` adds `ksef_number` (indexed),
   `invoicing_mode`, `offline_deadline` and `upo` to `einvoicing_outbound_documents` and creates
   `einvoicing_ksef_cursors`; `create_einvoicing_tables` creates the same columns on a fresh
@@ -67,15 +74,19 @@ All notable changes to this project are documented here. The format follows
 - **KSeF commands:** `einvoicing:ksef-certificate` enrols a KSeF Offline or Authentication
   certificate (EC P-256 or RSA-2048) and writes it with its private key, mode 0600, refusing to
   overwrite and never printing the key. `einvoicing:ksef-deadlines` lists offline rows not yet
-  delivered or failed with their deadlines, using the outages announced in Latarnia where
+  delivered with their deadlines (a failed row too, unless it failed on validation, as a duplicate
+  or as an unsupported document, marked for `einvoicing:resolve --resend`), using the outages announced in Latarnia where
   reachable, and stores the deadline on the row (a calculation aid, not legal advice).
-- **Events:** `KsefOfflineDeadlineApproaching` (`$message`, `$deadline`) for an offline row whose
-  deadline is within `deadline_warning_hours` or has passed. The document events fire for KSeF rows
+- **Events:** `KsefOfflineDeadlineApproaching` (`$message`, `$deadline`) for an offline row still
+  to be sent (including one failed for a reason that does not settle it, such as a transport
+  error) whose deadline is within `deadline_warning_hours` or has passed. The document events fire for KSeF rows
   as for Peppol.
 - **Doctor:** `ksef` rows when `einvoicing.ksef` is in use: configuration and credentials, the
   certificates' expiry (an Offline certificate within 30 days warns), the cursor table, a shadowed
   `ksef` transport, and the public Latarnia status, read by default with a 5-second timeout. KSeF
-  itself is never called.
+  itself is never called, not even with `--live`, which skips the inbox of a shadowed `ksef`
+  transport. The `retry_after` check and the claim lifetimes the doctor quotes include the KSeF
+  jobs (240 s send, 310 s status with the default `http` settings) when `einvoicing.ksef` is in use.
 - **Testing:** `KsefLiveTest` (group `ksef-live`, testsuite `Live`, excluded from the default run)
   sends an invoice through `EInvoicing::ksef()->queue()` on KSeF TE and receives it with
   `einvoicing:poll-inbound --transport=ksef` in a second context, with random NIPs and self-signed

@@ -654,7 +654,8 @@ Ezek a `config/einvoicing.php` `einvoicing.ksef` kulcsát töltik ki:
 
 ```bash
 php artisan einvoicing:ksef-certificate                         # Offline tanúsítvány, EC P-256
-php artisan einvoicing:ksef-certificate --type=authentication --algorithm=rsa --name="Billing"
+php artisan einvoicing:ksef-certificate --type=authentication --algorithm=rsa --name="Billing" \
+    --certificate=/run/secrets/ksef-auth.crt.pem --private-key=/run/secrets/ksef-auth.key.pem
 ```
 
 A parancs tanúsítványt igényel a beállított kontextusra, és a tanúsítványt meg a privát kulcsát
@@ -664,6 +665,11 @@ A parancs tanúsítványt igényel a beállított kontextusra, és a tanúsítv�
 ellenőrzi, és létező fájlt nem ír felül. A kulcs helyben készül, kiírásig csak a memóriában van, és
 sosem jelenik meg a kimeneten; ha a típushoz jelszó van beállítva, titkosítva írja ki. A KSeF
 alanyonként 100 tanúsítványt enged.
+
+Authentication tanúsítványhoz add meg a `--certificate=` és a `--private-key=` kapcsolót: az
+alapértelmezett útvonalak a `credentials` fájljai, amelyekkel maga a parancs hitelesít, ezek tehát
+már léteznek, és a parancs sosem írja felül őket. Az új tanúsítvánnyal való bejelentkezéshez utána
+állítsd a `credentials` útvonalait az új fájlokra.
 
 ### Küldés
 
@@ -687,13 +693,22 @@ validálja a számlát, elküldi, és elindítja a `PollKsefStatus` jobot, amely
   egy későbbi futás tölti le.
 - **Elutasítás:** a sor a KSeF kódjával és üzenetével `failed` lesz, és `DocumentFailed` esemény
   fut.
-- **Az ismeretlen kimenetelű küldést megismételjük**, a Peppoltól eltérően: a második példányt a
-  KSeF duplikátumként jelzi, így kétszer nem fogadhatja be.
+- **Az ismeretlen kimenetelű küldést aszinkron queue-n megismételjük**, a Peppoltól eltérően: a
+  második példányt a KSeF duplikátumként jelzi, így kétszer nem fogadhatja be. Közben a sor
+  `provider_code` értéke `outcome_unknown`. Szinkron kapcsolaton (`sync`, `deferred`,
+  `background`) nem ismételjük: a sor azonnal **unconfirmed** lesz; az `einvoicing:resolve`
+  paranccsal rendezd.
+- **Ismeretlen kimenetel után** az ismételt példány olyan elutasítása, amely az első küldésről
+  semmit nem mond (küldéskor, vagy 405-ös, 435-ös, 500-as vagy 550-es végleges státusz), a sort
+  `failed` helyett **unconfirmed** állapotba teszi, és megtartja az `outcome_unknown` jelölést: az
+  első küldést a KSeF befogadhatta, ezért újraküldés vagy újbóli kiállítás előtt keresd meg a
+  számlát a KSeF-ben. A validációs hibát (430, 450) a bájtok döntik el, ezért az továbbra is
+  `failed` állapotba teszi a sort.
 - **Duplikátumok (440-es státusz).** A KSeF akkor jelez duplikátumot, ha azonos eladói NIP-pel,
   számlatípussal és számlaszámmal (`P_2`) már befogadott egy számlát, a tartalmától függetlenül. A
   sor csak akkor lesz **delivered** az eredeti KSeF-számmal, ha az eredeti nyugtája igazolja, hogy
   az eredeti pontosan ez a fájl (azonos dokumentum-hash); ilyenkor a `provider_code` `440`, és az
-  eredeti nyugtáját tároljuk. Ha az eredeti egy másik fájl, a sor `duplicate` kategóriával
+  eredeti nyugtáját tároljuk, ha olvasható. Ha az eredeti egy másik fájl, a sor `duplicate` kategóriával
   **failed** lesz. Ha nem dönthető el (a nyugtát elutasítják vagy még nincs kiállítva), a következő
   futás újra megkérdezi, az utolsó futás után pedig a sor **unconfirmed** lesz, operátori döntésre
   (`einvoicing:resolve`). Találgatásra sosem lesz delivered.
@@ -702,6 +717,13 @@ validálja a számlát, elküldi, és elindítja a `PollKsefStatus` jobot, amely
 > core kliens lekérdezési korlátján belül, nagyjából 60 másodpercig vár a végleges státuszra, és
 > egyszer megpróbálja letölteni a nyugtát. Élesben aszinkron queue-t használj (lásd:
 > [Queue](#queue)).
+
+- **A státuszkövetéshez kell az `einvoicing.status.poll`.** A KSeF-nek nincs webhookja, így
+  kikapcsolt lekérdezés mellett a KSeF-sorok `pending` állapotban maradnak, KSeF-szám és nyugta
+  nélkül.
+- **Ha a státuszlekérdezések elfogynak** (`status.max_attempts`), miközben a KSeF még dolgozik,
+  vagy a szinkron várakozás végleges státusz nélkül ér véget, a sor `pending` marad, és nem fut
+  esemény. Keresd azokat a `pending` KSeF-sorokat, amelyeknél a `status_checks` elérte a maximumot.
 
 ### Fogadás
 
@@ -717,15 +739,24 @@ A lekérdezés a beállított NIP vevői postafiókját olvassa a tárolt pozíc
 bejövő sorként rögzít; a meglévő jobok letöltik, tárolják és nyugtázzák, a `DocumentReceived`
 pedig egyszer fut le, ahogy Peppolnál. Az első lekérdezés az utolsó 30 napot olvassa.
 
-- **A lekérdezés védett.** A KSeF kontextusonként óránként 20 metaadat-lekérdezést enged, és a
+- **A lekérdezés védett.** A KSeF kontextusonként és IP-címenként óránként 20
+  metaadat-lekérdezést enged, és a
   Pénzügyminisztérium azt ajánlja, hogy egy alanyt legfeljebb 15 percenként kérdezz le. Ha egy
   futás az előző indulása után az `inbound_min_interval_minutes`-nél hamarabb indul (egy perc
   türelmet hagyva az ütemező pontatlanságára), kihagyjuk, és ezt ki is írjuk. Az indulás idejét az
-  alapértelmezett cache store tárolja.
+  alapértelmezett cache store tárolja. Az intervallum legalább 4 perc legyen: a fix egy perc türelem
+  miatt egy kisebb érték a beállítottnál gyakoribb futást enged (3 perces intervallumnál 2
+  percenként, ami több a KSeF óránkénti 20 lekérdezésénél).
 - **A bejövő azonosítók** `<KSeF-szám>@<tárolási dátum>` alakúak, így a letöltéshez nem kell
   metaadat-lekérdezés; az a számla, amelyet a tárolt ablak metaadat nélkül sorol fel, a sima
   KSeF-számát kapja. Mindkét alak ugyanahhoz a sorhoz tartozik. Ha a saját oldaladon szűröd a
   duplikátumokat, a `KsefTransport::ksefNumberOf($message->provider_document_id)` értékét használd.
+- **A nyugtázás viszi tovább a tárolt ablakot.** Az ablak csak akkor lép tovább, ha minden benne
+  lévő számla nyugtázva van, ezért KSeF-hez hagyd bekapcsolva az `einvoicing.inbound.acknowledge`
+  beállítást: nélküle a lekérdezés újra és újra ugyanazt az ablakot olvassa. Ha két worker
+  egyszerre nyugtáz, felülírhatják egymás írását; ha a lekérdezés olyan számlát listáz, amelynek a
+  sora már nyugtázott, újra nyugtázza, így a következő lekérdezés helyreállítja az elveszett
+  nyugtázást.
 - A vevői postafiók néhány perccel a befogadás után listázza a számlát (a TE-n kb. két perccel).
 
 ### Események
@@ -736,20 +767,26 @@ KSeF feldolgozásra befogadta a számlát, `DocumentDelivered` a KSeF-számmal, 
 
 | Esemény | Mikor |
 |---|---|
-| `KsefOfflineDeadlineApproaching` | egy még úton lévő offline számlának (queued, sending, pending vagy unconfirmed) a `$deadline`-ig (`DateTimeImmutable`, a nap vége Europe/Warsaw időben) el kell jutnia a KSeF-be, és ez a határidő a `deadline_warning_hours`-on belül van vagy már elmúlt; a `$message` a sor. Az `einvoicing:ksef-deadlines` minden futáskor kiváltja, amíg ez fennáll, ezért jegyezd meg, miről értesítettél már |
+| `KsefOfflineDeadlineApproaching` | egy még úton lévő offline számlának (queued, sending, pending vagy unconfirmed, vagy olyan okból failed, amely nem zárja le, például szállítási hiba miatt) a `$deadline`-ig (`DateTimeImmutable`, a nap vége Europe/Warsaw időben) el kell jutnia a KSeF-be, és ez a határidő a `deadline_warning_hours`-on belül van vagy már elmúlt; a `$message` a sor. Az `einvoicing:ksef-deadlines` minden futáskor kiváltja, amíg ez fennáll, ezért jegyezd meg, miről értesítettél már |
 
 ### Offline mód és határidők
 
 Az olyankor kiállított számlát, amikor a KSeF nem használható, `offline: true` paraméterrel állítsd
 sorba; a KSeF offline-ként rögzíti, és egy határidőig el kell jutnia hozzá. A sor azonnal megkapja
 az offline24 határidejét (a `P_1` utáni első munkanap). Az `einvoicing:ksef-deadlines` felsorolja a
-még nem delivered és nem failed offline sorokat, a Latarnia (a KSeF elérhetőségi szolgáltatása)
+még nem delivered offline sorokat, a Latarnia (a KSeF elérhetőségi szolgáltatása)
 által bejelentett üzemzavarokkal újraszámolja a határidőket (egy üzemzavar a vége utáni 7.
 munkanapra tolja; teljes üzemzavar megszünteti a kötelezettséget, és amíg egy üzemzavar tart, a
 határidő üres), a sorra írja, és kiváltja a `KsefOfflineDeadlineApproaching` eseményt. Ha a
 Latarnia nem érhető el, vagy DEMO környezetben, amelyhez nincs Latarnia, üzemzavarok nélkül számol,
-és ezt jelzi. A munkanapok a hétvégéket és a lengyel törvényes ünnepnapokat hagyják ki (2026 és
+és ezt jelzi. A munkanapok a hétvégéket és a lengyel törvényes ünnepnapokat hagyják ki (2025 és
 2099 között).
+
+Az olyan okból `failed` sor, amely nem zárja le a számlát (például szállítási hiba egy
+KSeF-üzemzavar alatt), a listában marad „failed, resend with einvoicing:resolve --resend”
+jelöléssel, és az esemény is kiváltódik rá: a számlának ugyanúgy el kell jutnia a KSeF-be a
+határidőig. A validációs hiba, a duplikátum (`duplicate` kategória) vagy a nem támogatott
+dokumentum miatt `failed` sorok kimaradnak.
 
 **A határidők számítási segédletek, nem jogi tanácsadás.** Minden offline sort offline24
 számlaként kezelünk; a ténylegesen használt mód szabályait ellenőrizd.
@@ -786,9 +823,10 @@ Ha az `einvoicing.ksef` használatban van, az `einvoicing:doctor` `ksef` sorokka
 és ellenőrzi a beállításokat és a hozzáférési adatokat, a tanúsítványoknak olvashatónak és
 érvényesnek kell lenniük (a 30 napon belül lejáró Offline tanúsítvány figyelmeztetés), a
 kurzortáblának léteznie kell, és az `einvoicing.transports` alatti `ksef` nevű transportot
-eltakartként jelzi. **Alapból lekérdezi a környezet nyilvános Latarnia-állapotát**, hitelesítés
-nélküli kéréssel, 5 másodperces időkorláttal; a hiba csak figyelmeztetés. Magát a KSeF-et sosem
-hívja, `--live` mellett sem.
+eltakartként jelzi (`--live` mellett az inboxát sem olvassa). **Alapból lekérdezi a környezet
+nyilvános Latarnia-állapotát**, hitelesítés nélküli kéréssel, 5 másodperces időkorláttal; a hiba
+csak figyelmeztetés. Magát a KSeF-et sosem hívja, `--live` mellett sem. A `retry_after`
+ellenőrzése a KSeF-jobok időkorlátját is figyelembe veszi (lásd: [Queue](#queue)).
 
 ### Korlátok
 
@@ -798,6 +836,11 @@ hívja, `--live` mellett sem.
 - **Alkalmazásonként egy kontextus:** az `einvoicing.ksef` egy NIP-et nevez meg.
 - **Olvasási keret:** kontextusonként és IP-címenként óránként 20 metaadat-lekérdezés; tartsd meg a
   15 perces lekérdezést.
+- **Letöltési keret:** kontextusonként és IP-címenként óránként 64 számlaletöltés. Minden letöltés
+  egyet felhasznál, és a korlátozott (rate limited) letöltés is beleszámít az
+  `inbound.max_fetch_attempts` értékébe, így az óránkénti 64-nél jóval több számla a sorokat a
+  felső határig viheti; ezeket az `einvoicing:poll-inbound --transport=ksef --include-capped`
+  paranccsal próbáld újra.
 - **Online munkamenetek:** a core egy folyamat első küldésekor nyit egyet, és lejárat előtt
   lecseréli; a híd nem zárja le. A nyugtát nyitott munkamenet mellett töltjük le (ezt a TE-n
   végzett éles futtatás megerősíti).
@@ -818,7 +861,8 @@ használj.**
   egy hiba `500`-as választ ad (`APP_DEBUG` mellett hibaoldallal). A doctor ezekre a driverekre
   figyelmeztet.
 - **A `retry_after` legyen hosszabb a jobok időkorlátjánál.** Az alapértelmezett `http`
-  beállításokkal a küldő job időkorlátja 100, a bejövő dokumentumé 170 másodperc. Ha egy job
+  beállításokkal a küldő job időkorlátja 100, a bejövő dokumentumé 170 másodperc; ha az
+  `einvoicing.ksef` használatban van, a KSeF küldő jobé 240, a KSeF státuszjobé 310. Ha egy job
   tovább fut a kapcsolat `retry_after` értékénél, egy másik worker újra lefoglalja, és mivel ezek
   a jobok sosem ismétlődnek, sikertelennek jelöli, miközben az első futás még sikerülhet. A
   doctor ezt is ellenőrzi.
@@ -833,7 +877,7 @@ használj.**
   vagy `Retry-After` egyszerűen rövidebb várakozást jelent: az alapértelmezett `sending.backoff`
   (legfeljebb 1800) és `status.delays` (legfeljebb 21600) esetén a csomag a beállítottnál
   korábban kérdez le és próbálkozik újra. A foglalás lejárata (a küldő job időkorlátja plusz 30
-  másodperc, az alapértelmezett `http` beállításokkal 130) maradjon 900 alatt, különben a lassú
+  másodperc, az alapértelmezett `http` beállításokkal 130, KSeF-küldésnél 270) maradjon 900 alatt, különben a lassú
   küldés még futás közben `unconfirmed` lesz. Az Amazon SQS FIFO queue-n nem enged
   üzenetenkénti késleltetést (a `DelaySeconds` csak a queue szintjén állítható be), így az
   újrapróbálások és a státuszlekérdezések nem lennének időben széthúzva. **Ne használj FIFO
@@ -968,7 +1012,7 @@ A csomag alapértelmezett tesztfuttatása nem használ hálózatot; az éles smo
 zárva belőle (`recommand-live`, `b2brouter-france-live` és `ksef-live` csoport, `Live` testsuite).
 A KSeF futtatáshoz nem kell fiók: csak a KSeF TE-t éri el (`https://api-test.ksef.mf.gov.pl/v2`,
 minden más KSeF hostot elutasít), véletlen NIP-eket használ önaláírt bélyegzőkkel, amelyeket
-ideiglenes könyvtárba ír (0600), minden kérésnek van időkorlátja, és 15:55 és 18:00 (Europe/Warsaw)
+ideiglenes könyvtárba ír (0600), minden kérésnek van időkorlátja, és 15:40 és 18:00 (Europe/Warsaw)
 között, a TE napi karbantartása körül nem indul. A Recommand
 futtatás csak akkor indul, ha a kulcs a Peppol teszthálózaton lévő Recommand playgroundhoz
 tartozik; a francia futtatás (egy francia B2Brouter-fiók `B2BROUTER_API_KEY` és

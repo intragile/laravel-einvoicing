@@ -16,6 +16,7 @@ use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\FakeKsefApi;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\KsefInvoices;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
+use IntrAgile\EInvoicing\Transport\FailureCategory;
 use IntrAgile\EInvoicing\Transport\Http\HttpClient;
 use IntrAgile\EInvoicing\Transport\Ksef\Latarnia\Latarnia;
 
@@ -63,6 +64,7 @@ final class KsefDeadlinesCommandTest extends TestCase
         $this->ksefRow(OutboundState::Failed, [
             'invoicing_mode' => 'Offline',
             'reference' => 'FV/FAILED',
+            'failure_category' => FailureCategory::Validation,
             'provider_document_id' => FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::INVOICE_REF.'-F',
         ]);
         $this->ksefRow(OutboundState::Pending, [
@@ -106,6 +108,31 @@ final class KsefDeadlinesCommandTest extends TestCase
         $stored = OutboundMessage::query()->findOrFail($dueTomorrow->id)->offline_deadline;
         $this->assertNotNull($stored);
         $this->assertSame('2026-11-24 22:59:59', $stored->utc()->format('Y-m-d H:i:s'));
+    }
+
+    public function test_offline_row_failed_on_a_transport_error_is_still_listed_and_warned(): void
+    {
+        $this->bindLatarnia(FakeKsefApi::json(200, []));
+        $transport = $this->ksefRow(OutboundState::Failed, [
+            'invoicing_mode' => 'Offline',
+            'reference' => 'FV/FAILED/TRANSPORT',
+            'failure_category' => FailureCategory::Transport,
+            'provider_document_id' => null,
+        ]);
+        $this->ksefRow(OutboundState::Failed, [
+            'invoicing_mode' => 'Offline',
+            'reference' => 'FV/FAILED/DUPLICATE',
+            'failure_category' => FailureCategory::Duplicate,
+            'provider_document_id' => FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::INVOICE_REF.'-D',
+        ]);
+
+        $output = $this->deadlines();
+
+        $this->assertMatchesRegularExpression('#FV/FAILED/TRANSPORT .*failed.*2026-11-23 23:59 \(due soon\)#', $output);
+        $this->assertStringContainsString('einvoicing:resolve --resend', $output);
+        $this->assertStringNotContainsString('FV/FAILED/DUPLICATE', $output);
+        Event::assertDispatched(KsefOfflineDeadlineApproaching::class, 1);
+        Event::assertDispatched(KsefOfflineDeadlineApproaching::class, fn (KsefOfflineDeadlineApproaching $event): bool => $event->message->id === $transport->id);
     }
 
     public function test_deadlines_command_applies_an_announced_failure(): void

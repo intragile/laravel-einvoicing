@@ -65,8 +65,9 @@ use RuntimeException;
  * bound in the container, so every call goes through that guard.
  *
  * Every invoice is synthetic: invented names and addresses, no bank account. No key or token is
- * ever printed. No test starts in or within five minutes of TE's daily maintenance window
- * (16:00-18:00 Europe/Warsaw).
+ * ever printed. No test starts in or within twenty minutes of TE's daily maintenance window
+ * (16:00-18:00 Europe/Warsaw), so a run that polls the inbox to its limit still ends before
+ * 15:55.
  */
 #[Group('ksef-live')]
 final class KsefLiveTest extends TestCase
@@ -77,8 +78,11 @@ final class KsefLiveTest extends TestCase
 
     private const ZONE = 'Europe/Warsaw';
 
-    /** The first minute of the day (Europe/Warsaw) at which no live test starts. */
-    private const QUIET_FROM_MINUTE = 15 * 60 + 55;
+    /**
+     * The first minute of the day (Europe/Warsaw) at which no live test starts: the test can take
+     * several minutes, and nothing may reach TE from 15:55.
+     */
+    private const QUIET_FROM_MINUTE = 15 * 60 + 40;
 
     /** The minute of the day (Europe/Warsaw) at which the maintenance window ends. */
     private const QUIET_TO_MINUTE = 18 * 60;
@@ -312,15 +316,15 @@ final class KsefLiveTest extends TestCase
     }
 
     /**
-     * Why a live test must not start now, or null: from five minutes before TE's daily maintenance
-     * window until its end.
+     * Why a live test must not start now, or null: from twenty minutes before TE's daily
+     * maintenance window until its end.
      */
     private static function maintenanceReason(): ?string
     {
         $warsaw = new DateTimeImmutable('now', new DateTimeZone(self::ZONE));
         $minute = (int) $warsaw->format('G') * 60 + (int) $warsaw->format('i');
         if ($minute >= self::QUIET_FROM_MINUTE && $minute < self::QUIET_TO_MINUTE) {
-            return sprintf('KSeF TE is in or within five minutes of its daily maintenance window (16:00-18:00 Europe/Warsaw, now %s).', $warsaw->format('H:i'));
+            return sprintf('KSeF TE is in or within twenty minutes of its daily maintenance window (16:00-18:00 Europe/Warsaw, now %s).', $warsaw->format('H:i'));
         }
 
         return null;

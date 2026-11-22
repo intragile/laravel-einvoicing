@@ -174,6 +174,34 @@ final class KsefCertificateCommandTest extends TestCase
         $this->assertFileDoesNotExist($paths['private_key']);
     }
 
+    public function test_rejected_enrolment_says_nothing_was_issued(): void
+    {
+        $this->bindEnrolment();
+        $paths = $this->offlinePaths();
+        $credentials = new CertificateCredentials(
+            (string) file_get_contents((string) config('einvoicing.ksef.credentials.certificate')),
+            (string) file_get_contents((string) config('einvoicing.ksef.credentials.private_key')),
+            self::KSEF_PASSPHRASE,
+        );
+        $api = (new FakeKsefApi)->withCertificateAuthentication()
+            ->on('GET', '#\A/certificates/enrollments/data\z#', FakeKsefApi::json(200, ['commonName' => 'Test Seal', 'countryName' => 'PL']))
+            ->on('POST', '#\A/certificates/enrollments\z#', FakeKsefApi::json(202, ['referenceNumber' => '20261121-EH-1B2C3D4E5F-6A7B8C9D0E-11']))
+            ->on('GET', '#\A/certificates/enrollments/[A-Za-z0-9-]+\z#', FakeKsefApi::json(200, [
+                'requestDate' => '2026-11-21T10:00:00+00:00',
+                'status' => ['code' => 400, 'description' => 'Wniosek odrzucony', 'details' => ['Osiągnięto dopuszczalny limit posiadanych certyfikatów.']],
+            ]));
+        $this->app->instance(KsefTransport::class, $api->transport(credentials: $credentials));
+
+        $exitCode = Artisan::call('einvoicing:ksef-certificate', ['--type' => 'offline']);
+        $output = Artisan::output();
+
+        $this->assertSame(1, $exitCode, $output);
+        $this->assertStringContainsString('Wniosek odrzucony', $output);
+        $this->assertStringContainsString('no certificate was issued', $output);
+        $this->assertStringNotContainsString('may have issued', $output);
+        $this->assertFileDoesNotExist($paths['private_key']);
+    }
+
     public function test_certificate_command_refuses_overwrite(): void
     {
         $this->bindEnrolment();

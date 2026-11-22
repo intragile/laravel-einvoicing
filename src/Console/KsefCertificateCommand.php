@@ -7,6 +7,7 @@ namespace IntrAgile\EInvoicing\Laravel\Console;
 use Illuminate\Console\Command;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
+use IntrAgile\EInvoicing\Transport\Exception\DocumentRejected;
 use IntrAgile\EInvoicing\Transport\Ksef\Certificates\EnrolledCertificate;
 use IntrAgile\EInvoicing\Transport\Ksef\Certificates\KeyAlgorithm;
 use IntrAgile\EInvoicing\Transport\Ksef\Certificates\KsefCertificateType;
@@ -80,8 +81,18 @@ final class KsefCertificateCommand extends Command
 
         try {
             $enrolled = $ksef->transport()->certificates()->enroll($type, $algorithm, $name);
+        } catch (DocumentRejected $exception) {
+            // Without a previous exception KSeF rejected the enrolment request itself. A rejection
+            // wrapping another one comes from reading back an issued certificate, and its message
+            // names the serial number to revoke.
+            $this->components->error($exception->getPrevious() === null
+                ? sprintf('%s KSeF rejected the request, so no certificate was issued.', rtrim($exception->getMessage(), '.').'.')
+                : $exception->getMessage());
+
+            return self::FAILURE;
         } catch (ConfigurationException|LogicException|InvalidArgumentException $exception) {
-            // Refused before the enrolment request: nothing was issued.
+            // Usually refused before the enrolment request. An InvalidArgumentException raised
+            // after issuance names the issued serial number and says to revoke it.
             $this->components->error($exception->getMessage());
 
             return self::FAILURE;

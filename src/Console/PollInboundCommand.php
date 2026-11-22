@@ -31,6 +31,10 @@ use IntrAgile\EInvoicing\Transport\Exception\TransportException;
  * jitter (at least one minute in all), is skipped and says so. The start of the last run is kept
  * in the default cache store. Schedule it, for example, with
  * `Schedule::command('einvoicing:poll-inbound --transport=ksef')->everyFifteenMinutes()->withoutOverlapping();`
+ *
+ * The KSeF cursor is read and rewritten whole by every acknowledgement, so two workers can
+ * overwrite each other's acknowledgement. A KSeF document listed again although its row is
+ * acknowledged is therefore acknowledged again here, which only updates the cursor.
  */
 final class PollInboundCommand extends Command
 {
@@ -53,7 +57,8 @@ final class PollInboundCommand extends Command
             if ($transport === EInvoicingManager::KSEF && ! $this->claimKsefRun($manager->ksef())) {
                 return self::SUCCESS;
             }
-            $pending = $manager->inbound($transport)->pending();
+            $inbound = $manager->inbound($transport);
+            $pending = $inbound->pending();
         } catch (ConfigurationException|TransportException $exception) {
             $this->components->error($exception->getMessage());
 
@@ -70,6 +75,15 @@ final class PollInboundCommand extends Command
             $message = $recorder->notify($transport, $reference->documentId, $reference);
             if ($message->wasRecentlyCreated) {
                 $new++;
+
+                continue;
+            }
+            if ($message->state === InboundState::Acknowledged && $acknowledge && $transport === EInvoicingManager::KSEF) {
+                // Listed again although acknowledged here: the acknowledgement was lost in the
+                // stored KSeF cursor (two writers overwrote each other's window), which would hold
+                // the window for good. Acknowledging again only updates the cursor and is
+                // idempotent, so the next poll always repairs a lost write.
+                $inbound->acknowledge($reference->documentId);
 
                 continue;
             }

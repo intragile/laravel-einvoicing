@@ -633,7 +633,8 @@ These fill `einvoicing.ksef` in `config/einvoicing.php`:
 
 ```bash
 php artisan einvoicing:ksef-certificate                         # an Offline certificate, EC P-256
-php artisan einvoicing:ksef-certificate --type=authentication --algorithm=rsa --name="Billing"
+php artisan einvoicing:ksef-certificate --type=authentication --algorithm=rsa --name="Billing" \
+    --certificate=/run/secrets/ksef-auth.crt.pem --private-key=/run/secrets/ksef-auth.key.pem
 ```
 
 The command enrols a certificate for the configured context and writes the certificate and its
@@ -643,6 +644,10 @@ certificate, `credentials` for an Authentication certificate (`--certificate=` a
 an existing file. The key is generated locally, exists only in memory until it is written, and is
 never printed; when the type's passphrase is set, the key is written encrypted with it. KSeF
 allows 100 certificates per subject.
+
+An Authentication certificate needs `--certificate=` and `--private-key=`: its default paths are
+the `credentials` files the command itself authenticates with, which already exist and are never
+overwritten. Point `credentials` at the new files afterwards to log in with the new certificate.
 
 ### Sending
 
@@ -664,13 +669,21 @@ FA(3) schema, sends it, and starts `PollKsefStatus`, which follows `status.delay
   (`Online` or `Offline`; KSeF classifies an online send dated before today as offline), then
   fetches the receipt into `upo`. A receipt KSeF has not issued yet is fetched by a later run.
 - **A rejection** fails the row with the KSeF code and message and fires `DocumentFailed`.
-- **A send whose outcome is unknown is repeated**, unlike Peppol: KSeF answers a second copy as a
-  duplicate, so it cannot be accepted twice.
+- **A send whose outcome is unknown is repeated** on an asynchronous queue, unlike Peppol: KSeF
+  answers a second copy as a duplicate, so it cannot be accepted twice. The row is marked with
+  `provider_code` `outcome_unknown` meanwhile. On a synchronous connection (`sync`, `deferred`,
+  `background`) it is not repeated: the row becomes **unconfirmed** at once; resolve it with
+  `einvoicing:resolve`.
+- **After an unknown outcome**, a refusal of the repeated copy that says nothing about the first
+  send (at send time, or a final status 405, 435, 500 or 550) makes the row **unconfirmed** instead
+  of failed and keeps the `outcome_unknown` marker: the first send may have been accepted, so look
+  for the invoice in KSeF before resending or issuing it again. A validation failure (430, 450) is
+  decided by the bytes, so it still fails the row.
 - **Duplicates (status 440).** KSeF reports a duplicate when an invoice with the same seller NIP,
   invoice type and number (`P_2`) is already accepted, whatever its content. The row is
   **delivered** under the original KSeF number only when the original's receipt proves that the
   original is this exact file (same document hash); its `provider_code` is then `440` and the
-  original's receipt is stored. When the original is a different file the row **fails** with
+  original's receipt is stored when it can be read. When the original is a different file the row **fails** with
   category `duplicate`. When it cannot be decided (the receipt is refused or not issued yet) the
   next run asks again, and after the last run the row becomes **unconfirmed** for an operator
   (`einvoicing:resolve`). It is never delivered on a guess.
@@ -678,6 +691,12 @@ FA(3) schema, sends it, and starts `PollKsefStatus`, which follows `status.delay
 > **On a `sync` connection `queue()` blocks.** The send and the status poll run inside the call:
 > it waits for the final status within the core client's polling bounds, about 60 seconds, and
 > tries the receipt once. Use an asynchronous queue in production (see [Queues](#queues)).
+
+- **Status tracking needs `einvoicing.status.poll`.** KSeF has no webhooks, so with polling turned
+  off KSeF rows stay pending and get no KSeF number or receipt.
+- **When the status checks run out** (`status.max_attempts`) while KSeF is still processing, or the
+  synchronous wait ends without a final status, the row stays pending and no event fires. Look for
+  KSeF rows left pending with `status_checks` at the maximum.
 
 ### Receiving
 
@@ -693,14 +712,22 @@ The poll reads the buyer inbox of the configured NIP from the stored position an
 invoice as an inbound row; the existing jobs fetch, store and acknowledge it, and
 `DocumentReceived` fires once, as for Peppol. The first poll reads the last 30 days.
 
-- **The poll is guarded.** KSeF allows 20 metadata queries per hour per context, and the Ministry
+- **The poll is guarded.** KSeF allows 20 metadata queries per hour per context and IP, and the Ministry
   of Finance recommends polling a subject no more often than every 15 minutes. A run sooner than
   `inbound_min_interval_minutes` after the start of the previous one, less a minute of slack for
-  scheduler jitter, is skipped and says so. The start is kept in the default cache store.
+  scheduler jitter, is skipped and says so. The start is kept in the default cache store. Keep the
+  interval at 4 minutes or more: with the fixed minute of slack a smaller one lets runs through
+  more often than configured (every 2 minutes for an interval of 3, above KSeF's 20 queries an
+  hour).
 - **Inbound ids** are `<KSeF number>@<storage date>`, so the fetch needs no metadata query; an
   invoice the stored window lists without metadata keeps its plain KSeF number. Both forms match
   the same row. When you deduplicate on your side, use
   `KsefTransport::ksefNumberOf($message->provider_document_id)`.
+- **Acknowledgements move the stored window.** The window moves on only once every invoice in it
+  is acknowledged, so keep `einvoicing.inbound.acknowledge` on for KSeF: without it the poll reads
+  the same window again and again. Two workers acknowledging at once can overwrite each other's
+  write; a poll that lists an invoice whose row is already acknowledged acknowledges it again, so
+  the next poll repairs such a lost acknowledgement.
 - The buyer inbox lists an invoice a few minutes after KSeF accepted it (about two minutes on TE).
 
 ### Events
@@ -711,19 +738,24 @@ invoice for processing, `DocumentDelivered` with the KSeF number, `DocumentFaile
 
 | Event | When |
 |---|---|
-| `KsefOfflineDeadlineApproaching` | an offline invoice still on its way to KSeF (queued, sending, pending or unconfirmed) must reach KSeF by `$deadline` (`DateTimeImmutable`, the end of the day in Europe/Warsaw), which is within `deadline_warning_hours` or has passed; `$message` is the row. Fired by `einvoicing:ksef-deadlines` on every run while that holds, so remember what you have already notified |
+| `KsefOfflineDeadlineApproaching` | an offline invoice still on its way to KSeF (queued, sending, pending or unconfirmed, or failed for a reason that does not settle it, such as a transport error) must reach KSeF by `$deadline` (`DateTimeImmutable`, the end of the day in Europe/Warsaw), which is within `deadline_warning_hours` or has passed; `$message` is the row. Fired by `einvoicing:ksef-deadlines` on every run while that holds, so remember what you have already notified |
 
 ### Offline mode and deadlines
 
 An invoice issued while KSeF cannot be used is queued with `offline: true`; KSeF records it as
 offline, and it must reach KSeF by a deadline. The row gets its offline24 deadline at once (the
 next working day after `P_1`). `einvoicing:ksef-deadlines` lists the offline rows not yet
-delivered or failed, recomputes each deadline with the failures announced in Latarnia, the KSeF
+delivered, recomputes each deadline with the failures announced in Latarnia, the KSeF
 availability service (a failure moves it to the 7th working day after the failure ends; a total
 failure removes the duty, and the deadline is empty while a failure lasts), stores it on the row
 and fires `KsefOfflineDeadlineApproaching`. When Latarnia cannot be reached, or for DEMO, which has
 none, it computes without outages and says so. Working days skip weekends and the Polish statutory
-holidays (years 2026 to 2099).
+holidays (years 2025 to 2099).
+
+A row that failed for a reason that does not settle the invoice, such as a transport error during
+a KSeF outage, stays in the list, marked "failed, resend with einvoicing:resolve --resend", and
+still fires the event: the invoice must reach KSeF by its deadline all the same. Rows that failed
+on validation, as a duplicate (category `duplicate`) or as an unsupported document are left out.
 
 **The deadlines are a calculation aid, not legal advice.** Every offline row is taken as an
 offline24 invoice; check the rules of the mode you actually used.
@@ -759,9 +791,11 @@ Use the exact bytes stored on the row: the links carry their hash.
 With `einvoicing.ksef` in use, `einvoicing:doctor` adds `ksef` rows: the configuration and
 credentials are read and checked, the certificates must parse and not be expired (an Offline
 certificate expiring within 30 days is a warning), the cursor table must exist, and a transport
-named `ksef` in `einvoicing.transports` is reported as shadowed. **By default it reads the public
-Latarnia status** of the environment, an unauthenticated request with a 5-second timeout; a
-failure is only a warning. KSeF itself is never called, not even with `--live`.
+named `ksef` in `einvoicing.transports` is reported as shadowed (with `--live` its inbox is not
+read). **By default it reads the public Latarnia status** of the environment, an unauthenticated
+request with a 5-second timeout; a failure is only a warning. KSeF itself is never called, not
+even with `--live`. The `retry_after` check includes the KSeF jobs' timeouts (see
+[Queues](#queues)).
 
 ### Limits
 
@@ -770,6 +804,10 @@ failure is only a warning. KSeF itself is never called, not even with `--live`.
   (`EInvoicing::ksef()->transport()`), not through the queue.
 - **One context per application:** `einvoicing.ksef` names one NIP.
 - **Read quota:** 20 metadata queries per hour per context and IP; keep the 15-minute poll.
+- **Download quota:** 64 invoice downloads per hour per context and IP. Every fetch spends one, and
+  a rate-limited fetch counts towards `inbound.max_fetch_attempts`, so a burst far above 64
+  invoices an hour can bring rows to the cap; retry them with
+  `einvoicing:poll-inbound --transport=ksef --include-capped`.
 - **Online sessions:** the core opens one on the first send of a process and replaces it before it
   expires; the bridge does not close it. The receipt is fetched while the session is open (as the
   live run on TE confirms).
@@ -789,7 +827,8 @@ queue in production.**
   inside the webhook request, so an error there answers the webhook with `500` (and, with
   `APP_DEBUG`, a debug page). The doctor warns about these drivers.
 - **`retry_after` must be longer than the job timeouts.** With the default `http` settings the
-  send job's timeout is 100 seconds and the inbound job's 170. If a job outlives the
+  send job's timeout is 100 seconds and the inbound job's 170; with `einvoicing.ksef` in use, the
+  KSeF send job's is 240 and the KSeF status job's 310. If a job outlives the
   connection's `retry_after`, another worker reserves it again, and since these jobs are never
   retried it is marked failed while the first run may still succeed. The doctor checks this.
 - **Run workers with `pcntl`** (usually available in Linux CLI builds; it needs PHP built with
@@ -801,7 +840,7 @@ queue in production.**
   capped at 900 seconds, so a longer backoff, status poll delay or `Retry-After` simply waits
   less: the default `sending.backoff` (up to 1800) and `status.delays` (up to 21600) then poll
   and retry earlier than configured. Keep the claim expiry (send job timeout plus 30 seconds,
-  130 with the default `http` settings) below 900, or a slow send is marked `unconfirmed` while
+  130 with the default `http` settings, 270 for a KSeF send) below 900, or a slow send is marked `unconfirmed` while
   it still runs. Amazon SQS does not allow per-message delays on FIFO queues (`DelaySeconds`
   can only be set on the queue), so retries and status polls would not be spaced out. **Do not
   use a FIFO queue.** (See `DelaySeconds` in the
@@ -931,7 +970,7 @@ The default test run of this package makes no network call; the live smoke run i
 it (groups `recommand-live`, `b2brouter-france-live` and `ksef-live`, testsuite `Live`). The KSeF
 run needs no account: it reaches only KSeF TE (`https://api-test.ksef.mf.gov.pl/v2`, every other
 KSeF host is refused), uses random NIPs with self-signed seals written to a temporary directory
-(mode 0600), every request has a timeout, and it does not start between 15:55 and 18:00
+(mode 0600), every request has a timeout, and it does not start between 15:40 and 18:00
 Europe/Warsaw, around TE's daily maintenance. The Recommand run
 refuses unless the key belongs to a Recommand playground on the Peppol test network; the French
 run (`B2BROUTER_API_KEY` and `B2BROUTER_ACCOUNT_ID` of a French B2Brouter account) refuses any key
