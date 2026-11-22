@@ -12,7 +12,7 @@
         <testsuite name="Live"><directory>tests/Live</directory></testsuite>
     </testsuites>
     <groups>
-        <exclude><group>peppol-rules</group><group>recommand-live</group><group>b2brouter-france-live</group></exclude>
+        <exclude><group>peppol-rules</group><group>recommand-live</group><group>b2brouter-france-live</group><group>ksef-live</group></exclude>
     </groups>
     <source>
         <include><directory>src</directory></include>
