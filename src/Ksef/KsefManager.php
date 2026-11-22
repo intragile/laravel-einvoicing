@@ -7,10 +7,17 @@ namespace IntrAgile\EInvoicing\Laravel\Ksef;
 use Closure;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Contracts\Foundation\Application;
+use IntrAgile\EInvoicing\Exception\UnsafeXml;
+use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
+use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\Jobs\SendKsefInvoice;
+use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
+use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Poland\KsefEnvironment;
 use IntrAgile\EInvoicing\Poland\Nip;
+use IntrAgile\EInvoicing\Syntax\Fa3\Fa3Writer;
 use IntrAgile\EInvoicing\Transport\Http\HttpClient;
 use IntrAgile\EInvoicing\Transport\Ksef\Auth\CertificateCredentials;
 use IntrAgile\EInvoicing\Transport\Ksef\Auth\ContextIdentifier;
@@ -52,12 +59,16 @@ final class KsefManager
     /**
      * The KSeF transport of the configured context, environment and credentials, reading its
      * inbox through the bound KsefCursorStore (the database store unless the application binds
-     * another).
+     * another). A KsefTransport instance bound in the container is used instead.
      *
      * @throws ConfigurationException when a setting is missing or invalid, or a file cannot be read
      */
     public function transport(): KsefTransport
     {
+        $app = ($this->app)();
+        if ($app->bound(KsefTransport::class)) {
+            return $app->make(KsefTransport::class);
+        }
         if ($this->transport !== null) {
             return $this->transport;
         }
@@ -68,6 +79,54 @@ final class KsefManager
             $this->httpClient($config->secrets()),
             ($this->app)()->make(KsefCursorStore::class),
         );
+    }
+
+    /**
+     * Stores an FA(3) invoice as a queued KSeF row and dispatches the job that sends it once the
+     * open database transaction, if any, commits. The row keeps the exact bytes that are sent, so
+     * a resend after an unknown outcome is answered by KSeF as a duplicate of the first copy.
+     *
+     * The row's sender and receiver are the seller NIP and the buyer's identifier, its document
+     * type "FA (3)" and its process "ksef". Its invoicing_mode is the requested mode ("Offline" or
+     * "Online") until KSeF reports its own classification; an offline invoice carries its offline24
+     * deadline at once, computed without announced outages (see einvoicing:ksef-deadlines). Nothing
+     * is sent to KSeF here and the invoice is not validated: the send job validates it and fails
+     * the row when it is invalid.
+     *
+     * @param  Invoice|string  $invoice  an FA(3) file, or an invoice to write as one
+     * @param  bool  $offline  true for an invoice issued in offline mode
+     * @param  string|null  $reference  the application's own reference, e.g. the invoice number
+     *
+     * @throws UnsafeXml when the file carries a DOCTYPE declaration or declares entities
+     * @throws UnsupportedDocument when it is not well-formed XML or not an FA(3) invoice
+     * @throws InvalidArgumentException when the invoice cannot be written as FA(3), or it lacks the
+     *                                  seller NIP or a valid issue date (P_1)
+     * @throws ConfigurationException when a numeric job setting is invalid
+     */
+    public function queue(Invoice|string $invoice, bool $offline = false, ?string $reference = null): OutboundMessage
+    {
+        $xml = is_string($invoice) ? $invoice : (new Fa3Writer)->write($invoice);
+        $facts = KsefInvoiceFacts::read($xml);
+        // Before the row is written, so an invalid setting leaves no queued row without a job.
+        SendKsefInvoice::assertSettings();
+
+        $message = new OutboundMessage([
+            'transport' => EInvoicingManager::KSEF,
+            'reference' => $reference,
+            'sender' => $facts->sellerNip,
+            'receiver' => $facts->buyer,
+            'document_type' => SendKsefInvoice::DOCUMENT_TYPE,
+            'process' => EInvoicingManager::KSEF,
+            'xml' => $xml,
+            'invoicing_mode' => $offline ? SendKsefInvoice::MODE_OFFLINE : SendKsefInvoice::MODE_ONLINE,
+            'offline_deadline' => $offline ? $facts->offlineDeadline()->deadline : null,
+        ]);
+        $message->state = OutboundState::Queued;
+        $message->save();
+
+        SendKsefInvoice::schedule($message->id);
+
+        return $message;
     }
 
     /**

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Models;
 
+use DateTimeInterface;
+use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
@@ -37,6 +39,10 @@ use IntrAgile\EInvoicing\Transport\Peppol\ProcessId;
  * @property string|null $provider_code
  * @property Carbon|null $sent_at
  * @property Carbon|null $finished_at
+ * @property string|null $ksef_number
+ * @property string|null $invoicing_mode
+ * @property Carbon|null $offline_deadline
+ * @property string|null $upo
  * @property Carbon $created_at
  * @property Carbon $updated_at
  *
@@ -49,7 +55,7 @@ class OutboundMessage extends Model
     protected $guarded = ['id'];
 
     /** @var list<string> */
-    protected $hidden = ['xml'];
+    protected $hidden = ['xml', 'upo'];
 
     protected $attributes = [
         'attempts' => 0,
@@ -66,7 +72,21 @@ class OutboundMessage extends Model
             'failure_category' => FailureCategory::class,
             'sent_at' => 'datetime',
             'finished_at' => 'datetime',
+            'offline_deadline' => 'datetime',
         ];
+    }
+
+    /**
+     * Stores the KSeF offline deadline as the same instant in the application timezone, which
+     * the timestamp column is read back in, whatever timezone the given time carries.
+     *
+     * @return Attribute<Carbon|null, DateTimeInterface|string|null>
+     */
+    protected function offlineDeadline(): Attribute
+    {
+        return Attribute::make(set: fn (DateTimeInterface|string|null $value): ?string => $value === null
+            ? null
+            : $this->fromDateTime($this->asDateTime($value)->setTimezone(date_default_timezone_get())));
     }
 
     /**

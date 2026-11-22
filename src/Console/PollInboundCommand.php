@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace IntrAgile\EInvoicing\Laravel\Console;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
+use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\InboundRecorder;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
@@ -22,6 +24,12 @@ use IntrAgile\EInvoicing\Transport\Exception\TransportException;
  *
  * Schedule it to receive documents without webhooks, or as a safety net next to them:
  * `Schedule::command('einvoicing:poll-inbound')->everyFiveMinutes();`
+ *
+ * The KSeF inbox (--transport=ksef) is read at most once per
+ * einvoicing.ksef.inbound_min_interval_minutes, as KSeF allows 20 metadata queries per hour: a run
+ * sooner than that after the start of the previous one is skipped and says so. The start of the
+ * last run is kept in the default cache store. Schedule it, for example, with
+ * `Schedule::command('einvoicing:poll-inbound --transport=ksef')->everyFifteenMinutes()->withoutOverlapping();`
  */
 final class PollInboundCommand extends Command
 {
@@ -38,6 +46,9 @@ final class PollInboundCommand extends Command
         try {
             $transport = is_string($option) && $option !== '' ? $option : $manager->defaultName();
             $cap = FetchInboundDocument::attemptCap();
+            if ($transport === EInvoicingManager::KSEF && ! $this->claimKsefRun($manager->ksef())) {
+                return self::SUCCESS;
+            }
             $pending = $manager->inbound($transport)->pending();
         } catch (ConfigurationException|TransportException $exception) {
             $this->components->error($exception->getMessage());
@@ -94,5 +105,37 @@ final class PollInboundCommand extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Records the start of a KSeF inbox run, unless the previous one started less than
+     * einvoicing.ksef.inbound_min_interval_minutes ago; then the skip is reported and false is
+     * returned. The record is added atomically, so of two runs started together only one reads
+     * the inbox.
+     *
+     * @throws ConfigurationException when a KSeF setting is invalid
+     */
+    private function claimKsefRun(KsefManager $ksef): bool
+    {
+        $settings = $ksef->settings();
+        $minutes = $settings->inboundMinIntervalMinutes;
+        if ($minutes === 0) {
+            return true;
+        }
+        $nip = config('einvoicing.ksef.nip');
+        $key = sprintf('einvoicing:ksef:inbound-run:%s:%s', $settings->environment->value, is_scalar($nip) ? trim((string) $nip) : '');
+        $now = now()->getTimestamp();
+        if (Cache::add($key, $now, $minutes * 60)) {
+            return true;
+        }
+
+        $last = Cache::get($key);
+        $this->components->warn(sprintf(
+            'Skipped: the KSeF inbox was last read %s; runs are at least einvoicing.ksef.inbound_min_interval_minutes (%d) apart, as KSeF allows 20 metadata queries per hour.',
+            is_int($last) ? sprintf('%d minutes ago', intdiv(max(0, $now - $last), 60)) : 'recently',
+            $minutes,
+        ));
+
+        return false;
     }
 }

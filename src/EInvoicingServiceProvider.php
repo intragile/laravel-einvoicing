@@ -9,6 +9,8 @@ use Illuminate\Support\ServiceProvider;
 use IntrAgile\EInvoicing\France\Routing\Annuaire;
 use IntrAgile\EInvoicing\Laravel\Console\DoctorCommand;
 use IntrAgile\EInvoicing\Laravel\Console\InstallRulesCommand;
+use IntrAgile\EInvoicing\Laravel\Console\KsefCertificateCommand;
+use IntrAgile\EInvoicing\Laravel\Console\KsefDeadlinesCommand;
 use IntrAgile\EInvoicing\Laravel\Console\PollInboundCommand;
 use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
 use IntrAgile\EInvoicing\Laravel\France\FranceManager;
@@ -58,7 +60,7 @@ final class EInvoicingServiceProvider extends ServiceProvider
         }
 
         if ($this->app->runningInConsole()) {
-            $this->commands([DoctorCommand::class, InstallRulesCommand::class, PollInboundCommand::class, ResolveCommand::class]);
+            $this->commands([DoctorCommand::class, InstallRulesCommand::class, KsefCertificateCommand::class, KsefDeadlinesCommand::class, PollInboundCommand::class, ResolveCommand::class]);
             $this->publishes([self::CONFIG => $this->app->configPath('einvoicing.php')], 'einvoicing-config');
             $now = time();
             $this->publishes([

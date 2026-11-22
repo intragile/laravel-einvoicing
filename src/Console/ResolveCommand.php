@@ -6,10 +6,13 @@ namespace IntrAgile\EInvoicing\Laravel\Console;
 
 use Illuminate\Console\Command;
 use Illuminate\Database\UniqueConstraintViolationException;
+use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentSent;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
+use IntrAgile\EInvoicing\Laravel\Jobs\PollKsefStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
+use IntrAgile\EInvoicing\Laravel\Jobs\SendKsefInvoice;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 
 /**
@@ -20,6 +23,10 @@ use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
  * duplicate invoice and therefore needs confirmation. A failed or still queued document can be
  * queued again without asking. The attempt count is never lowered: it identifies the sending
  * claim, and the next send claims the following attempt.
+ *
+ * A KSeF row is sent again by SendKsefInvoice and polled by PollKsefStatus. Queued again from an
+ * unknown outcome, it is marked as possibly accepted (provider_code "outcome_unknown"), so that
+ * KSeF's duplicate answer to the resend delivers it with the original KSeF number.
  */
 final class ResolveCommand extends Command
 {
@@ -104,7 +111,11 @@ final class ResolveCommand extends Command
         }
 
         event(new DocumentSent($message));
-        PollDeliveryStatus::start($message->id, $message->attempts);
+        if (self::isKsef($message)) {
+            PollKsefStatus::start($message->id, $message->attempts);
+        } else {
+            PollDeliveryStatus::start($message->id, $message->attempts);
+        }
 
         $this->components->info(sprintf('Outbound document %d is now pending as %s.', $message->id, $documentId));
 
@@ -137,6 +148,10 @@ final class ResolveCommand extends Command
         // Before the row is queued again, so an invalid setting leaves no queued row without a job.
         SendDocument::assertSettings();
 
+        // An earlier KSeF send that may have been accepted is remembered for its duplicate answer.
+        $outcomeUnknown = self::isKsef($message)
+            && ($from === OutboundState::Unconfirmed || $from === OutboundState::Sending || $message->provider_code === SendKsefInvoice::OUTCOME_UNKNOWN);
+
         // The earlier send is cleared, so a late notification for it no longer finds this row.
         if (! $message->transition($from, OutboundState::Queued, [
             'provider_document_id' => null,
@@ -146,13 +161,17 @@ final class ResolveCommand extends Command
             'status_checks' => 0,
             'failure_category' => null,
             'failure_message' => null,
-            'provider_code' => null,
+            'provider_code' => $outcomeUnknown ? SendKsefInvoice::OUTCOME_UNKNOWN : null,
             'finished_at' => null,
         ], ['attempts' => $message->attempts])) {
             return $this->changedMeanwhile($message);
         }
 
-        SendDocument::schedule($message->id);
+        if (self::isKsef($message)) {
+            SendKsefInvoice::schedule($message->id);
+        } else {
+            SendDocument::schedule($message->id);
+        }
 
         $this->components->info(sprintf('Outbound document %d is queued to be sent again.', $message->id));
 
@@ -171,11 +190,16 @@ final class ResolveCommand extends Command
         }
 
         if ($message->state === OutboundState::Sending
-            && $message->updated_at->lessThan(now()->subSeconds(SendDocument::claimLifetime()))) {
+            && $message->updated_at->lessThan(now()->subSeconds(self::isKsef($message) ? SendKsefInvoice::claimLifetime() : SendDocument::claimLifetime()))) {
             return OutboundState::Sending;
         }
 
         return null;
+    }
+
+    private static function isKsef(OutboundMessage $message): bool
+    {
+        return $message->transport === EInvoicingManager::KSEF;
     }
 
     private function wrongState(OutboundMessage $message, string $rule): int
