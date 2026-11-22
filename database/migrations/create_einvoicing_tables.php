@@ -33,6 +33,11 @@ return new class extends Migration
                 $table->string('provider_code')->nullable();
                 $table->timestamp('sent_at')->nullable();
                 $table->timestamp('finished_at')->nullable();
+                // KSeF columns, as add_ksef_to_einvoicing_tables adds them to an existing table.
+                $table->string('ksef_number', 64)->nullable()->index();
+                $table->string('invoicing_mode', 16)->nullable();
+                $table->timestamp('offline_deadline')->nullable();
+                $table->longText('upo')->nullable();
                 $table->timestamps();
 
                 $table->unique(['transport', 'provider_document_id']);

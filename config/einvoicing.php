@@ -97,6 +97,52 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Polish KSeF
+    |--------------------------------------------------------------------------
+    |
+    | The KSeF API 2.0 connection used by EInvoicing::ksef() and
+    | EInvoicing::inbound('ksef'). "environment" is "test" (TE), "demo" or
+    | "production"; production is never chosen unless it is set here. "nip"
+    | is the context the client authenticates for.
+    |
+    | "credentials" holds either a certificate (a qualified seal or signature,
+    | or a KSeF authentication certificate) or a KSeF token, not both. The
+    | certificate and its private key are read from the files at the given
+    | paths, never from environment values; the passphrase of an encrypted key
+    | may come from the environment. "offline_certificate" is the KSeF Offline
+    | certificate that signs the KOD II verification link of invoices issued
+    | in offline mode; leave its paths empty when offline invoicing is unused.
+    |
+    | max_response_bytes caps every KSeF answer read into memory; it must be
+    | at least 52,428,816 bytes, the largest encrypted export part KSeF sends.
+    | inbound_min_interval_minutes is the shortest interval between two KSeF
+    | inbox polls, as KSeF allows 20 metadata queries per hour. Offline
+    | invoices whose delivery deadline is within deadline_warning_hours are
+    | reported as approaching.
+    |
+    */
+
+    'ksef' => [
+        'environment' => env('KSEF_ENVIRONMENT', 'test'),
+        'nip' => env('KSEF_NIP'),
+        'credentials' => [
+            'certificate' => env('KSEF_CERTIFICATE_PATH'),
+            'private_key' => env('KSEF_PRIVATE_KEY_PATH'),
+            'passphrase' => env('KSEF_PRIVATE_KEY_PASSPHRASE'),
+            'token' => env('KSEF_TOKEN'),
+        ],
+        'offline_certificate' => [
+            'certificate' => env('KSEF_OFFLINE_CERTIFICATE_PATH'),
+            'private_key' => env('KSEF_OFFLINE_PRIVATE_KEY_PATH'),
+            'passphrase' => env('KSEF_OFFLINE_PRIVATE_KEY_PASSPHRASE'),
+        ],
+        'max_response_bytes' => 67_108_864,
+        'inbound_min_interval_minutes' => 15,
+        'deadline_warning_hours' => 24,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | HTTP client
     |--------------------------------------------------------------------------
     |

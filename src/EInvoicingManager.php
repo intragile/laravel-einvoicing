@@ -15,6 +15,7 @@ use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
+use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
@@ -89,6 +90,9 @@ final class EInvoicingManager
         'b2brouter' => 'account_id',
         'einvoicebe' => 'tenant_id',
     ];
+
+    /** The inbound source name of the KSeF transport configured in einvoicing.ksef. */
+    public const KSEF = 'ksef';
 
     /** Longest webhook timestamp tolerance accepted, one year in seconds. */
     private const MAX_WEBHOOK_TOLERANCE = 31_536_000;
@@ -212,6 +216,15 @@ final class EInvoicingManager
     }
 
     /**
+     * The KSeF manager of einvoicing.ksef: the KSeF transport, Latarnia and the offline
+     * certificate. It is never faked.
+     */
+    public function ksef(): KsefManager
+    {
+        return ($this->app)()->make(KsefManager::class);
+    }
+
+    /**
      * Stores the document as queued and dispatches the job that sends it once the open database
      * transaction, if any, commits. The returned message reflects the row as stored here; on the
      * sync queue connection the send has already run, so refresh() it to see the outcome.
@@ -250,7 +263,7 @@ final class EInvoicingManager
 
     /**
      * The inbound source of the transport with this name, or the default one. Receiving needs no
-     * validation rules.
+     * validation rules. The name "ksef" gives the KSeF transport of einvoicing.ksef.
      *
      * @throws ConfigurationException when the transport is not configured or cannot receive documents
      */
@@ -260,6 +273,9 @@ final class EInvoicingManager
             return $this->fake;
         }
         $name ??= $this->defaultName();
+        if ($name === self::KSEF) {
+            return $this->ksef()->transport();
+        }
 
         $driver = $this->driver($name);
         if (! $driver instanceof InboundSource) {
@@ -630,15 +646,19 @@ final class EInvoicingManager
     }
 
     /**
-     * The HTTP client every built-in driver sends through. It never follows a redirect: the
-     * drivers follow the ones they trust themselves. It carries no secrets; each transport adds
-     * its own.
+     * The HTTP client every built-in driver sends through, with the timeouts of einvoicing.http.
+     * It never follows a redirect: the drivers follow the ones they trust themselves. Without
+     * arguments it reads at most einvoicing.http.max_response_bytes and carries no secrets; each
+     * transport adds its own.
      *
-     * @internal used by the French flow clients
+     * @internal used by the French flow clients and the KSeF manager
+     *
+     * @param  int|null  $maxResponseBytes  a checked response size cap; null reads einvoicing.http.max_response_bytes
+     * @param  list<string>  $secrets  values kept out of exception messages and body excerpts
      *
      * @throws ConfigurationException when an einvoicing.http setting is invalid
      */
-    public function httpClient(): HttpClient
+    public function httpClient(?int $maxResponseBytes = null, #[SensitiveParameter] array $secrets = []): HttpClient
     {
         $factory = new HttpFactory;
         $client = new Client([
@@ -647,13 +667,15 @@ final class EInvoicingManager
             'allow_redirects' => false,
             'http_errors' => false,
         ]);
-        $maxBytes = $this->config()->get('einvoicing.http.max_response_bytes') ?? 20_000_000;
-        $maxBytes = ConfigValue::number($maxBytes, 'einvoicing.http.max_response_bytes');
+        $maxBytes = $maxResponseBytes ?? ConfigValue::number(
+            $this->config()->get('einvoicing.http.max_response_bytes') ?? 20_000_000,
+            'einvoicing.http.max_response_bytes',
+        );
         if (! is_int($maxBytes) || $maxBytes < 1) {
             throw new ConfigurationException('einvoicing.http.max_response_bytes must be a positive integer.');
         }
 
-        return new HttpClient($client, $factory, $factory, $maxBytes);
+        return new HttpClient($client, $factory, $factory, $maxBytes, $secrets);
     }
 
     /**

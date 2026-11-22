@@ -7,6 +7,7 @@ namespace IntrAgile\EInvoicing\Laravel\Console;
 use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
@@ -16,11 +17,17 @@ use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Jobs\MessageJob;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
+use IntrAgile\EInvoicing\Laravel\Ksef\DatabaseKsefCursorStore;
+use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
+use IntrAgile\EInvoicing\Poland\KsefEnvironment;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
 use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeConfig;
+use IntrAgile\EInvoicing\Transport\Ksef\Auth\CertificateCredentials;
+use IntrAgile\EInvoicing\Transport\Ksef\Inbound\KsefCursorStore;
+use IntrAgile\EInvoicing\Transport\Ksef\Latarnia\KsefAvailability;
 use IntrAgile\EInvoicing\Transport\Recommand\RecommandConfig;
 use IntrAgile\EInvoicing\Validation\DocumentValidator;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
@@ -87,6 +94,12 @@ final class DoctorCommand extends Command
     /** Settings that are never printed. */
     private const SECRET_KEYS = ['api_key_id', 'secret', 'api_key', 'webhook_secret'];
 
+    /** KSeF settings that are never printed. */
+    private const KSEF_SECRET_KEYS = ['credentials.token', 'credentials.passphrase', 'offline_certificate.passphrase'];
+
+    /** Days before the expiry of the KSeF Offline certificate from which the doctor warns. */
+    private const KSEF_EXPIRY_WARNING_DAYS = 30;
+
     /** @var list<array{string, string, string}> */
     private array $rows = [];
 
@@ -104,6 +117,7 @@ final class DoctorCommand extends Command
             $this->checkTransport($manager, $name);
         }
         $this->checkFrance();
+        $this->checkKsef();
         $this->checkValidation($manager);
         $this->checkCore();
         $this->checkRulePackages();
@@ -368,6 +382,139 @@ final class DoctorCommand extends Command
             default => 'production key: invoices are sent for real',
         };
         $this->row('france', self::OK, "transport {$transport} (b2brouter), {$kind}");
+    }
+
+    /**
+     * KSeF, when einvoicing.ksef is in use: the settings and credentials, the expiry of the
+     * certificates, the availability Latarnia reports and the cursor table. Latarnia, a public
+     * service, is asked once; KSeF itself is never called.
+     */
+    private function checkKsef(): void
+    {
+        $ksef = app(KsefManager::class);
+        if (! $ksef->isConfigured()) {
+            return;
+        }
+
+        try {
+            $environment = $ksef->settings()->environment;
+        } catch (ConfigurationException $exception) {
+            $this->row('ksef: config', self::FAIL, $this->describe($exception, withClass: false));
+
+            return;
+        }
+
+        try {
+            $config = $ksef->ksefConfig();
+            $credentials = $config->credentials;
+            $this->row('ksef: config', self::OK, sprintf(
+                '%s environment%s, NIP %s, %s',
+                $environment->value,
+                $environment === KsefEnvironment::Production ? ' (invoices are sent for real)' : '',
+                $config->context->value,
+                $credentials instanceof CertificateCredentials ? 'certificate credentials' : 'KSeF token',
+            ));
+            if ($credentials instanceof CertificateCredentials) {
+                $this->checkKsefCertificate('ksef: certificate', $credentials, false);
+            }
+        } catch (ConfigurationException $exception) {
+            $this->row('ksef: config', self::FAIL, $this->describe($exception, withClass: false));
+        }
+
+        try {
+            $offline = $ksef->offlineCertificate();
+            $offline === null
+                ? $this->row('ksef: offline certificate', self::INFO, 'not set (einvoicing.ksef.offline_certificate): invoices issued '
+                    .'in offline mode cannot carry the signed KOD II verification link')
+                : $this->checkKsefCertificate('ksef: offline certificate', $offline, true);
+        } catch (ConfigurationException $exception) {
+            $this->row('ksef: offline certificate', self::FAIL, $this->describe($exception, withClass: false));
+        }
+
+        $this->checkLatarnia($ksef);
+        $this->checkKsefCursorTable();
+    }
+
+    /**
+     * Fails a certificate that is expired or not yet valid; with $warnSoon, warns when it expires
+     * within KSEF_EXPIRY_WARNING_DAYS.
+     */
+    private function checkKsefCertificate(string $check, CertificateCredentials $credentials, bool $warnSoon): void
+    {
+        $parsed = openssl_x509_parse($credentials->certificatePem);
+        $from = is_array($parsed) && is_int($parsed['validFrom_time_t'] ?? null) ? $parsed['validFrom_time_t'] : null;
+        $to = is_array($parsed) && is_int($parsed['validTo_time_t'] ?? null) ? $parsed['validTo_time_t'] : null;
+        if ($from === null || $to === null) {
+            $this->row($check, self::FAIL, 'the validity period cannot be read');
+
+            return;
+        }
+
+        $now = time();
+        $until = gmdate('Y-m-d H:i', $to).' UTC';
+        if ($to <= $now) {
+            $this->row($check, self::FAIL, "expired on {$until}");
+        } elseif ($from > $now) {
+            $this->row($check, self::FAIL, 'not valid before '.gmdate('Y-m-d H:i', $from).' UTC');
+        } elseif ($warnSoon && $to - $now < self::KSEF_EXPIRY_WARNING_DAYS * 86_400) {
+            $this->row($check, self::WARN, sprintf(
+                'expires in %d days, on %s; enrol a new one with KSeF in time',
+                intdiv($to - $now, 86_400),
+                $until,
+            ));
+        } else {
+            $this->row($check, self::OK, "valid until {$until}");
+        }
+    }
+
+    /**
+     * The availability of KSeF as Latarnia reports it; DEMO has no Latarnia. A Latarnia that
+     * cannot be reached is a warning, as it does not stop sending.
+     */
+    private function checkLatarnia(KsefManager $ksef): void
+    {
+        try {
+            $latarnia = $ksef->latarnia();
+            if ($latarnia === null) {
+                $this->row('ksef: latarnia', self::INFO, 'the Ministry of Finance publishes no Latarnia for DEMO; availability is not checked');
+
+                return;
+            }
+            $status = $latarnia->status();
+        } catch (Throwable $exception) {
+            $this->row('ksef: latarnia', self::WARN, 'availability unknown: '.$this->describe($exception));
+
+            return;
+        }
+
+        $status->availability === KsefAvailability::Available
+            ? $this->row('ksef: latarnia', self::OK, 'KSeF is AVAILABLE')
+            : $this->row('ksef: latarnia', self::WARN, sprintf(
+                'KSeF reports %s (%d messages); invoices may have to be issued in offline mode',
+                $status->availability->value,
+                count($status->messages),
+            ));
+    }
+
+    private function checkKsefCursorTable(): void
+    {
+        try {
+            $store = app(KsefCursorStore::class);
+            if (! $store instanceof DatabaseKsefCursorStore) {
+                $this->row('ksef: cursor table', self::OK, 'not used: the inbox cursor is kept by the bound '.$store::class);
+
+                return;
+            }
+            $exists = Schema::hasTable(DatabaseKsefCursorStore::TABLE);
+        } catch (Throwable $exception) {
+            $this->row('ksef: cursor table', self::FAIL, $this->describe($exception));
+
+            return;
+        }
+
+        $exists
+            ? $this->row('ksef: cursor table', self::OK, DatabaseKsefCursorStore::TABLE)
+            : $this->row('ksef: cursor table', self::FAIL, 'missing: '.DatabaseKsefCursorStore::TABLE.'; run php artisan migrate');
     }
 
     private function checkValidation(EInvoicingManager $manager): void
@@ -666,6 +813,13 @@ final class DoctorCommand extends Command
                 $pair = $config['api_key_id'].':'.$config['secret'];
                 $secrets[] = $pair;
                 $secrets[] = base64_encode($pair);
+            }
+        }
+        foreach (self::KSEF_SECRET_KEYS as $key) {
+            $value = config("einvoicing.ksef.{$key}");
+            if (self::filled($value)) {
+                $secrets[] = $value;
+                $secrets[] = trim($value);
             }
         }
         $secrets = array_values(array_unique($secrets));

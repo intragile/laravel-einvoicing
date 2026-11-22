@@ -141,9 +141,14 @@ final class ModelsTest extends TestCase
     {
         $paths = ServiceProvider::pathsToPublish(EInvoicingServiceProvider::class, 'einvoicing-migrations');
 
-        $this->assertCount(1, $paths);
-        $target = (string) array_values($paths)[0];
-        $this->assertMatchesRegularExpression('/\d{4}_\d{2}_\d{2}_\d{6}_create_einvoicing_tables\.php$/', $target);
-        $this->assertFileExists((string) array_key_first($paths));
+        $this->assertCount(2, $paths);
+        [$create, $ksef] = array_map(strval(...), array_values($paths));
+        $this->assertMatchesRegularExpression('/\d{4}_\d{2}_\d{2}_\d{6}_create_einvoicing_tables\.php$/', $create);
+        $this->assertMatchesRegularExpression('/\d{4}_\d{2}_\d{2}_\d{6}_add_ksef_to_einvoicing_tables\.php$/', $ksef);
+        // The published copies run in file name order: the tables first, then the KSeF columns.
+        $this->assertLessThan(0, strcmp(basename($create), basename($ksef)));
+        foreach (array_keys($paths) as $source) {
+            $this->assertFileExists((string) $source);
+        }
     }
 }
