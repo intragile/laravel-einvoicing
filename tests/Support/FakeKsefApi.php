@@ -44,7 +44,11 @@ final class FakeKsefApi implements ClientInterface
 
     public const SECOND_INVOICE_REF = '20261121-EE-319D7EE000-B67F415CDC-2D';
 
-    public const KSEF_NUMBER = '5265877635-20261121-010080DD2B5E-26';
+    public const ORIGINAL_SESSION_REF = '20261121-SO-2F14610000-242991F8C9-B4';
+
+    public const KSEF_NUMBER = '5265877635-20261121-010080DD2B5E-ED';
+
+    public const SECOND_KSEF_NUMBER = '5265877635-20261121-010080DD2B5F-E4';
 
     /** @var array<int, CertificateCredentials> */
     private static array $mfKeys = [];
@@ -239,23 +243,23 @@ final class FakeKsefApi implements ClientInterface
         return self::status(440, 'Duplikat faktury', [], [
             'details' => ['Duplikat faktury. Faktura o numerze KSeF: '.$originalKsefNumber.' została już prawidłowo przesłana do systemu.'],
             'extensions' => [
-                'originalSessionReferenceNumber' => '20261121-SO-2F14610000-242991F8C9-B4',
+                'originalSessionReferenceNumber' => self::ORIGINAL_SESSION_REF,
                 'originalKsefNumber' => $originalKsefNumber,
             ],
         ]);
     }
 
     /**
-     * A UPO 4-3 receipt for one invoice.
+     * A UPO 4-3 receipt for one invoice, with the document digest of the given file.
      */
-    public static function upo(string $ksefNumber = self::KSEF_NUMBER): ResponseInterface
+    public static function upo(string $ksefNumber = self::KSEF_NUMBER, string $invoiceXml = 'hash'): ResponseInterface
     {
         $xml = '<?xml version="1.0" encoding="utf-8"?><Potwierdzenie xmlns="http://upo.schematy.mf.gov.pl/KSeF/v4-3">'
             .'<NazwaPodmiotuPrzyjmujacego>Ministerstwo Finansów - środowisko testowe (TE)</NazwaPodmiotuPrzyjmujacego>'
             .'<NumerReferencyjnySesji>'.self::SESSION_REF.'</NumerReferencyjnySesji>'
             .'<Uwierzytelnienie><IdKontekstu><Nip>'.self::NIP.'</Nip></IdKontekstu></Uwierzytelnienie>'
             .'<Dokument><NipSprzedawcy>'.self::NIP.'</NipSprzedawcy><NumerKSeFDokumentu>'.$ksefNumber.'</NumerKSeFDokumentu>'
-            .'<DataNadaniaNumeruKSeF>2026-11-21T10:00:02.014+01:00</DataNadaniaNumeruKSeF><SkrotDokumentu>aGFzaA==</SkrotDokumentu></Dokument>'
+            .'<DataNadaniaNumeruKSeF>2026-11-21T10:00:02.014+01:00</DataNadaniaNumeruKSeF><SkrotDokumentu>'.base64_encode(hash('sha256', $invoiceXml, true)).'</SkrotDokumentu></Dokument>'
             .'</Potwierdzenie>';
 
         return new Response(200, ['Content-Type' => 'application/xml'], $xml);

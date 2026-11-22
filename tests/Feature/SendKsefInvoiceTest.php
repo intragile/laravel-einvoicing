@@ -9,6 +9,7 @@ use GuzzleHttp\Psr7\Response;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Queue;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
@@ -26,6 +27,7 @@ use IntrAgile\EInvoicing\Laravel\Tests\Support\FakeKsefApi;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\KsefInvoices;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Transport\FailureCategory;
+use RuntimeException;
 
 final class SendKsefInvoiceTest extends TestCase
 {
@@ -162,7 +164,9 @@ final class SendKsefInvoiceTest extends TestCase
         Queue::fake();
         $this->bindKsef()->withSession()
             ->onSend(FakeKsefApi::connectionLost(), FakeKsefApi::accepted(FakeKsefApi::SECOND_INVOICE_REF))
-            ->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER));
+            ->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER))
+            // The original's receipt proves it is this file.
+            ->onUpo(FakeKsefApi::upo(FakeKsefApi::KSEF_NUMBER, self::fa3()), FakeKsefApi::upo(FakeKsefApi::KSEF_NUMBER, self::fa3()));
         $message = EInvoicing::ksef()->queue(self::fa3());
 
         // The first send is lost on the way back: the row is queued again, never unconfirmed.
@@ -180,7 +184,8 @@ final class SendKsefInvoiceTest extends TestCase
         $this->assertSame(FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::SECOND_INVOICE_REF, $row->provider_document_id);
         $this->assertSame($this->sentBody(0)['invoiceHash'], $this->sentBody(1)['invoiceHash']);
 
-        // KSeF answers the copy as a duplicate of the invoice the lost send delivered.
+        // KSeF answers the copy as a duplicate of the invoice the lost send delivered, and the
+        // original's receipt carries this file's digest.
         $row = $this->runPoll($row);
         $this->assertSame(OutboundState::Delivered, $row->state);
         $this->assertSame(FakeKsefApi::KSEF_NUMBER, $row->ksef_number);
@@ -265,6 +270,74 @@ final class SendKsefInvoiceTest extends TestCase
 
         $this->assertSame(OutboundState::Unconfirmed, $row->state);
         Event::assertNotDispatched(DocumentFailed::class);
+    }
+
+    public function test_sync_connection_sends_and_waits_for_the_final_status(): void
+    {
+        config()->set('queue.default', 'sync');
+        // Processing at first, then accepted; the receipt is tried once.
+        $this->bindKsef()->withSession()->onSend(FakeKsefApi::accepted())
+            ->onStatus(FakeKsefApi::status(150, 'Trwa przetwarzanie'), FakeKsefApi::delivered(), FakeKsefApi::delivered())
+            ->onUpo(FakeKsefApi::upo());
+
+        $message = EInvoicing::ksef()->queue(self::fa3());
+
+        $row = OutboundMessage::query()->findOrFail($message->id);
+        $this->assertSame(OutboundState::Delivered, $row->state);
+        $this->assertSame(FakeKsefApi::KSEF_NUMBER, $row->ksef_number);
+        $this->assertNotNull($row->upo);
+        $this->assertSame(1, $row->status_checks);
+        Event::assertDispatched(DocumentDelivered::class);
+    }
+
+    public function test_expired_claim_of_a_ksef_row_does_not_mention_an_access_point(): void
+    {
+        $this->bindKsef();
+        $message = $this->ksefRow(OutboundState::Sending, ['provider_document_id' => null]);
+
+        (new ExpireSendingClaim($message->id, 1))->handle();
+
+        $row = OutboundMessage::query()->findOrFail($message->id);
+        $this->assertSame(OutboundState::Unconfirmed, $row->state);
+        $this->assertSame(ExpireSendingClaim::KSEF_MESSAGE, $row->failure_message);
+        $this->assertStringNotContainsString('access point', (string) $row->failure_message);
+        $this->assertSame(SendKsefInvoice::OUTCOME_UNKNOWN, $row->provider_code);
+    }
+
+    public function test_resolve_sent_refuses_an_id_that_is_not_a_ksef_document_id(): void
+    {
+        Queue::fake();
+        $this->bindKsef();
+        $message = $this->ksefRow(OutboundState::Unconfirmed, ['provider_document_id' => null]);
+
+        $this->artisan('einvoicing:resolve', ['id' => $message->id, '--sent' => 'abc'])
+            ->expectsOutputToContain('<session reference>/<invoice reference>')
+            ->assertExitCode(2);
+
+        $this->artisan('einvoicing:resolve', ['id' => $message->id, '--sent' => self::DOCUMENT_ID])->assertSuccessful();
+        $this->assertSame(OutboundState::Pending, OutboundMessage::query()->findOrFail($message->id)->state);
+        Queue::assertPushed(PollKsefStatus::class, fn (PollKsefStatus $job): bool => $job->messageId === $message->id);
+    }
+
+    public function test_answer_arriving_after_the_claim_expired_is_reported(): void
+    {
+        Queue::fake();
+        Exceptions::fake();
+        $message = null;
+        $this->bindKsef()->withSession()->on('POST', '#\A/sessions/online/[A-Za-z0-9-]+/invoices\z#', function () use (&$message): never {
+            // The claim expiry ends the claim while the request is in flight, then the connection drops.
+            (new ExpireSendingClaim($message->id, 1))->handle();
+
+            throw FakeKsefApi::connectionLost();
+        });
+        $message = EInvoicing::ksef()->queue(self::fa3());
+
+        $row = $this->runSend($message);
+
+        $this->assertSame(OutboundState::Unconfirmed, $row->state);
+        $this->assertSame(SendKsefInvoice::OUTCOME_UNKNOWN, $row->provider_code);
+        Queue::assertNotPushed(SendKsefInvoice::class, fn (SendKsefInvoice $job): bool => $job->delay !== null);
+        Exceptions::assertReported(fn (RuntimeException $e): bool => str_contains($e->getMessage(), 'after the row had left that sending claim'));
     }
 
     public function test_job_payload_holds_only_the_id(): void

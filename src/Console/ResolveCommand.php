@@ -78,6 +78,11 @@ final class ResolveCommand extends Command
 
             return self::INVALID;
         }
+        if (self::isKsef($message) && ! PollKsefStatus::isKsefDocumentId($documentId)) {
+            $this->components->error('A KSeF document id is "<session reference>/<invoice reference>", as the send returned it.');
+
+            return self::INVALID;
+        }
 
         $from = $this->unresolvedState($message);
         if ($from === null) {

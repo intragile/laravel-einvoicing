@@ -29,10 +29,12 @@ use Throwable;
  *
  * The claim, the claim expiry and the backoff are those of SendDocument. Unlike a Peppol send, a
  * send whose outcome is not known is repeated: KSeF answers a copy of an invoice it has already
- * accepted with status 440 and the original KSeF number, and PollKsefStatus records such a copy
- * as delivered. The row is marked with provider_code "outcome_unknown" so that the status poll can
- * tell a copy of this row's own lost send from a duplicate of another invoice. Once
- * sending.max_attempts are used up with the outcome still unknown, the row becomes unconfirmed.
+ * accepted with status 440 and the original KSeF number, and PollKsefStatus delivers the row
+ * under that number once the original's receipt proves it is the same file. The row is marked
+ * with provider_code "outcome_unknown" while an earlier send may have been accepted, so that a
+ * later refusal of this row makes it unconfirmed rather than failed. Once sending.max_attempts are
+ * used up with the outcome still unknown, the row becomes unconfirmed. An answer that arrives after
+ * the claim was ended by ExpireSendingClaim is reported, as SendDocument does.
  *
  * The FA(3) file is validated by the transport before anything is sent; an invalid file fails the
  * row with category validation. An accepted invoice becomes pending and PollKsefStatus reads its
@@ -201,6 +203,12 @@ final class SendKsefInvoice extends MessageJob
             $attributes['provider_code'] = self::OUTCOME_UNKNOWN;
         }
         if (! $message->transition(OutboundState::Sending, OutboundState::Queued, $attributes, ['attempts' => $claim])) {
+            if ($mayBeAccepted) {
+                // Keep the marker on a row the claim expiry made unconfirmed meanwhile.
+                $message->transition(OutboundState::Unconfirmed, OutboundState::Unconfirmed, ['provider_code' => self::OUTCOME_UNKNOWN], ['attempts' => $claim]);
+            }
+            self::reportLostAnswer($message, $claim, $e->getMessage());
+
             return;
         }
 
@@ -220,17 +228,38 @@ final class SendKsefInvoice extends MessageJob
             'finished_at' => now(),
         ])) {
             event(new DocumentFailed($message));
+
+            return;
         }
+        self::reportLostAnswer($message, $claim, $reason);
     }
 
     private function unconfirmed(OutboundMessage $message, int $claim, string $reason): void
     {
-        if ($message->transition(OutboundState::Sending, OutboundState::Unconfirmed, [
-            'failure_message' => $reason,
-            'provider_code' => self::OUTCOME_UNKNOWN,
-        ], ['attempts' => $claim])) {
+        $attributes = ['failure_message' => $reason, 'provider_code' => self::OUTCOME_UNKNOWN];
+        if ($message->transition(OutboundState::Sending, OutboundState::Unconfirmed, $attributes, ['attempts' => $claim])) {
             event(new DocumentUnconfirmed($message));
+
+            return;
         }
+        // The claim expiry made the row unconfirmed meanwhile: keep this attempt's reason on it.
+        $message->transition(OutboundState::Unconfirmed, OutboundState::Unconfirmed, $attributes, ['attempts' => $claim]);
+        self::reportLostAnswer($message, $claim, $reason);
+    }
+
+    /**
+     * Reports an answer that could not be recorded because the row left this sending claim
+     * meanwhile, typically into unconfirmed through ExpireSendingClaim, so the operator who now
+     * owns the row learns what happened under this claim.
+     */
+    private static function reportLostAnswer(OutboundMessage $message, int $claim, string $reason): void
+    {
+        report(new RuntimeException(sprintf(
+            'KSeF outbound document %d answered attempt %d after the row had left that sending claim, so the answer was not recorded as such: %s',
+            $message->id,
+            $claim,
+            $reason,
+        )));
     }
 
     /**

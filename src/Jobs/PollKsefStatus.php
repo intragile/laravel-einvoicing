@@ -4,17 +4,20 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Jobs;
 
+use DateTimeImmutable;
 use IntrAgile\EInvoicing\Exception\UnsafeXml;
 use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentDelivered;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentFailed;
+use IntrAgile\EInvoicing\Laravel\Events\DocumentUnconfirmed;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefInvoiceFacts;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Transport\DeliveryFailure;
 use IntrAgile\EInvoicing\Transport\DeliveryState;
+use IntrAgile\EInvoicing\Transport\Exception\RateLimited;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
 use IntrAgile\EInvoicing\Transport\FailureCategory;
 use IntrAgile\EInvoicing\Transport\Ksef\KsefTransport;
@@ -24,25 +27,32 @@ use InvalidArgumentException;
 use LogicException;
 
 /**
- * Reads the KSeF status of a sent invoice once per run, and fetches its receipt (UPO) once KSeF
- * has accepted it.
+ * Reads the KSeF status of a sent invoice, and fetches its receipt (UPO) once KSeF has accepted
+ * it.
  *
- * The runs follow status.delays and stop after status.max_attempts, as PollDeliveryStatus does;
- * every run, a failed one included, counts. Status 200 delivers the row with its KSeF number and
- * the invoicing mode KSeF reports; an invoice KSeF classifies as offline gets its offline24
- * deadline when the row has none. The UPO is then fetched into the row; when KSeF has not issued
- * it yet, later runs fetch it. A final failure fails the row and fires DocumentFailed.
+ * On an asynchronous queue connection the job reads the status once per run; the runs follow
+ * status.delays and stop after status.max_attempts, as PollDeliveryStatus does, and every run, a
+ * failed one included, counts. A RateLimited answer delays the next run by its Retry-After. On a
+ * synchronous connection (sync, deferred, background), which cannot delay jobs, the one run waits
+ * for the final status within the KSeF client's polling bounds (KsefTransport::awaitFinal()) and
+ * tries the receipt once.
  *
- * A duplicate (status 440) is delivered with the original KSeF number when the original is known
- * to carry the same bytes: either another stored KSeF row with that number holds an identical
- * file, or no stored row holds the number and an earlier send of this row may have been accepted
- * (provider_code "outcome_unknown", see SendKsefInvoice). Any other duplicate fails with category
- * duplicate. A duplicate delivered this way keeps provider_code "440" and gets no UPO here: the
- * receipt belongs to the original send.
+ * Status 200 delivers the row with its KSeF number and the invoicing mode KSeF reports; an invoice
+ * KSeF classifies as offline gets its offline24 deadline when the row has none. The UPO is then
+ * fetched into the row; when KSeF has not issued it yet, later runs fetch it. A final failure
+ * fails the row and fires DocumentFailed, as does a document id that is not a KSeF one.
+ *
+ * KSeF reports a duplicate (status 440) when an invoice with the same seller NIP, invoice type and
+ * number is already accepted, whatever its content. The row is delivered under the original KSeF
+ * number only when KsefTransport::isSameDocument() confirms, through the original's receipt, that
+ * the original is this exact file; the original's receipt is then stored and provider_code is
+ * "440". When the original is another invoice the row fails with category duplicate. When it
+ * cannot be decided (the receipt is refused or not issued yet), the next run asks again; once no
+ * run is left the row becomes unconfirmed for an operator, never delivered.
  */
 final class PollKsefStatus extends MessageJob
 {
-    /** The provider_code of a row delivered as a duplicate of an earlier copy. */
+    /** The provider_code of a row delivered as an earlier accepted copy of the same file. */
     public const DUPLICATE = '440';
 
     private const DUPLICATE_STATUS = 440;
@@ -53,11 +63,12 @@ final class PollKsefStatus extends MessageJob
 
     /**
      * Schedules the first run for an invoice KSeF has just accepted for processing, unless polling
-     * is disabled or the queue connection cannot delay jobs.
+     * is disabled. On a synchronous connection the run happens at once and waits for the final
+     * status.
      */
     public static function start(int $messageId, int $attempts, ?string $connection = null): void
     {
-        if (! ConfigFlag::enabled('status.poll') || self::runsSynchronously($connection)) {
+        if (! ConfigFlag::enabled('status.poll')) {
             return;
         }
 
@@ -65,11 +76,12 @@ final class PollKsefStatus extends MessageJob
     }
 
     /**
-     * Up to three requests (status, and status with receipt), each with its timeouts, plus a margin.
+     * Up to four requests (status, receipt, and the original's receipt for a duplicate), each with
+     * its timeouts, plus a margin.
      */
     protected static function jobTimeout(): int
     {
-        return 3 * (self::setting('http.timeout', 60) + self::setting('http.connect_timeout', 10)) + 30;
+        return 4 * (self::setting('http.timeout', 60) + self::setting('http.connect_timeout', 10)) + 30;
     }
 
     public function handle(EInvoicingManager $manager): void
@@ -103,16 +115,30 @@ final class PollKsefStatus extends MessageJob
             return;
         }
         $checks++;
+        $last = $checks >= $maxChecks || self::runsSynchronously($this->queueConnection());
 
         if (self::awaitsStatus($message)) {
-            try {
-                $status = $transport->invoiceStatus($documentId);
-            } catch (TransportException) {
-                $this->again($message, $checks, $maxChecks);
+            if (! self::isKsefDocumentId($documentId)) {
+                $this->failRow($message, $documentId, new DeliveryFailure(FailureCategory::Other, sprintf(
+                    'The KSeF status cannot be read: the provider_document_id "%s" is not a KSeF document id "<session reference>/<invoice reference>"; resolve the row with the id send() returned.',
+                    $documentId,
+                )));
 
                 return;
             }
-            if (! $this->record($message, $documentId, $status)) {
+            try {
+                $status = self::runsSynchronously($this->queueConnection())
+                    ? $transport->awaitFinal($documentId)
+                    : $transport->invoiceStatus($documentId);
+            } catch (TransportException $e) {
+                $this->again($message, $checks, $maxChecks, $e);
+
+                return;
+            }
+            $recorded = $status->deliveryState() === DeliveryState::Failed && $status->code === self::DUPLICATE_STATUS
+                ? $this->duplicate($transport, $message, $documentId, $status, $last)
+                : $this->record($message, $documentId, $status);
+            if (! $recorded) {
                 $this->again($message, $checks, $maxChecks);
 
                 return;
@@ -133,14 +159,12 @@ final class PollKsefStatus extends MessageJob
         return match ($status->deliveryState()) {
             DeliveryState::Delivered => $status->ksefNumber !== null
                 && $this->deliver($message, $documentId, $status->ksefNumber, $status->invoicingMode),
-            DeliveryState::Failed => $status->code === self::DUPLICATE_STATUS
-                ? $this->duplicate($message, $documentId, $status)
-                : $this->failRow($message, $documentId, $status->failure()),
+            DeliveryState::Failed => $this->failRow($message, $documentId, $status->failure()),
             DeliveryState::Pending, DeliveryState::Unknown => false,
         };
     }
 
-    private function deliver(OutboundMessage $message, string $documentId, string $ksefNumber, ?InvoicingMode $mode, ?string $providerCode = null): bool
+    private function deliver(OutboundMessage $message, string $documentId, string $ksefNumber, ?InvoicingMode $mode, ?string $providerCode = null, ?string $upo = null): bool
     {
         $attributes = [
             'ksef_number' => $ksefNumber,
@@ -155,6 +179,9 @@ final class PollKsefStatus extends MessageJob
         if ($mode === InvoicingMode::Offline && $message->offline_deadline === null) {
             $attributes['offline_deadline'] = self::offlineDeadline($message);
         }
+        if ($upo !== null) {
+            $attributes['upo'] = $upo;
+        }
 
         if (! $message->transition(OutboundState::Pending, OutboundState::Delivered, $attributes, ['provider_document_id' => $documentId])) {
             return false;
@@ -165,42 +192,58 @@ final class PollKsefStatus extends MessageJob
     }
 
     /**
-     * Settles a duplicate: delivered when the original carries this row's bytes, failed otherwise.
+     * Settles a duplicate by comparing the original with this row's file; false when it cannot be
+     * decided yet and another run is left.
+     *
+     * @param  bool  $last  whether this is the last run, after which an undecided duplicate becomes unconfirmed
      */
-    private function duplicate(OutboundMessage $message, string $documentId, KsefInvoiceStatus $status): bool
+    private function duplicate(KsefTransport $transport, OutboundMessage $message, string $documentId, KsefInvoiceStatus $status, bool $last): bool
     {
         $original = $status->originalKsefNumber;
         $failure = $status->failure() ?? new DeliveryFailure(FailureCategory::Duplicate, $status->description, (string) $status->code);
-        if ($original === null) {
-            return $this->failRow($message, $documentId, $failure);
-        }
+        $session = $status->originalSessionReferenceNumber;
 
-        $hash = hash('sha256', $message->xml);
-        $stored = OutboundMessage::query()
-            ->where('transport', EInvoicingManager::KSEF)
-            ->where('ksef_number', $original)
-            ->whereKeyNot($message->getKey())
-            ->get(['id', 'xml']);
-        if ($stored->isNotEmpty()) {
-            $identical = $stored->contains(static fn (OutboundMessage $row): bool => hash_equals(hash('sha256', $row->xml), $hash));
-            if ($identical) {
-                return $this->deliver($message, $documentId, $original, null, self::DUPLICATE);
+        try {
+            $same = $transport->isSameDocument($status, $message->xml);
+        } catch (LogicException) {
+            // KSeF named no original to compare with, so no later run can decide it.
+            return $this->unconfirmed($message, $documentId, sprintf(
+                '%s KSeF names no original KSeF number and session to compare this invoice with; confirm in KSeF whether it was accepted and run einvoicing:resolve.',
+                $failure->message,
+            ));
+        } catch (TransportException|UnsafeXml|UnsupportedDocument $e) {
+            if (! $last) {
+                return false;
             }
 
-            return $this->failRow($message, $documentId, new DeliveryFailure(
-                FailureCategory::Duplicate,
-                sprintf('%s The stored outbound document %d holds that KSeF number with a different file.', $failure->message, $stored->first()->id),
-                $failure->providerCode,
+            return $this->unconfirmed($message, $documentId, sprintf(
+                'KSeF reports this invoice as a duplicate of the KSeF invoice %s, but its receipt (UPO) could not be compared with this file: %s Confirm in KSeF whether %s is this invoice and run einvoicing:resolve.',
+                $original ?? 'named in the status',
+                rtrim($e->getMessage(), '.').'.',
+                $original ?? 'the original',
             ));
         }
 
-        if ($message->provider_code === SendKsefInvoice::OUTCOME_UNKNOWN) {
-            return $this->deliver($message, $documentId, $original, null, self::DUPLICATE);
+        if ($same && $original !== null) {
+            $upo = null;
+            if ($session !== null) {
+                try {
+                    $upo = $transport->upoByKsefNumber($session, $original)->xml;
+                } catch (TransportException|InvalidArgumentException|UnsafeXml|UnsupportedDocument) {
+                    // The receipt was just read for the comparison; a second failure leaves it out.
+                }
+            }
+
+            return $this->deliver($message, $documentId, $original, null, self::DUPLICATE, $upo);
         }
 
         return $this->failRow($message, $documentId, new DeliveryFailure(
             FailureCategory::Duplicate,
-            sprintf('%s No earlier send of this invoice may have been accepted, so the original was sent elsewhere; compare it before resending.', $failure->message),
+            sprintf(
+                '%s The KSeF invoice %s has the same seller NIP, invoice type and number (P_2) but is a different file: this invoice was not accepted.',
+                $failure->message,
+                $original,
+            ),
             $failure->providerCode,
         ));
     }
@@ -220,11 +263,28 @@ final class PollKsefStatus extends MessageJob
         return true;
     }
 
+    private function unconfirmed(OutboundMessage $message, string $documentId, string $reason): bool
+    {
+        if (! $message->transition(OutboundState::Pending, OutboundState::Unconfirmed, [
+            'failure_message' => $reason,
+            'provider_code' => (string) self::DUPLICATE_STATUS,
+        ], ['provider_document_id' => $documentId])) {
+            return false;
+        }
+        event(new DocumentUnconfirmed($message));
+
+        return true;
+    }
+
     private function fetchReceipt(KsefTransport $transport, OutboundMessage $message, string $documentId, int $checks, int $maxChecks): void
     {
         try {
             $upo = $transport->upo($documentId);
-        } catch (TransportException|LogicException|UnsafeXml|UnsupportedDocument) {
+        } catch (TransportException $e) {
+            $this->again($message, $checks, $maxChecks, $e);
+
+            return;
+        } catch (LogicException|UnsafeXml|UnsupportedDocument) {
             $this->again($message, $checks, $maxChecks);
 
             return;
@@ -237,9 +297,10 @@ final class PollKsefStatus extends MessageJob
     }
 
     /**
-     * Schedules the next run while the row still waits for its status or receipt and checks remain.
+     * Schedules the next run while the row still waits for its status or receipt and checks
+     * remain; after a RateLimited answer no sooner than its Retry-After.
      */
-    private function again(OutboundMessage $message, int $checks, int $maxChecks): void
+    private function again(OutboundMessage $message, int $checks, int $maxChecks, ?TransportException $e = null): void
     {
         $connection = $this->queueConnection();
         if ((! self::awaitsStatus($message) && ! self::awaitsReceipt($message))
@@ -248,7 +309,20 @@ final class PollKsefStatus extends MessageJob
             return;
         }
 
-        self::schedule($message->id, self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks), $this->attempt, $connection);
+        $delay = self::delayAt('status.delays', self::DEFAULT_DELAYS, $checks);
+        if ($e instanceof RateLimited && $e->retryAfterSeconds !== null) {
+            $delay = $e->retryAfterSeconds;
+        }
+
+        self::schedule($message->id, $delay, $this->attempt, $connection);
+    }
+
+    /**
+     * Whether the id has the shape of a KSeF document id, "<session reference>/<invoice reference>".
+     */
+    public static function isKsefDocumentId(string $documentId): bool
+    {
+        return preg_match('#\A[A-Za-z0-9-]{1,64}/[A-Za-z0-9-]{1,64}\z#', $documentId) === 1;
     }
 
     private static function awaitsStatus(OutboundMessage $message): bool
@@ -267,7 +341,7 @@ final class PollKsefStatus extends MessageJob
     /**
      * The offline24 deadline of the row's invoice, or null when its issue date cannot be read.
      */
-    private static function offlineDeadline(OutboundMessage $message): ?\DateTimeImmutable
+    private static function offlineDeadline(OutboundMessage $message): ?DateTimeImmutable
     {
         try {
             return KsefInvoiceFacts::read($message->xml)->offlineDeadline()->deadline;

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
 use DateTimeZone;
+use GuzzleHttp\Psr7\Response;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
@@ -12,7 +13,9 @@ use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\OutboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentDelivered;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentFailed;
+use IntrAgile\EInvoicing\Laravel\Events\DocumentUnconfirmed;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollKsefStatus;
+use IntrAgile\EInvoicing\Laravel\Jobs\SendKsefInvoice;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\FakeKsefApi;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\KsefInvoices;
@@ -34,7 +37,7 @@ final class PollKsefStatusTest extends TestCase
         parent::setUp();
 
         Queue::fake();
-        Event::fake([DocumentDelivered::class, DocumentFailed::class]);
+        Event::fake([DocumentDelivered::class, DocumentFailed::class, DocumentUnconfirmed::class]);
     }
 
     private function runPoll(OutboundMessage $message, ?int $attempt = null): OutboundMessage
@@ -123,15 +126,30 @@ final class PollKsefStatusTest extends TestCase
         Event::assertDispatched(DocumentFailed::class, fn (DocumentFailed $event): bool => $event->message->id === $message->id);
     }
 
-    public function test_duplicate_of_another_invoice_fails(): void
+    public function test_duplicate_proven_by_the_original_receipt_is_delivered_with_the_original_number(): void
     {
-        // Another stored invoice with other bytes already holds the KSeF number.
-        $this->ksefRow(OutboundState::Delivered, [
-            'xml' => self::fa3(number: 'FV/TEST/OTHER/2026'),
-            'provider_document_id' => FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::SECOND_INVOICE_REF,
-            'ksef_number' => FakeKsefApi::KSEF_NUMBER,
-        ]);
-        $this->bindKsef()->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER));
+        // One receipt read for the comparison, one stored on the row.
+        $this->bindKsef()
+            ->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER))
+            ->onUpo(FakeKsefApi::upo(FakeKsefApi::KSEF_NUMBER, self::fa3()), FakeKsefApi::upo(FakeKsefApi::KSEF_NUMBER, self::fa3()));
+        $message = $this->ksefRow();
+
+        $row = $this->runPoll($message);
+
+        $this->assertSame(OutboundState::Delivered, $row->state);
+        $this->assertSame(FakeKsefApi::KSEF_NUMBER, $row->ksef_number);
+        $this->assertSame(PollKsefStatus::DUPLICATE, $row->provider_code);
+        $this->assertStringContainsString(FakeKsefApi::KSEF_NUMBER, (string) $row->upo);
+        $this->assertContains('GET /sessions/'.FakeKsefApi::ORIGINAL_SESSION_REF.'/invoices/ksef/'.FakeKsefApi::KSEF_NUMBER.'/upo', $this->api->paths());
+        Event::assertDispatched(DocumentDelivered::class);
+        Queue::assertNotPushed(PollKsefStatus::class);
+    }
+
+    public function test_duplicate_of_a_different_file_fails_naming_the_original(): void
+    {
+        $this->bindKsef()
+            ->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER))
+            ->onUpo(FakeKsefApi::upo(FakeKsefApi::KSEF_NUMBER, self::fa3(number: 'FV/TEST/OTHER/2026')));
         $message = $this->ksefRow();
 
         $row = $this->runPoll($message);
@@ -140,35 +158,77 @@ final class PollKsefStatusTest extends TestCase
         $this->assertSame(FailureCategory::Duplicate, $row->failure_category);
         $this->assertNull($row->ksef_number);
         $this->assertStringContainsString(FakeKsefApi::KSEF_NUMBER, (string) $row->failure_message);
+        $this->assertStringContainsString('different file', (string) $row->failure_message);
         Event::assertDispatched(DocumentFailed::class);
+        Event::assertNotDispatched(DocumentDelivered::class);
     }
 
-    public function test_duplicate_of_an_identical_stored_invoice_is_delivered(): void
+    public function test_undecidable_duplicate_is_retried_then_unconfirmed(): void
     {
-        $this->ksefRow(OutboundState::Delivered, [
-            'provider_document_id' => FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::SECOND_INVOICE_REF,
-            'ksef_number' => FakeKsefApi::KSEF_NUMBER,
-        ]);
-        $this->bindKsef()->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER));
+        config()->set('einvoicing.status.max_attempts', 2);
+        $this->bindKsef()
+            ->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER), FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER))
+            ->onUpo(FakeKsefApi::problem(404, 21178, 'Nie znaleziono UPO'), FakeKsefApi::problem(404, 21178, 'Nie znaleziono UPO'));
         $message = $this->ksefRow();
 
+        // The original's receipt is not available yet: asked again on the next run.
         $row = $this->runPoll($message);
+        $this->assertSame(OutboundState::Pending, $row->state);
+        Queue::assertPushed(PollKsefStatus::class, fn (PollKsefStatus $job): bool => $job->messageId === $message->id && $job->delay === 300);
 
-        $this->assertSame(OutboundState::Delivered, $row->state);
-        $this->assertSame(FakeKsefApi::KSEF_NUMBER, $row->ksef_number);
+        // The last run still cannot decide: an operator confirms it.
+        $row = $this->runPoll($row);
+        $this->assertSame(OutboundState::Unconfirmed, $row->state);
+        $this->assertNull($row->ksef_number);
+        $this->assertStringContainsString(FakeKsefApi::KSEF_NUMBER, (string) $row->failure_message);
+        $this->assertStringContainsString('einvoicing:resolve', (string) $row->failure_message);
+        Event::assertDispatched(DocumentUnconfirmed::class);
+        Event::assertNotDispatched(DocumentDelivered::class);
     }
 
-    public function test_duplicate_of_an_invoice_sent_elsewhere_fails(): void
+    public function test_duplicate_of_another_accepted_but_unpolled_row_is_not_delivered(): void
     {
-        // No stored row holds the number and no earlier send of this row may have been accepted,
-        // so the original's bytes are unknown.
-        $this->bindKsef()->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER));
-        $message = $this->ksefRow();
+        // Row A, with the same seller, type and number but other content, was accepted by KSeF and
+        // is not polled yet; row B's send is answered 440 naming A's KSeF number.
+        $rowAXml = self::fa3();
+        $this->ksefRow(OutboundState::Pending, [
+            'provider_document_id' => FakeKsefApi::ORIGINAL_SESSION_REF.'/'.FakeKsefApi::SECOND_INVOICE_REF,
+        ]);
+        $rowBXml = str_replace('<P_7>Usługa testowa</P_7>', '<P_7>Inna usługa</P_7>', $rowAXml);
+        $this->bindKsef()
+            ->onStatus(FakeKsefApi::duplicate(FakeKsefApi::KSEF_NUMBER))
+            ->onUpo(FakeKsefApi::upo(FakeKsefApi::KSEF_NUMBER, $rowAXml));
+        $rowB = $this->ksefRow(OutboundState::Pending, ['xml' => $rowBXml, 'provider_code' => SendKsefInvoice::OUTCOME_UNKNOWN]);
+
+        $row = $this->runPoll($rowB);
+
+        $this->assertSame(OutboundState::Failed, $row->state);
+        $this->assertNull($row->ksef_number);
+        Event::assertNotDispatched(DocumentDelivered::class);
+    }
+
+    public function test_row_with_a_document_id_that_is_not_a_ksef_one_fails(): void
+    {
+        $this->bindKsef();
+        $message = $this->ksefRow(OutboundState::Pending, ['provider_document_id' => 'not-a-ksef-id']);
 
         $row = $this->runPoll($message);
 
         $this->assertSame(OutboundState::Failed, $row->state);
-        $this->assertSame(FailureCategory::Duplicate, $row->failure_category);
+        $this->assertStringContainsString('<session reference>/<invoice reference>', (string) $row->failure_message);
+        Event::assertDispatched(DocumentFailed::class);
+        $this->assertSame([], $this->api->paths());
+    }
+
+    public function test_rate_limited_status_read_waits_for_retry_after(): void
+    {
+        $this->bindKsef()->onStatus(new Response(429, ['Content-Type' => 'application/json', 'Retry-After' => '1200'], '{}'));
+        $message = $this->ksefRow();
+
+        $row = $this->runPoll($message);
+
+        $this->assertSame(OutboundState::Pending, $row->state);
+        Queue::assertPushed(PollKsefStatus::class, fn (PollKsefStatus $job): bool => $job->messageId === $message->id && $job->delay === 1200);
     }
 
     public function test_poll_for_an_earlier_send_does_nothing(): void
