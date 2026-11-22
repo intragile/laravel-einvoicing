@@ -27,8 +27,9 @@ use IntrAgile\EInvoicing\Transport\Exception\TransportException;
  *
  * The KSeF inbox (--transport=ksef) is read at most once per
  * einvoicing.ksef.inbound_min_interval_minutes, as KSeF allows 20 metadata queries per hour: a run
- * sooner than that after the start of the previous one is skipped and says so. The start of the
- * last run is kept in the default cache store. Schedule it, for example, with
+ * sooner than that after the start of the previous one, less a minute of slack for scheduler
+ * jitter (at least one minute in all), is skipped and says so. The start of the last run is kept
+ * in the default cache store. Schedule it, for example, with
  * `Schedule::command('einvoicing:poll-inbound --transport=ksef')->everyFifteenMinutes()->withoutOverlapping();`
  */
 final class PollInboundCommand extends Command
@@ -36,6 +37,9 @@ final class PollInboundCommand extends Command
     protected $signature = 'einvoicing:poll-inbound
         {--transport= : Transport name, default the default transport}
         {--include-capped : Retry each document that has used up inbound.max_fetch_attempts once}';
+
+    /** Seconds of scheduler jitter tolerated between two KSeF inbox runs. */
+    private const KSEF_INTERVAL_SLACK = 60;
 
     protected $description = 'Record the documents waiting at an inbound transport and queue their intake';
 
@@ -125,7 +129,9 @@ final class PollInboundCommand extends Command
         $nip = config('einvoicing.ksef.nip');
         $key = sprintf('einvoicing:ksef:inbound-run:%s:%s', $settings->environment->value, is_scalar($nip) ? trim((string) $nip) : '');
         $now = now()->getTimestamp();
-        if (Cache::add($key, $now, $minutes * 60)) {
+        // A minute of slack, so a scheduled run that started a few seconds late does not make the
+        // next on-time run look early.
+        if (Cache::add($key, $now, max(self::KSEF_INTERVAL_SLACK, $minutes * 60 - self::KSEF_INTERVAL_SLACK))) {
             return true;
         }
 

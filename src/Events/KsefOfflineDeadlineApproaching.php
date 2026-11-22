@@ -10,8 +10,13 @@ use Illuminate\Queue\SerializesModels;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 
 /**
- * An offline KSeF invoice that is not delivered yet must reach KSeF by the deadline, which lies
- * within einvoicing.ksef.deadline_warning_hours or has already passed.
+ * An offline KSeF invoice still on its way to KSeF (queued, sending, pending or unconfirmed) must
+ * reach KSeF by the deadline, which lies within einvoicing.ksef.deadline_warning_hours or has
+ * already passed.
+ *
+ * einvoicing:ksef-deadlines fires it again on every run while the row stays inside the window and
+ * is neither delivered nor failed, so a listener that notifies people should remember what it has
+ * already sent.
  */
 final class KsefOfflineDeadlineApproaching
 {

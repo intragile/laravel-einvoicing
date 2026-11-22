@@ -60,6 +60,11 @@ final class KsefDeadlinesCommandTest extends TestCase
             'xml' => self::fa3('2026-11-23', 'FV/DUE/TOMORROW'),
         ]);
         $this->ksefRow(OutboundState::Delivered, ['invoicing_mode' => 'Offline', 'reference' => 'FV/DELIVERED', 'ksef_number' => FakeKsefApi::KSEF_NUMBER]);
+        $this->ksefRow(OutboundState::Failed, [
+            'invoicing_mode' => 'Offline',
+            'reference' => 'FV/FAILED',
+            'provider_document_id' => FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::INVOICE_REF.'-F',
+        ]);
         $this->ksefRow(OutboundState::Pending, [
             'reference' => 'FV/ONLINE',
             'provider_document_id' => FakeKsefApi::SESSION_REF.'/'.FakeKsefApi::SECOND_INVOICE_REF,
@@ -88,6 +93,7 @@ final class KsefDeadlinesCommandTest extends TestCase
         $this->assertMatchesRegularExpression('#FV/DUE/TOMORROW .*2026-11-24 23:59 #', $output);
         $this->assertStringNotContainsString('FV/DELIVERED', $output);
         $this->assertStringNotContainsString('FV/ONLINE', $output);
+        $this->assertStringNotContainsString('FV/FAILED', $output);
 
         Event::assertDispatched(KsefOfflineDeadlineApproaching::class, 1);
         Event::assertDispatched(

@@ -8,13 +8,18 @@ use GuzzleHttp\Psr7\Response;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Queue;
+use IntrAgile\EInvoicing\Laravel\EInvoicingManager;
 use IntrAgile\EInvoicing\Laravel\Enums\InboundState;
 use IntrAgile\EInvoicing\Laravel\Events\DocumentReceived;
 use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
+use IntrAgile\EInvoicing\Laravel\Support\InboundRecorder;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\FakeKsefApi;
 use IntrAgile\EInvoicing\Laravel\Tests\Support\KsefInvoices;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
+use IntrAgile\EInvoicing\Poland\KsefNumber;
 use IntrAgile\EInvoicing\Transport\Ksef\Inbound\KsefCursorStore;
 use IntrAgile\EInvoicing\Transport\Ksef\KsefTransport;
 
@@ -24,6 +29,8 @@ final class KsefInboundTest extends TestCase
     use RefreshDatabase;
 
     private const RECEIVED = '5555555555-20261120-010080615740-BB';
+
+    private const RECEIVED_ID = self::RECEIVED.'@2026-11-21T09:00:00.000000Z';
 
     private const RECEIVED_XML = '<?xml version="1.0" encoding="UTF-8"?><Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/"/>';
 
@@ -94,7 +101,9 @@ final class KsefInboundTest extends TestCase
             ->assertSuccessful();
 
         $row = InboundMessage::query()->where('transport', 'ksef')->sole();
-        $this->assertSame(self::RECEIVED, $row->provider_document_id);
+        // The full id pending() returned is kept, so a later fetch needs no metadata query.
+        $this->assertSame(self::RECEIVED_ID, $row->provider_document_id);
+        $this->assertSame(self::RECEIVED, KsefTransport::ksefNumberOf($row->provider_document_id));
         $this->assertSame(InboundState::Acknowledged, $row->state);
         $this->assertSame(self::RECEIVED_XML, InboundMessage::query()->findOrFail($row->id)->xml);
         $this->assertSame('FA (3)', $row->document_type);
@@ -123,6 +132,64 @@ final class KsefInboundTest extends TestCase
         $this->travel(6)->minutes();
         $this->artisan('einvoicing:poll-inbound', ['--transport' => 'ksef'])->assertSuccessful();
         $this->assertCount(2, $this->metadataQueries());
+    }
+
+    public function test_on_time_run_after_a_late_one_is_not_skipped(): void
+    {
+        $this->bindInbox((new FakeKsefApi)->withTokenAuthentication()
+            ->on('POST', '#\A/invoices/query/metadata\z#', self::metadataPage([]), self::metadataPage([])));
+
+        // The scheduler starts run 1 a few seconds late and run 2 exactly on time.
+        $this->travelTo(new \DateTimeImmutable('2026-11-21T10:00:07+00:00'));
+        $this->artisan('einvoicing:poll-inbound', ['--transport' => 'ksef'])->assertSuccessful();
+        $this->travelTo(new \DateTimeImmutable('2026-11-21T10:15:00+00:00'));
+        $this->artisan('einvoicing:poll-inbound', ['--transport' => 'ksef'])
+            ->doesntExpectOutputToContain('Skipped')
+            ->assertSuccessful();
+
+        $this->assertCount(2, $this->metadataQueries());
+    }
+
+    public function test_fetch_in_a_fresh_worker_spends_no_metadata_query(): void
+    {
+        config()->set('queue.default', 'database');
+        Queue::fake();
+        $this->bindInbox((new FakeKsefApi)->withTokenAuthentication()
+            ->on('POST', '#\A/invoices/query/metadata\z#', self::metadataPage([self::RECEIVED])));
+        $this->artisan('einvoicing:poll-inbound', ['--transport' => 'ksef'])->assertSuccessful();
+        $row = InboundMessage::query()->where('transport', 'ksef')->sole();
+
+        // Another process: a new transport that never listed the inbox.
+        $this->bindInbox((new FakeKsefApi)->withTokenAuthentication()
+            ->on('GET', '#\A/invoices/ksef/[A-Za-z0-9-]+\z#', new Response(200, ['Content-Type' => 'application/xml'], self::RECEIVED_XML)));
+        (new FetchInboundDocument($row->id))->handle($this->app->make(EInvoicingManager::class));
+
+        $this->assertSame([], $this->metadataQueries());
+        $this->assertContains('GET /invoices/ksef/'.self::RECEIVED, $this->api->paths());
+        $this->assertSame(self::RECEIVED_XML, InboundMessage::query()->findOrFail($row->id)->xml);
+    }
+
+    public function test_one_invoice_listed_in_both_id_forms_is_recorded_once(): void
+    {
+        config()->set('queue.default', 'database');
+        Queue::fake();
+        $recorder = $this->app->make(InboundRecorder::class);
+
+        $first = $recorder->notify('ksef', self::RECEIVED_ID);
+        $plain = $recorder->notify('ksef', self::RECEIVED);
+        $again = $recorder->notify('ksef', self::RECEIVED_ID);
+
+        $this->assertSame(1, InboundMessage::query()->where('transport', 'ksef')->count());
+        $this->assertSame($first->id, $plain->id);
+        $this->assertSame($first->id, $again->id);
+        $this->assertSame(self::RECEIVED_ID, $plain->provider_document_id);
+
+        // The other order as well: a plain id first, the full one later.
+        $other = '5555555555-20261120-010080615741-'.KsefNumber::checksum('5555555555-20261120-010080615741');
+        $recorder->notify('ksef', $other);
+        $recorder->notify('ksef', $other.'@2026-11-21T09:00:00.000000Z');
+        $this->assertSame(2, InboundMessage::query()->where('transport', 'ksef')->count());
+        Queue::assertPushed(FetchInboundDocument::class, 2);
     }
 
     public function test_min_interval_of_zero_never_skips(): void

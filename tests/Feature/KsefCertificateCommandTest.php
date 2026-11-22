@@ -129,6 +129,51 @@ final class KsefCertificateCommandTest extends TestCase
         $this->assertNotNull($this->app->make(KsefManager::class)->offlineCertificate());
     }
 
+    public function test_certificate_command_encrypts_the_key_with_the_configured_passphrase(): void
+    {
+        $this->bindEnrolment();
+        $paths = $this->offlinePaths();
+        config()->set('einvoicing.ksef.offline_certificate.passphrase', 'offline-'.self::SECRET_MARK);
+
+        $exitCode = Artisan::call('einvoicing:ksef-certificate', ['--type' => 'offline']);
+        $output = Artisan::output();
+
+        $this->assertSame(0, $exitCode, $output);
+        $this->assertStringNotContainsString(self::SECRET_MARK, $output);
+        $key = (string) file_get_contents($paths['private_key']);
+        $this->assertStringContainsString('-----BEGIN ENCRYPTED PRIVATE KEY-----', $key);
+        $this->assertFalse(@openssl_pkey_get_private($key));
+        $this->assertNotFalse(openssl_pkey_get_private($key, 'offline-'.self::SECRET_MARK));
+        $this->app->forgetInstance(KsefManager::class);
+        $this->assertNotNull($this->app->make(KsefManager::class)->offlineCertificate());
+    }
+
+    public function test_failed_enrolment_says_the_certificate_may_have_been_issued(): void
+    {
+        // Configures the certificate credentials; the canned answers are replaced below.
+        $this->bindEnrolment();
+        $paths = $this->offlinePaths();
+        // The status reads after the accepted enrolment request fail with server errors.
+        $credentials = new CertificateCredentials(
+            (string) file_get_contents((string) config('einvoicing.ksef.credentials.certificate')),
+            (string) file_get_contents((string) config('einvoicing.ksef.credentials.private_key')),
+            self::KSEF_PASSPHRASE,
+        );
+        $api = (new FakeKsefApi)->withCertificateAuthentication()
+            ->on('GET', '#\A/certificates/enrollments/data\z#', FakeKsefApi::json(200, ['commonName' => 'Test Seal', 'countryName' => 'PL']))
+            ->on('POST', '#\A/certificates/enrollments\z#', FakeKsefApi::json(202, ['referenceNumber' => '20261121-EH-1B2C3D4E5F-6A7B8C9D0E-11']))
+            ->on('GET', '#\A/certificates/enrollments/[A-Za-z0-9-]+\z#', FakeKsefApi::problem(500, 0, 'Internal error'), FakeKsefApi::problem(500, 0, 'Internal error'), FakeKsefApi::problem(500, 0, 'Internal error'), FakeKsefApi::problem(500, 0, 'Internal error'));
+        $this->app->instance(KsefTransport::class, $api->transport(credentials: $credentials));
+
+        $exitCode = Artisan::call('einvoicing:ksef-certificate', ['--type' => 'offline']);
+        $output = Artisan::output();
+
+        $this->assertSame(1, $exitCode, $output);
+        $this->assertStringContainsString('may have issued the certificate', $output);
+        $this->assertStringContainsString('revoke', $output);
+        $this->assertFileDoesNotExist($paths['private_key']);
+    }
+
     public function test_certificate_command_refuses_overwrite(): void
     {
         $this->bindEnrolment();

@@ -7,7 +7,6 @@ namespace IntrAgile\EInvoicing\Laravel\Console;
 use Illuminate\Console\Command;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
-use IntrAgile\EInvoicing\Transport\Exception\TransportException;
 use IntrAgile\EInvoicing\Transport\Ksef\Certificates\EnrolledCertificate;
 use IntrAgile\EInvoicing\Transport\Ksef\Certificates\KeyAlgorithm;
 use IntrAgile\EInvoicing\Transport\Ksef\Certificates\KsefCertificateType;
@@ -25,7 +24,8 @@ use SensitiveParameter;
  * KSeF enrols certificates only for a context authenticated with a certificate (XAdES), so the
  * configured credentials must be a certificate, not a KSeF token. The command refuses to overwrite
  * an existing file and checks the paths before it enrols. The private key exists only in memory
- * until it is written; it is never printed.
+ * until it is written; it is never printed. When the type's passphrase setting (offline_certificate.
+ * passphrase or credentials.passphrase) is set, the key is written encrypted with it.
  */
 final class KsefCertificateCommand extends Command
 {
@@ -80,24 +80,36 @@ final class KsefCertificateCommand extends Command
 
         try {
             $enrolled = $ksef->transport()->certificates()->enroll($type, $algorithm, $name);
-        } catch (ConfigurationException|LogicException|InvalidArgumentException|RuntimeException $exception) {
-            // TransportException is a RuntimeException; none of these messages holds key material.
+        } catch (ConfigurationException|LogicException|InvalidArgumentException $exception) {
+            // Refused before the enrolment request: nothing was issued.
             $this->components->error($exception->getMessage());
+
+            return self::FAILURE;
+        } catch (RuntimeException $exception) {
+            // A transport failure may come after KSeF accepted the enrolment. None of these
+            // messages holds key material.
+            $this->components->error(sprintf(
+                '%s KSeF may have issued the certificate even so, and its private key is lost: look for it with KsefCertificates::query() (for example by its name) and revoke it if it is there.',
+                rtrim($exception->getMessage(), '.').'.',
+            ));
 
             return self::FAILURE;
         }
 
-        return $this->store($enrolled, $certificatePath, $keyPath);
+        $passphrase = config("{$group}.passphrase");
+
+        return $this->store($enrolled, $certificatePath, $keyPath, is_string($passphrase) && $passphrase !== '' ? $passphrase : null);
     }
 
     /**
-     * Writes the private key, then the certificate.
+     * Writes the private key, encrypted with the passphrase configured for the type when there is
+     * one, then the certificate.
      */
-    private function store(EnrolledCertificate $enrolled, string $certificatePath, string $keyPath): int
+    private function store(EnrolledCertificate $enrolled, string $certificatePath, string $keyPath, #[SensitiveParameter] ?string $passphrase): int
     {
         $certificate = $enrolled->certificate;
         try {
-            self::writeExclusive($keyPath, $enrolled->privateKeyPem());
+            self::writeExclusive($keyPath, self::keyPem($enrolled, $passphrase));
         } catch (RuntimeException $exception) {
             $this->components->error(sprintf(
                 'KSeF issued the certificate %s, but its private key could not be written: %s The key is gone, so revoke the certificate and enrol again.',
@@ -131,6 +143,29 @@ final class KsefCertificateCommand extends Command
         $this->components->twoColumnDetail('Private key (mode 0600)', $keyPath);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * The private key as PEM: unencrypted PKCS#8, or encrypted PKCS#8 (AES-256-CBC) with the
+     * passphrase.
+     *
+     * @throws RuntimeException when OpenSSL cannot encrypt the key
+     */
+    private static function keyPem(EnrolledCertificate $enrolled, #[SensitiveParameter] ?string $passphrase): string
+    {
+        if ($passphrase === null) {
+            return $enrolled->privateKeyPem();
+        }
+        $key = openssl_pkey_get_private($enrolled->privateKeyPem());
+        if ($key === false || ! openssl_pkey_export($key, $pem, $passphrase, ['encrypt_key_cipher' => OPENSSL_CIPHER_AES_256_CBC]) || ! is_string($pem)) {
+            while (openssl_error_string() !== false) {
+                // Drain OpenSSL's error queue.
+            }
+
+            throw new RuntimeException('OpenSSL could not encrypt the private key with the configured passphrase.');
+        }
+
+        return $pem;
     }
 
     /**

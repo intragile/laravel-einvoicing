@@ -24,9 +24,10 @@ use IntrAgile\EInvoicing\Transport\Ksef\Latarnia\OutageEvents;
 use InvalidArgumentException;
 
 /**
- * Lists the offline KSeF invoices that are not delivered yet with their sending deadlines, and
- * fires KsefOfflineDeadlineApproaching for each one whose deadline lies within
- * einvoicing.ksef.deadline_warning_hours or has passed.
+ * Lists the offline KSeF invoices still on their way to KSeF (queued, sending, pending or
+ * unconfirmed) with their sending deadlines, and fires KsefOfflineDeadlineApproaching for each one
+ * whose deadline lies within einvoicing.ksef.deadline_warning_hours or has passed, on every run.
+ * Delivered and failed rows are left out.
  *
  * Every offline row is taken as an offline24 invoice issued on its P_1 date. The failures
  * announced in Latarnia move the deadlines as the KSeF rules say; when Latarnia cannot be reached,
@@ -41,6 +42,9 @@ final class KsefDeadlinesCommand extends Command
     protected $signature = 'einvoicing:ksef-deadlines';
 
     protected $description = 'List the offline KSeF invoices waiting for delivery with their deadlines, and warn about those due soon';
+
+    /** The states of a row that may still reach KSeF; delivered and failed rows are final. */
+    private const OPEN_STATES = [OutboundState::Queued, OutboundState::Sending, OutboundState::Pending, OutboundState::Unconfirmed];
 
     /** Seconds the Latarnia request may take to connect and in total. */
     private const LATARNIA_TIMEOUT = 10;
@@ -58,7 +62,7 @@ final class KsefDeadlinesCommand extends Command
         $rows = OutboundMessage::query()
             ->where('transport', EInvoicingManager::KSEF)
             ->where('invoicing_mode', SendKsefInvoice::MODE_OFFLINE)
-            ->where('state', '!=', OutboundState::Delivered->value)
+            ->whereIn('state', array_map(static fn (OutboundState $state): string => $state->value, self::OPEN_STATES))
             ->orderBy('id')
             ->get();
         if ($rows->isEmpty()) {
