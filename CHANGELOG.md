@@ -33,10 +33,59 @@ All notable changes to this project are documented here. The format follows
   the webhook route: real signatures must verify and fire `LifecycleStatusChanged`.
 - **Doctor:** a `france` row when `einvoicing.france.transport` is set: the transport must be a
   valid B2Brouter transport; the row names its key kind (sandbox, staging or production).
+- **Polish KSeF:** `EInvoicing::ksef()` returns the new `Ksef\KsefManager` singleton:
+  `transport()` (the core's `KsefTransport` for the configured context, built on first use and
+  cached for the process; a `KsefTransport` bound in the container is used instead),
+  `latarnia()`, `offlineCertificate()`, `settings()` and
+  `queue(Invoice|string $invoice, bool $offline = false, ?string $reference = null)`, which stores
+  an FA(3) row in `einvoicing_outbound_documents` and dispatches `SendKsefInvoice`.
+  `EInvoicing::inbound('ksef')` returns the same transport.
+- **KSeF configuration:** a new `einvoicing.ksef` section: `environment` (`KSEF_ENVIRONMENT`,
+  default `test`; production only when set), `nip`, `credentials` (certificate and private key
+  read from files, with an optional passphrase, or a KSeF token from `KSEF_TOKEN`),
+  `offline_certificate`, `max_response_bytes` (default 67,108,864, at least 52,428,816),
+  `inbound_min_interval_minutes` (default 15, 0 to 1440) and `deadline_warning_hours` (default 24,
+  1 to 720). Errors name the setting and path, never the key, passphrase or token.
+- **KSeF jobs:** `SendKsefInvoice` sends with the claim, backoff and state machine of
+  `SendDocument`, and repeats a send whose outcome is unknown (KSeF answers a second copy as a
+  duplicate). `PollKsefStatus` reads the status once per run along `status.delays`, stores
+  `ksef_number`, `invoicing_mode` and the receipt (`upo`); on a synchronous connection it waits for
+  the final status inline (about 60 seconds at most) and tries the receipt once.
+- **KSeF duplicates:** a status 440 delivers the row under the original KSeF number only when the
+  original's receipt proves the same file (`provider_code` `440`, the original's receipt stored); a
+  different file fails the row with category `duplicate`; an undecidable comparison is retried and
+  finally leaves the row `unconfirmed`.
+- **KSeF inbox:** `einvoicing:poll-inbound --transport=ksef` reads the buyer inbox through the
+  existing intake jobs, at most once per `inbound_min_interval_minutes` (less a minute of slack,
+  at least one minute; kept in the default cache store). Inbound ids are
+  `<KSeF number>@<storage date>`, and a plain KSeF number matches the same row. The inbox position
+  is kept by `Ksef\DatabaseKsefCursorStore` in the new table `einvoicing_ksef_cursors`.
+- **KSeF migration:** `add_ksef_to_einvoicing_tables` adds `ksef_number` (indexed),
+  `invoicing_mode`, `offline_deadline` and `upo` to `einvoicing_outbound_documents` and creates
+  `einvoicing_ksef_cursors`; `create_einvoicing_tables` creates the same columns on a fresh
+  install.
+- **KSeF commands:** `einvoicing:ksef-certificate` enrols a KSeF Offline or Authentication
+  certificate (EC P-256 or RSA-2048) and writes it with its private key, mode 0600, refusing to
+  overwrite and never printing the key. `einvoicing:ksef-deadlines` lists offline rows not yet
+  delivered or failed with their deadlines, using the outages announced in Latarnia where
+  reachable, and stores the deadline on the row (a calculation aid, not legal advice).
+- **Events:** `KsefOfflineDeadlineApproaching` (`$message`, `$deadline`) for an offline row whose
+  deadline is within `deadline_warning_hours` or has passed. The document events fire for KSeF rows
+  as for Peppol.
+- **Doctor:** `ksef` rows when `einvoicing.ksef` is in use: configuration and credentials, the
+  certificates' expiry (an Offline certificate within 30 days warns), the cursor table, a shadowed
+  `ksef` transport, and the public Latarnia status, read by default with a 5-second timeout. KSeF
+  itself is never called.
+- **Testing:** `KsefLiveTest` (group `ksef-live`, testsuite `Live`, excluded from the default run)
+  sends an invoice through `EInvoicing::ksef()->queue()` on KSeF TE and receives it with
+  `einvoicing:poll-inbound --transport=ksef` in a second context, with random NIPs and self-signed
+  seals, within 15 metadata queries; it reaches no KSeF host but TE.
+- **Documentation:** a "Polish KSeF" section in both READMEs.
 
 ### Changed
 
-- Requires `intragile/php-einvoicing` ^1.1.
+- Requires `intragile/php-einvoicing` ^1.2.
+- The Composer description and keywords name the French and Polish (KSeF) support.
 
 ## [1.0.0] - 2026-11-16
 

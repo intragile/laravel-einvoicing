@@ -8,7 +8,8 @@ Developed and maintained by [IntrAgile Kft.](https://intragile.eu)
 [![License](https://img.shields.io/packagist/l/intragile/laravel-einvoicing.svg)](LICENSE)
 
 The Laravel bridge for [`intragile/php-einvoicing`](https://github.com/intragile/php-einvoicing):
-send and receive EN 16931 invoices over **Peppol** from a Laravel application.
+send and receive EN 16931 invoices over **Peppol**, French e-invoicing through B2Brouter and
+Polish **KSeF** FA(3) invoices from a Laravel application.
 
 [Magyar nyelvű leírás → README.hu.md](README.hu.md)
 
@@ -30,6 +31,9 @@ send and receive EN 16931 invoices over **Peppol** from a Laravel application.
   then acknowledged at the access point.
 - **Signed webhooks**, verified against the request exactly as received, without the `web`
   middleware group.
+- **Polish KSeF:** queued FA(3) sending with the KSeF number and receipt stored, inbox polling
+  within KSeF's read limits, offline deadlines and KSeF certificates; see
+  [Polish KSeF](#polish-ksef).
 - `EInvoicing::fake()` for your tests, and `einvoicing:doctor` to check an installation.
 
 > **Live testing, per driver.** Recommand is live-tested on the Peppol test network, through this
@@ -79,7 +83,7 @@ mapping, inbound behaviour and webhook details are in the core's
 composer require intragile/laravel-einvoicing
 php artisan vendor:publish --tag=einvoicing-config     # optional: config/einvoicing.php
 php artisan einvoicing:install-rules                   # the Peppol BIS validation rules
-php artisan migrate                                    # two tables: einvoicing_outbound_documents, einvoicing_inbound_documents
+php artisan migrate                                    # einvoicing_outbound_documents, einvoicing_inbound_documents, einvoicing_ksef_cursors
 php artisan einvoicing:doctor                          # checks everything below
 ```
 
@@ -89,7 +93,7 @@ php artisan einvoicing:doctor                          # checks everything below
 >
 > ```json
 > "repositories": [
->     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.1.0" } } },
+>     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.2.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931", "options": { "versions": { "intragile/einvoicing-rules-en16931": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-xrechnung", "options": { "versions": { "intragile/einvoicing-rules-xrechnung": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-facturx", "options": { "versions": { "intragile/einvoicing-rules-facturx": "1.0.0" } } },
@@ -100,7 +104,7 @@ php artisan einvoicing:doctor                          # checks everything below
 > and require `"intragile/laravel-einvoicing": "^1.0"`. The `versions` option gives each path
 > package the version the constraints between the packages expect.
 
-The migration is loaded from the package. To keep a copy in your application, publish it with
+The migrations are loaded from the package. To keep a copy in your application, publish them with
 `php artisan vendor:publish --tag=einvoicing-migrations`.
 
 `einvoicing:install-rules` downloads the pinned Peppol BIS Billing sources and compiles them
@@ -569,6 +573,209 @@ sandbox), so `Collected` never arrives as `LifecycleStatusChanged`: read it from
 transport must be a valid B2Brouter transport, and the row says whether its key is a sandbox
 (`test_`), staging (`stag_`) or production key. It makes no request.
 
+## Polish KSeF
+
+`EInvoicing::ksef()` sends FA(3) invoices to KSeF, the Polish national e-invoicing system (KSeF
+API 2.0), through the queue, and `einvoicing:poll-inbound --transport=ksef` receives the invoices
+issued to you. Rows, states and events are the same as for Peppol. Requires
+`intragile/php-einvoicing` 1.2 or later. The core's
+[POLAND.md](https://github.com/intragile/php-einvoicing/blob/main/docs/countries/POLAND.md)
+describes the FA(3) model, the KSeF client and its limits in detail.
+
+> **Live-tested on KSeF TE, the test environment, through this package:** a queued send that
+> ends delivered with its KSeF number and receipt (UPO), and the buyer's inbox poll that fires
+> `DocumentReceived` (2026-11-22, PHP 8.4 and 8.5). Offline invoices, deadlines, the certificate
+> command and the doctor row are tested offline here; the core live-tests offline sending, KSeF
+> certificates and the QR links on TE.
+
+### Configuration and credentials
+
+```bash
+KSEF_ENVIRONMENT=test                   # test (TE), demo or production; production only when set
+KSEF_NIP=5265877635                     # the context the client authenticates for
+KSEF_CERTIFICATE_PATH=/run/secrets/ksef-seal.crt.pem
+KSEF_PRIVATE_KEY_PATH=/run/secrets/ksef-seal.key.pem
+# KSEF_PRIVATE_KEY_PASSPHRASE=...       # for an encrypted key
+# KSEF_TOKEN=...                        # instead of a certificate: a KSeF token
+# KSEF_OFFLINE_CERTIFICATE_PATH=/run/secrets/ksef-offline.crt.pem
+# KSEF_OFFLINE_PRIVATE_KEY_PATH=/run/secrets/ksef-offline.key.pem
+# KSEF_OFFLINE_PRIVATE_KEY_PASSPHRASE=...
+```
+
+These fill `einvoicing.ksef` in `config/einvoicing.php`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `environment` | `test` | `test`, `demo` or `production`; production is never chosen unless it is set |
+| `nip` | — | the ten-digit NIP of the context, check digit validated |
+| `credentials` | — | `certificate` and `private_key` (file paths) with an optional `passphrase`, **or** `token`; not both |
+| `offline_certificate` | — | `certificate` and `private_key` paths and `passphrase` of the KSeF Offline certificate that signs KOD II of offline invoices; leave empty when unused |
+| `max_response_bytes` | 67,108,864 | the cap on every KSeF answer read into memory; at least 52,428,816, the largest encrypted export part |
+| `inbound_min_interval_minutes` | 15 | the shortest interval between two inbox polls (0 to 1440; 0 turns the guard off) |
+| `deadline_warning_hours` | 24 | how close an offline deadline must be to fire `KsefOfflineDeadlineApproaching` (1 to 720) |
+
+- **Certificates and private keys are read from files**, never from environment values; keep the
+  key files readable by the application user only. A qualified seal or signature works, and so
+  does a KSeF Authentication certificate. The passphrase of an encrypted key comes from the
+  environment.
+- **A KSeF token comes from the environment** (`KSEF_TOKEN`), like other providers' API keys.
+  KSeF enrols certificates only for a context authenticated with a certificate, so
+  `einvoicing:ksef-certificate` needs certificate credentials.
+- Errors name the setting and the file path, never the file contents, the passphrase or the
+  token. The KSeF client is built on first use and cached for the process: restart queue workers
+  and Octane after a configuration change. `EInvoicing::fake()` does not replace it.
+- `php artisan migrate` adds the columns `ksef_number`, `invoicing_mode`, `offline_deadline` and
+  `upo` to `einvoicing_outbound_documents` and the table `einvoicing_ksef_cursors`, where the
+  inbox position is kept (`DatabaseKsefCursorStore`; bind your own
+  `Transport\Ksef\Inbound\KsefCursorStore` to keep it elsewhere).
+
+### KSeF certificates
+
+```bash
+php artisan einvoicing:ksef-certificate                         # an Offline certificate, EC P-256
+php artisan einvoicing:ksef-certificate --type=authentication --algorithm=rsa --name="Billing"
+```
+
+The command enrols a certificate for the configured context and writes the certificate and its
+private key, each with mode 0600, to the configured paths: `offline_certificate` for an Offline
+certificate, `credentials` for an Authentication certificate (`--certificate=` and
+`--private-key=` name other paths). It checks the paths before it enrols and refuses to overwrite
+an existing file. The key is generated locally, exists only in memory until it is written, and is
+never printed; when the type's passphrase is set, the key is written encrypted with it. KSeF
+allows 100 certificates per subject.
+
+### Sending
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+
+$message = EInvoicing::ksef()->queue($invoice);                    // an Invoice, or an FA(3) file
+$message = EInvoicing::ksef()->queue($fa3Xml, offline: true);       // issued in offline mode
+$message = EInvoicing::ksef()->queue($invoice, reference: 'FV/2026/11/0042');
+```
+
+`queue()` stores the exact bytes in `einvoicing_outbound_documents` (`transport` and `process`
+`ksef`, `document_type` `FA (3)`, `sender` the seller NIP, `receiver` the buyer) and dispatches
+`SendKsefInvoice` once the open transaction commits. The job validates the invoice against the
+FA(3) schema, sends it, and starts `PollKsefStatus`, which follows `status.delays` and
+`status.max_attempts`:
+
+- **Status 200** delivers the row with `ksef_number` and the `invoicing_mode` KSeF reports
+  (`Online` or `Offline`; KSeF classifies an online send dated before today as offline), then
+  fetches the receipt into `upo`. A receipt KSeF has not issued yet is fetched by a later run.
+- **A rejection** fails the row with the KSeF code and message and fires `DocumentFailed`.
+- **A send whose outcome is unknown is repeated**, unlike Peppol: KSeF answers a second copy as a
+  duplicate, so it cannot be accepted twice.
+- **Duplicates (status 440).** KSeF reports a duplicate when an invoice with the same seller NIP,
+  invoice type and number (`P_2`) is already accepted, whatever its content. The row is
+  **delivered** under the original KSeF number only when the original's receipt proves that the
+  original is this exact file (same document hash); its `provider_code` is then `440` and the
+  original's receipt is stored. When the original is a different file the row **fails** with
+  category `duplicate`. When it cannot be decided (the receipt is refused or not issued yet) the
+  next run asks again, and after the last run the row becomes **unconfirmed** for an operator
+  (`einvoicing:resolve`). It is never delivered on a guess.
+
+> **On a `sync` connection `queue()` blocks.** The send and the status poll run inside the call:
+> it waits for the final status within the core client's polling bounds, about 60 seconds, and
+> tries the receipt once. Use an asynchronous queue in production (see [Queues](#queues)).
+
+### Receiving
+
+```php
+// routes/console.php
+use Illuminate\Support\Facades\Schedule;
+
+Schedule::command('einvoicing:poll-inbound --transport=ksef')->everyFifteenMinutes()->withoutOverlapping();
+Schedule::command('einvoicing:ksef-deadlines')->hourly();
+```
+
+The poll reads the buyer inbox of the configured NIP from the stored position and records each new
+invoice as an inbound row; the existing jobs fetch, store and acknowledge it, and
+`DocumentReceived` fires once, as for Peppol. The first poll reads the last 30 days.
+
+- **The poll is guarded.** KSeF allows 20 metadata queries per hour per context, and the Ministry
+  of Finance recommends polling a subject no more often than every 15 minutes. A run sooner than
+  `inbound_min_interval_minutes` after the start of the previous one, less a minute of slack for
+  scheduler jitter, is skipped and says so. The start is kept in the default cache store.
+- **Inbound ids** are `<KSeF number>@<storage date>`, so the fetch needs no metadata query; an
+  invoice the stored window lists without metadata keeps its plain KSeF number. Both forms match
+  the same row. When you deduplicate on your side, use
+  `KsefTransport::ksefNumberOf($message->provider_document_id)`.
+- The buyer inbox lists an invoice a few minutes after KSeF accepted it (about two minutes on TE).
+
+### Events
+
+The document events fire for KSeF rows as for Peppol: `DocumentSent` when KSeF accepted the
+invoice for processing, `DocumentDelivered` with the KSeF number, `DocumentFailed`,
+`DocumentUnconfirmed`, and `DocumentReceived` for an inbound invoice. One more:
+
+| Event | When |
+|---|---|
+| `KsefOfflineDeadlineApproaching` | an offline invoice still on its way to KSeF (queued, sending, pending or unconfirmed) must reach KSeF by `$deadline` (`DateTimeImmutable`, the end of the day in Europe/Warsaw), which is within `deadline_warning_hours` or has passed; `$message` is the row. Fired by `einvoicing:ksef-deadlines` on every run while that holds, so remember what you have already notified |
+
+### Offline mode and deadlines
+
+An invoice issued while KSeF cannot be used is queued with `offline: true`; KSeF records it as
+offline, and it must reach KSeF by a deadline. The row gets its offline24 deadline at once (the
+next working day after `P_1`). `einvoicing:ksef-deadlines` lists the offline rows not yet
+delivered or failed, recomputes each deadline with the failures announced in Latarnia, the KSeF
+availability service (a failure moves it to the 7th working day after the failure ends; a total
+failure removes the duty, and the deadline is empty while a failure lasts), stores it on the row
+and fires `KsefOfflineDeadlineApproaching`. When Latarnia cannot be reached, or for DEMO, which has
+none, it computes without outages and says so. Working days skip weekends and the Polish statutory
+holidays (years 2026 to 2099).
+
+**The deadlines are a calculation aid, not legal advice.** Every offline row is taken as an
+offline24 invoice; check the rules of the mode you actually used.
+
+### QR codes
+
+The visualisation of an FA(3) invoice carries KOD I, and an offline invoice also KOD II, signed
+with the Offline certificate. The core builds both links; rendering an image is optional
+(`ChillerlanQrRenderer` needs `chillerlan/php-qrcode` ^5):
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Transport\Ksef\Qr\KsefQrCodes;
+
+$ksef = EInvoicing::ksef();
+$environment = $ksef->settings()->environment;
+
+$kod1 = KsefQrCodes::online($environment, $message->xml, $message->ksef_number);   // ->url, ->label
+
+[$kod1, $kod2] = KsefQrCodes::offline(
+    $environment,
+    $ksef->ksefConfig()->context,
+    $message->xml,
+    $ksef->offlineCertificate(),        // einvoicing.ksef.offline_certificate
+    $message->ksef_number,              // null until KSeF assigns one: caption "OFFLINE"
+);
+```
+
+Use the exact bytes stored on the row: the links carry their hash.
+
+### Doctor
+
+With `einvoicing.ksef` in use, `einvoicing:doctor` adds `ksef` rows: the configuration and
+credentials are read and checked, the certificates must parse and not be expired (an Offline
+certificate expiring within 30 days is a warning), the cursor table must exist, and a transport
+named `ksef` in `einvoicing.transports` is reported as shadowed. **By default it reads the public
+Latarnia status** of the environment, an unauthenticated request with a 5-second timeout; a
+failure is only a warning. KSeF itself is never called, not even with `--live`.
+
+### Limits
+
+- **FA(3) only.** FA_PEF (PEF (3)) invoices can be sent only by Peppol providers and are not
+  supported; batch sending, technical corrections and exports are available on the core client
+  (`EInvoicing::ksef()->transport()`), not through the queue.
+- **One context per application:** `einvoicing.ksef` names one NIP.
+- **Read quota:** 20 metadata queries per hour per context and IP; keep the 15-minute poll.
+- **Online sessions:** the core opens one on the first send of a process and replaces it before it
+  expires; the bridge does not close it. The receipt is fetched while the session is open (as the
+  live run on TE confirms).
+- **The offline deadline helper** treats every offline row as offline24 and knows only the outages
+  Latarnia announces.
+
 ## Queues
 
 Configure the connection and queue name with `einvoicing.queue.connection` and
@@ -698,7 +905,9 @@ configured secret while faked.
 |---|---|
 | `einvoicing:doctor [--live]` | check transports, webhook URLs, validation rules, the installed rule packages, tables, inbound documents at the attempt cap, numeric job settings, the queue driver, `pcntl`, `retry_after` and SQS delays; `--live` also calls each inbox once to check the credentials |
 | `einvoicing:install-rules [--from=DIR]` | install the Peppol BIS Billing validation rules |
-| `einvoicing:poll-inbound [--transport=] [--include-capped]` | record waiting inbound documents and queue their intake; schedule it. `--include-capped` gives each document at `inbound.max_fetch_attempts` one more attempt |
+| `einvoicing:ksef-certificate [--type=offline\|authentication] [--algorithm=ec\|rsa] [--name=] [--certificate=] [--private-key=]` | enrol a KSeF Offline or Authentication certificate and write it with its key (mode 0600); never overwrites, never prints the key |
+| `einvoicing:ksef-deadlines` | list offline KSeF invoices not yet delivered with their deadlines and fire `KsefOfflineDeadlineApproaching`; schedule it hourly |
+| `einvoicing:poll-inbound [--transport=] [--include-capped]` | record waiting inbound documents and queue their intake; schedule it. `--include-capped` gives each document at `inbound.max_fetch_attempts` one more attempt. `--transport=ksef` reads the KSeF inbox, at most once per `einvoicing.ksef.inbound_min_interval_minutes` |
 | `einvoicing:resolve ID (--sent=DOCUMENT-ID \| --resend) [--force]` | resolve an `unconfirmed` send, or queue a document again |
 
 ## What is verified
@@ -710,6 +919,7 @@ configured secret while faked.
 | Recommand driver | Core offline tests with fixtures written from Recommand's published API description; core live group `recommand-live`; bridge live smoke run `RecommandSmokeTest`, which sends an invoice through `EInvoicing::send()` | **Live-tested on the Peppol test network** (2026-11-15: core run and bridge run) |
 | B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference, core live groups `b2brouter-live` and `einvoicebe-live`; manager, config, doctor and webhook routing tested here | **Live-tested against the provider sandbox (simulated network)** (2026-11-15, core) |
 | French flow (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | Core offline contract tests and core live group `b2brouter-france-live`; bridge live smoke run `B2BrouterFranceSmokeTest`: the `Annuaire` binding, a send that reaches `Deposited` and a full payment that reads `Collected` | **Live-tested against the B2Brouter sandbox** (2026-11-18: core run and bridge run, French sandbox account); an accepted Flux 10 deposit is not yet live-tested |
+| Polish KSeF (`EInvoicing::ksef()`, `SendKsefInvoice`, `PollKsefStatus`, KSeF inbox, deadlines, certificate command, doctor row) | Offline feature tests against canned KSeF answers; bridge live run `KsefLiveTest` (group `ksef-live`) on KSeF TE: a queued send on the `sync` connection that ends delivered with its KSeF number and receipt, and the buyer's `einvoicing:poll-inbound --transport=ksef` that fires `DocumentReceived` within 15 metadata queries; the core live group `ksef-live` covers offline sending, KSeF certificates and the QR links | **Live-tested on KSeF TE** (2026-11-22, bridge run); offline deadlines, the certificate command and the doctor row are tested offline here |
 | Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | Verified offline; **B2Brouter webhooks live-tested** (2026-11-18: real signed sandbox deliveries replayed through the bridge); Recommand and e-invoice.be webhooks not live-tested |
 
 The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
@@ -718,7 +928,11 @@ The run results, with dates and commits, are in the core's
 [VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md). Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); only B2Brouter's webhooks were live-tested (2026-11-18, sandbox deliveries replayed through the Laravel bridge).
 
 The default test run of this package makes no network call; the live smoke run is excluded from
-it (groups `recommand-live` and `b2brouter-france-live`, testsuite `Live`). The Recommand run
+it (groups `recommand-live`, `b2brouter-france-live` and `ksef-live`, testsuite `Live`). The KSeF
+run needs no account: it reaches only KSeF TE (`https://api-test.ksef.mf.gov.pl/v2`, every other
+KSeF host is refused), uses random NIPs with self-signed seals written to a temporary directory
+(mode 0600), every request has a timeout, and it does not start between 15:55 and 18:00
+Europe/Warsaw, around TE's daily maintenance. The Recommand run
 refuses unless the key belongs to a Recommand playground on the Peppol test network; the French
 run (`B2BROUTER_API_KEY` and `B2BROUTER_ACCOUNT_ID` of a French B2Brouter account) refuses any key
 but a `test_` key on the sandbox host or a `stag_` key on the staging host.

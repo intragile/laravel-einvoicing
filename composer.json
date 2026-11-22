@@ -1,6 +1,6 @@
 {
     "name": "intragile/laravel-einvoicing",
-    "description": "Laravel bridge for intragile/php-einvoicing: send and receive EN 16931 invoices over Peppol, with configured transports, queued sending under a guarded delivery state machine, inbound documents and signed webhooks (Recommand, B2Brouter, e-invoice.be).",
+    "description": "Laravel bridge for intragile/php-einvoicing: send and receive EN 16931 invoices over Peppol, French e-invoicing through B2Brouter and Polish KSeF FA(3) invoices, with configured transports, queued sending under a guarded delivery state machine, inbound documents, signed webhooks (Recommand, B2Brouter, e-invoice.be) and KSeF offline deadlines.",
     "keywords": [
         "laravel",
         "e-invoicing",
@@ -11,7 +11,12 @@
         "recommand",
         "b2brouter",
         "webhook",
-        "queue"
+        "queue",
+        "france",
+        "ksef",
+        "fa3",
+        "poland",
+        "e-faktura"
     ],
     "type": "library",
     "license": "MIT",
@@ -34,7 +39,7 @@
         "intragile/einvoicing-rules-en16931": "^1.0",
         "intragile/einvoicing-rules-facturx": "^1.0",
         "intragile/einvoicing-rules-xrechnung": "^1.0",
-        "intragile/php-einvoicing": "^1.1",
+        "intragile/php-einvoicing": "^1.2",
         "laravel/framework": "^12.71|^13.0"
     },
     "require-dev": {

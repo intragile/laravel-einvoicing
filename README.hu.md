@@ -8,8 +8,8 @@ Fejlesztő és karbantartó: [IntrAgile Kft.](https://intragile.eu)
 [![License](https://img.shields.io/packagist/l/intragile/laravel-einvoicing.svg)](LICENSE)
 
 Laravel-integráció az [`intragile/php-einvoicing`](https://github.com/intragile/php-einvoicing)
-csomaghoz: EN 16931 szerinti számlák küldése és fogadása **Peppol** hálózaton, Laravel
-alkalmazásból.
+csomaghoz: EN 16931 szerinti számlák küldése és fogadása **Peppol** hálózaton, francia
+e-számlázás a B2Brouteren át és lengyel **KSeF** FA(3) számlák, Laravel alkalmazásból.
 
 [English documentation → README.md](README.md)
 
@@ -32,6 +32,9 @@ alkalmazásból.
   és csak ezután nyugtázás az access pointnál.
 - **Aláírt webhookok**, pontosan a beérkezett kérésen ellenőrizve, a `web` middleware-csoport
   nélkül.
+- **Lengyel KSeF:** sorba állított FA(3) küldés a KSeF-szám és a nyugta tárolásával,
+  postafiók-lekérdezés a KSeF olvasási keretein belül, offline határidők és KSeF-tanúsítványok;
+  lásd: [Lengyel KSeF](#lengyel-ksef).
 - `EInvoicing::fake()` a saját tesztekhez, `einvoicing:doctor` a telepítés ellenőrzéséhez.
 
 > **Éles tesztelés driverenként.** A Recommandot a Peppol teszthálózaton teszteltük élesben, e
@@ -82,7 +85,7 @@ leírása tartalmazza (angolul).
 composer require intragile/laravel-einvoicing
 php artisan vendor:publish --tag=einvoicing-config     # opcionális: config/einvoicing.php
 php artisan einvoicing:install-rules                   # a Peppol BIS validációs szabályok
-php artisan migrate                                    # két tábla: einvoicing_outbound_documents, einvoicing_inbound_documents
+php artisan migrate                                    # einvoicing_outbound_documents, einvoicing_inbound_documents, einvoicing_ksef_cursors
 php artisan einvoicing:doctor                          # mindent ellenőriz, ami alább szerepel
 ```
 
@@ -92,7 +95,7 @@ php artisan einvoicing:doctor                          # mindent ellenőriz, ami
 >
 > ```json
 > "repositories": [
->     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.1.0" } } },
+>     { "type": "path", "url": "../php-einvoicing", "options": { "versions": { "intragile/php-einvoicing": "1.2.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-en16931", "options": { "versions": { "intragile/einvoicing-rules-en16931": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-xrechnung", "options": { "versions": { "intragile/einvoicing-rules-xrechnung": "1.0.0" } } },
 >     { "type": "path", "url": "../php-einvoicing/packages/rules-facturx", "options": { "versions": { "intragile/einvoicing-rules-facturx": "1.0.0" } } },
@@ -103,7 +106,7 @@ php artisan einvoicing:doctor                          # mindent ellenőriz, ami
 > majd kérd be így: `"intragile/laravel-einvoicing": "^1.0"`. A `versions` beállítás minden path
 > csomagnak azt a verziót adja, amelyet a csomagok egymás közötti feltételei várnak.
 
-A migrációt a csomag maga tölti be. Ha saját példányt szeretnél belőle az alkalmazásban:
+A migrációkat a csomag maga tölti be. Ha saját példányt szeretnél belőlük az alkalmazásban:
 `php artisan vendor:publish --tag=einvoicing-migrations`.
 
 Az `einvoicing:install-rules` letölti a rögzített verziójú Peppol BIS Billing forrásokat, és a
@@ -590,6 +593,217 @@ Amikor egy rögzített fizetés `paid` állapotba viszi a számlát, a B2Brouter
 sort is kiír: a transportnak érvényes B2Brouter transportnak kell lennie, és a sor megmondja, hogy
 a kulcsa sandbox (`test_`), staging (`stag_`) vagy éles kulcs. Kérést nem küld.
 
+## Lengyel KSeF
+
+Az `EInvoicing::ksef()` FA(3) számlákat küld a KSeF-be, a lengyel nemzeti e-számlázási rendszerbe
+(KSeF API 2.0), queue-n keresztül, az `einvoicing:poll-inbound --transport=ksef` pedig fogadja a
+neked kiállított számlákat. A sorok, állapotok és események ugyanazok, mint Peppolnál. Az
+`intragile/php-einvoicing` 1.2-es vagy újabb verziója kell hozzá. A core
+[POLAND.md](https://github.com/intragile/php-einvoicing/blob/main/docs/countries/POLAND.md)
+leírása (angolul) részletesen bemutatja az FA(3) modellt, a KSeF klienst és a korlátait.
+
+> **Élesben tesztelve a KSeF TE tesztkörnyezetben, e csomagon keresztül:** egy sorba állított
+> küldés, amely KSeF-számmal és nyugtával (UPO) `delivered` állapotba jut, és a vevő
+> postafiók-lekérdezése, amely `DocumentReceived` eseményt vált ki (2026-11-22, PHP 8.4 és 8.5).
+> Az offline számlák, a határidők, a tanúsítványparancs és a doctor sora itt offline tesztelt; az
+> offline küldést, a KSeF-tanúsítványokat és a QR-linkeket a core teszteli élesben a TE-n.
+
+### Beállítás és hozzáférési adatok
+
+```bash
+KSEF_ENVIRONMENT=test                   # test (TE), demo vagy production; production csak ha beállítod
+KSEF_NIP=5265877635                     # a kontextus, amelyre a kliens hitelesít
+KSEF_CERTIFICATE_PATH=/run/secrets/ksef-seal.crt.pem
+KSEF_PRIVATE_KEY_PATH=/run/secrets/ksef-seal.key.pem
+# KSEF_PRIVATE_KEY_PASSPHRASE=...       # titkosított kulcshoz
+# KSEF_TOKEN=...                        # tanúsítvány helyett: KSeF token
+# KSEF_OFFLINE_CERTIFICATE_PATH=/run/secrets/ksef-offline.crt.pem
+# KSEF_OFFLINE_PRIVATE_KEY_PATH=/run/secrets/ksef-offline.key.pem
+# KSEF_OFFLINE_PRIVATE_KEY_PASSPHRASE=...
+```
+
+Ezek a `config/einvoicing.php` `einvoicing.ksef` kulcsát töltik ki:
+
+| Beállítás | Alapérték | Jelentés |
+|---|---|---|
+| `environment` | `test` | `test`, `demo` vagy `production`; production csak akkor, ha beállítod |
+| `nip` | — | a kontextus tízjegyű NIP-je, ellenőrző számjeggyel ellenőrizve |
+| `credentials` | — | `certificate` és `private_key` (fájlútvonalak) opcionális `passphrase`-zel, **vagy** `token`; a kettő együtt nem |
+| `offline_certificate` | — | a KSeF Offline tanúsítvány `certificate` és `private_key` útvonala és `passphrase`-e, amely az offline számlák KOD II-jét aláírja; ha nem használod, hagyd üresen |
+| `max_response_bytes` | 67 108 864 | a memóriába olvasott KSeF-válaszok felső határa; legalább 52 428 816, a legnagyobb titkosított exportrész |
+| `inbound_min_interval_minutes` | 15 | a legrövidebb idő két postafiók-lekérdezés között (0–1440; 0 kikapcsolja a védelmet) |
+| `deadline_warning_hours` | 24 | milyen közel kell lennie egy offline határidőnek a `KsefOfflineDeadlineApproaching` eseményhez (1–720) |
+
+- **A tanúsítványt és a privát kulcsot fájlból olvassuk**, sosem környezeti változóból; a
+  kulcsfájlokat csak az alkalmazás felhasználója olvashassa. Minősített bélyegző vagy aláírás is
+  jó, és KSeF Authentication tanúsítvány is. A titkosított kulcs jelszava környezeti változóból
+  jön.
+- **A KSeF token környezeti változóból jön** (`KSEF_TOKEN`), ahogy más szolgáltatók API-kulcsai.
+  A KSeF csak tanúsítvánnyal hitelesített kontextusnak állít ki tanúsítványt, ezért az
+  `einvoicing:ksef-certificate` tanúsítványos hozzáférést igényel.
+- A hibaüzenetek a beállítást és a fájl útvonalát nevezik meg, sosem a fájl tartalmát, a jelszót
+  vagy a tokent. A KSeF klienst az első használatkor építjük fel, és a folyamat élettartamára
+  gyorsítótárazzuk: konfigurációváltozás után indítsd újra a queue workereket és az Octane-t. Az
+  `EInvoicing::fake()` nem helyettesíti.
+- A `php artisan migrate` hozzáadja a `ksef_number`, `invoicing_mode`, `offline_deadline` és `upo`
+  oszlopot az `einvoicing_outbound_documents` táblához, és létrehozza az `einvoicing_ksef_cursors`
+  táblát, amely a postafiók pozícióját tárolja (`DatabaseKsefCursorStore`; ha máshol tartanád,
+  bindold a saját `Transport\Ksef\Inbound\KsefCursorStore` implementációdat).
+
+### KSeF-tanúsítványok
+
+```bash
+php artisan einvoicing:ksef-certificate                         # Offline tanúsítvány, EC P-256
+php artisan einvoicing:ksef-certificate --type=authentication --algorithm=rsa --name="Billing"
+```
+
+A parancs tanúsítványt igényel a beállított kontextusra, és a tanúsítványt meg a privát kulcsát
+0600-as jogosultsággal a beállított útvonalakra írja: Offline tanúsítványnál az
+`offline_certificate`, Authentication tanúsítványnál a `credentials` útvonalaira (a
+`--certificate=` és a `--private-key=` más útvonalat ad meg). Az útvonalakat az igénylés előtt
+ellenőrzi, és létező fájlt nem ír felül. A kulcs helyben készül, kiírásig csak a memóriában van, és
+sosem jelenik meg a kimeneten; ha a típushoz jelszó van beállítva, titkosítva írja ki. A KSeF
+alanyonként 100 tanúsítványt enged.
+
+### Küldés
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+
+$message = EInvoicing::ksef()->queue($invoice);                    // Invoice vagy FA(3) fájl
+$message = EInvoicing::ksef()->queue($fa3Xml, offline: true);       // offline módban kiállítva
+$message = EInvoicing::ksef()->queue($invoice, reference: 'FV/2026/11/0042');
+```
+
+A `queue()` a pontos bájtokat az `einvoicing_outbound_documents` táblába írja (`transport` és
+`process` `ksef`, `document_type` `FA (3)`, `sender` az eladó NIP-je, `receiver` a vevő), és a
+nyitott tranzakció commitja után elindítja a `SendKsefInvoice` jobot. A job az FA(3) séma szerint
+validálja a számlát, elküldi, és elindítja a `PollKsefStatus` jobot, amely a `status.delays` és a
+`status.max_attempts` szerint fut:
+
+- **200-as státusz:** a sor `delivered` lesz a `ksef_number`-rel és a KSeF által jelzett
+  `invoicing_mode`-dal (`Online` vagy `Offline`; a mai napnál korábbi keltű online küldést a KSeF
+  offline-nak minősíti), majd a nyugta az `upo` oszlopba kerül. Ha a KSeF még nem állította ki,
+  egy későbbi futás tölti le.
+- **Elutasítás:** a sor a KSeF kódjával és üzenetével `failed` lesz, és `DocumentFailed` esemény
+  fut.
+- **Az ismeretlen kimenetelű küldést megismételjük**, a Peppoltól eltérően: a második példányt a
+  KSeF duplikátumként jelzi, így kétszer nem fogadhatja be.
+- **Duplikátumok (440-es státusz).** A KSeF akkor jelez duplikátumot, ha azonos eladói NIP-pel,
+  számlatípussal és számlaszámmal (`P_2`) már befogadott egy számlát, a tartalmától függetlenül. A
+  sor csak akkor lesz **delivered** az eredeti KSeF-számmal, ha az eredeti nyugtája igazolja, hogy
+  az eredeti pontosan ez a fájl (azonos dokumentum-hash); ilyenkor a `provider_code` `440`, és az
+  eredeti nyugtáját tároljuk. Ha az eredeti egy másik fájl, a sor `duplicate` kategóriával
+  **failed** lesz. Ha nem dönthető el (a nyugtát elutasítják vagy még nincs kiállítva), a következő
+  futás újra megkérdezi, az utolsó futás után pedig a sor **unconfirmed** lesz, operátori döntésre
+  (`einvoicing:resolve`). Találgatásra sosem lesz delivered.
+
+> **`sync` kapcsolaton a `queue()` blokkol.** A küldés és a státuszlekérdezés a hívásban fut: a
+> core kliens lekérdezési korlátján belül, nagyjából 60 másodpercig vár a végleges státuszra, és
+> egyszer megpróbálja letölteni a nyugtát. Élesben aszinkron queue-t használj (lásd:
+> [Queue](#queue)).
+
+### Fogadás
+
+```php
+// routes/console.php
+use Illuminate\Support\Facades\Schedule;
+
+Schedule::command('einvoicing:poll-inbound --transport=ksef')->everyFifteenMinutes()->withoutOverlapping();
+Schedule::command('einvoicing:ksef-deadlines')->hourly();
+```
+
+A lekérdezés a beállított NIP vevői postafiókját olvassa a tárolt pozíciótól, és minden új számlát
+bejövő sorként rögzít; a meglévő jobok letöltik, tárolják és nyugtázzák, a `DocumentReceived`
+pedig egyszer fut le, ahogy Peppolnál. Az első lekérdezés az utolsó 30 napot olvassa.
+
+- **A lekérdezés védett.** A KSeF kontextusonként óránként 20 metaadat-lekérdezést enged, és a
+  Pénzügyminisztérium azt ajánlja, hogy egy alanyt legfeljebb 15 percenként kérdezz le. Ha egy
+  futás az előző indulása után az `inbound_min_interval_minutes`-nél hamarabb indul (egy perc
+  türelmet hagyva az ütemező pontatlanságára), kihagyjuk, és ezt ki is írjuk. Az indulás idejét az
+  alapértelmezett cache store tárolja.
+- **A bejövő azonosítók** `<KSeF-szám>@<tárolási dátum>` alakúak, így a letöltéshez nem kell
+  metaadat-lekérdezés; az a számla, amelyet a tárolt ablak metaadat nélkül sorol fel, a sima
+  KSeF-számát kapja. Mindkét alak ugyanahhoz a sorhoz tartozik. Ha a saját oldaladon szűröd a
+  duplikátumokat, a `KsefTransport::ksefNumberOf($message->provider_document_id)` értékét használd.
+- A vevői postafiók néhány perccel a befogadás után listázza a számlát (a TE-n kb. két perccel).
+
+### Események
+
+A dokumentumesemények a KSeF-soroknál ugyanúgy futnak, mint Peppolnál: `DocumentSent`, amikor a
+KSeF feldolgozásra befogadta a számlát, `DocumentDelivered` a KSeF-számmal, `DocumentFailed`,
+`DocumentUnconfirmed`, és `DocumentReceived` a bejövő számlánál. Egy új esemény is van:
+
+| Esemény | Mikor |
+|---|---|
+| `KsefOfflineDeadlineApproaching` | egy még úton lévő offline számlának (queued, sending, pending vagy unconfirmed) a `$deadline`-ig (`DateTimeImmutable`, a nap vége Europe/Warsaw időben) el kell jutnia a KSeF-be, és ez a határidő a `deadline_warning_hours`-on belül van vagy már elmúlt; a `$message` a sor. Az `einvoicing:ksef-deadlines` minden futáskor kiváltja, amíg ez fennáll, ezért jegyezd meg, miről értesítettél már |
+
+### Offline mód és határidők
+
+Az olyankor kiállított számlát, amikor a KSeF nem használható, `offline: true` paraméterrel állítsd
+sorba; a KSeF offline-ként rögzíti, és egy határidőig el kell jutnia hozzá. A sor azonnal megkapja
+az offline24 határidejét (a `P_1` utáni első munkanap). Az `einvoicing:ksef-deadlines` felsorolja a
+még nem delivered és nem failed offline sorokat, a Latarnia (a KSeF elérhetőségi szolgáltatása)
+által bejelentett üzemzavarokkal újraszámolja a határidőket (egy üzemzavar a vége utáni 7.
+munkanapra tolja; teljes üzemzavar megszünteti a kötelezettséget, és amíg egy üzemzavar tart, a
+határidő üres), a sorra írja, és kiváltja a `KsefOfflineDeadlineApproaching` eseményt. Ha a
+Latarnia nem érhető el, vagy DEMO környezetben, amelyhez nincs Latarnia, üzemzavarok nélkül számol,
+és ezt jelzi. A munkanapok a hétvégéket és a lengyel törvényes ünnepnapokat hagyják ki (2026 és
+2099 között).
+
+**A határidők számítási segédletek, nem jogi tanácsadás.** Minden offline sort offline24
+számlaként kezelünk; a ténylegesen használt mód szabályait ellenőrizd.
+
+### QR-kódok
+
+Az FA(3) számla vizualizációján KOD I szerepel, offline számlán az Offline tanúsítvánnyal aláírt
+KOD II is. Mindkét linket a core állítja elő; képként kirajzolni opcionális (a
+`ChillerlanQrRenderer`-hez a `chillerlan/php-qrcode` ^5 kell):
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Transport\Ksef\Qr\KsefQrCodes;
+
+$ksef = EInvoicing::ksef();
+$environment = $ksef->settings()->environment;
+
+$kod1 = KsefQrCodes::online($environment, $message->xml, $message->ksef_number);   // ->url, ->label
+
+[$kod1, $kod2] = KsefQrCodes::offline(
+    $environment,
+    $ksef->ksefConfig()->context,
+    $message->xml,
+    $ksef->offlineCertificate(),        // einvoicing.ksef.offline_certificate
+    $message->ksef_number,              // null, amíg a KSeF nem ad számot: "OFFLINE" felirat
+);
+```
+
+A soron tárolt pontos bájtokat használd: a linkek ezek hash-ét tartalmazzák.
+
+### Doctor
+
+Ha az `einvoicing.ksef` használatban van, az `einvoicing:doctor` `ksef` sorokkal bővül: beolvassa
+és ellenőrzi a beállításokat és a hozzáférési adatokat, a tanúsítványoknak olvashatónak és
+érvényesnek kell lenniük (a 30 napon belül lejáró Offline tanúsítvány figyelmeztetés), a
+kurzortáblának léteznie kell, és az `einvoicing.transports` alatti `ksef` nevű transportot
+eltakartként jelzi. **Alapból lekérdezi a környezet nyilvános Latarnia-állapotát**, hitelesítés
+nélküli kéréssel, 5 másodperces időkorláttal; a hiba csak figyelmeztetés. Magát a KSeF-et sosem
+hívja, `--live` mellett sem.
+
+### Korlátok
+
+- **Csak FA(3).** FA_PEF (PEF (3)) számlát csak Peppol-szolgáltató küldhet, ezt nem támogatjuk; a
+  kötegelt küldés, a technikai javítás és az export a core kliensen érhető el
+  (`EInvoicing::ksef()->transport()`), a queue-n keresztül nem.
+- **Alkalmazásonként egy kontextus:** az `einvoicing.ksef` egy NIP-et nevez meg.
+- **Olvasási keret:** kontextusonként és IP-címenként óránként 20 metaadat-lekérdezés; tartsd meg a
+  15 perces lekérdezést.
+- **Online munkamenetek:** a core egy folyamat első küldésekor nyit egyet, és lejárat előtt
+  lecseréli; a híd nem zárja le. A nyugtát nyitott munkamenet mellett töltjük le (ezt a TE-n
+  végzett éles futtatás megerősíti).
+- **Az offline határidő-segéd** minden offline sort offline24-ként kezel, és csak a Latarnia
+  által bejelentett üzemzavarokról tud.
+
 ## Queue
 
 A kapcsolatot és a queue nevét az `einvoicing.queue.connection` és az `einvoicing.queue.name`
@@ -728,7 +942,9 @@ fake módban is a beállított kulccsal ellenőrzi.
 |---|---|
 | `einvoicing:doctor [--live]` | ellenőrzi a transportokat, a webhook-URL-eket, a validációs szabályokat, a telepített szabálycsomagokat, a táblákat, a kísérleti keretet elhasznált bejövő dokumentumokat, a számértékű job-beállításokat, a queue drivert, a `pcntl`-t, a `retry_after`-t és az SQS-késleltetéseket; `--live` mellett minden inboxot egyszer meghív a hozzáférési adatok ellenőrzéséhez |
 | `einvoicing:install-rules [--from=DIR]` | telepíti a Peppol BIS Billing validációs szabályokat |
-| `einvoicing:poll-inbound [--transport=] [--include-capped]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd. A `--include-capped` minden, az `inbound.max_fetch_attempts` keretet elhasznált dokumentumnak még egy kísérletet ad |
+| `einvoicing:ksef-certificate [--type=offline\|authentication] [--algorithm=ec\|rsa] [--name=] [--certificate=] [--private-key=]` | KSeF Offline vagy Authentication tanúsítványt igényel, és a kulcsával együtt kiírja (0600); sosem ír felül, a kulcsot sosem írja ki |
+| `einvoicing:ksef-deadlines` | felsorolja a még nem kézbesített offline KSeF-számlákat a határidejükkel, és kiváltja a `KsefOfflineDeadlineApproaching` eseményt; óránként ütemezd |
+| `einvoicing:poll-inbound [--transport=] [--include-capped]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd. A `--include-capped` minden, az `inbound.max_fetch_attempts` keretet elhasznált dokumentumnak még egy kísérletet ad. A `--transport=ksef` a KSeF postafiókot olvassa, legfeljebb `einvoicing.ksef.inbound_min_interval_minutes` percenként egyszer |
 | `einvoicing:resolve ID (--sent=DOKUMENTUM-ID \| --resend) [--force]` | rendez egy `unconfirmed` küldést, vagy újra sorba állít egy dokumentumot |
 
 ## Mi van ellenőrizve
@@ -740,6 +956,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel; a core `recommand-live` éles csoportja; a híd `RecommandSmokeTest` éles futtatása, amely számlát küld az `EInvoicing::send()`-del | **Élesben tesztelve a Peppol teszthálózaton** (2026-11-15: core- és hídfuttatás) |
 | B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel, a core `b2brouter-live` és `einvoicebe-live` éles csoportjai; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat)** (2026-11-15, core) |
 | Francia folyamat (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | A core offline szerződéstesztjei és `b2brouter-france-live` éles csoportja; a híd `B2BrouterFranceSmokeTest` éles futtatása: az `Annuaire` binding, egy küldés `Deposited` állapotig és egy teljes fizetés, amely `Collected`-ként olvasható vissza | **Élesben tesztelve a B2Brouter sandbox ellen** (2026-11-18: core- és hídfuttatás, francia sandboxfiók); az elfogadott Flux 10 beküldést még nem teszteltük élesben |
+| Lengyel KSeF (`EInvoicing::ksef()`, `SendKsefInvoice`, `PollKsefStatus`, KSeF postafiók, határidők, tanúsítványparancs, doctor sor) | Offline feature tesztek előre rögzített KSeF-válaszokkal; a híd `KsefLiveTest` éles futtatása (`ksef-live` csoport) a KSeF TE-n: egy `sync` kapcsolaton sorba állított küldés, amely KSeF-számmal és nyugtával `delivered` lesz, és a vevő `einvoicing:poll-inbound --transport=ksef` futása, amely legfeljebb 15 metaadat-lekérdezéssel `DocumentReceived` eseményt vált ki; a core `ksef-live` éles csoportja lefedi az offline küldést, a KSeF-tanúsítványokat és a QR-linkeket | **Élesben tesztelve a KSeF TE-n** (2026-11-22, hídfuttatás); az offline határidők, a tanúsítványparancs és a doctor sor itt offline tesztelt |
 | Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | Offline ellenőrizve; **a B2Brouter webhookjait élesben teszteltük** (2026-11-18: valódi, aláírt sandbox-kézbesítések a hídon visszajátszva); a Recommand és az e-invoice.be webhookjait nem |
 
 A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
@@ -748,7 +965,11 @@ A futtatások eredménye dátummal és commitokkal a core
 [VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md) fájljában van (angolul). A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); élesben csak a B2Brouter webhookjait teszteltük (2026-11-18, sandbox-kézbesítések a Laravel hídon visszajátszva).
 
 A csomag alapértelmezett tesztfuttatása nem használ hálózatot; az éles smoke-futtatás ki van
-zárva belőle (`recommand-live` és `b2brouter-france-live` csoport, `Live` testsuite). A Recommand
+zárva belőle (`recommand-live`, `b2brouter-france-live` és `ksef-live` csoport, `Live` testsuite).
+A KSeF futtatáshoz nem kell fiók: csak a KSeF TE-t éri el (`https://api-test.ksef.mf.gov.pl/v2`,
+minden más KSeF hostot elutasít), véletlen NIP-eket használ önaláírt bélyegzőkkel, amelyeket
+ideiglenes könyvtárba ír (0600), minden kérésnek van időkorlátja, és 15:55 és 18:00 (Europe/Warsaw)
+között, a TE napi karbantartása körül nem indul. A Recommand
 futtatás csak akkor indul, ha a kulcs a Peppol teszthálózaton lévő Recommand playgroundhoz
 tartozik; a francia futtatás (egy francia B2Brouter-fiók `B2BROUTER_API_KEY` és
 `B2BROUTER_ACCOUNT_ID` értékével) csak sandbox hoston `test_`, staging hoston `stag_` kulccsal

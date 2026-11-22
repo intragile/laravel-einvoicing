@@ -25,6 +25,12 @@ use InvalidArgumentException;
  * A KSeF invoice may be listed as "<KSeF number>@<date>" or as its plain KSeF number; both forms
  * match the same row, which keeps the id it was first recorded with (the fetch needs the full id
  * to skip a metadata query).
+ *
+ * The unique key covers the exact id only, so two processes recording the same KSeF invoice at the
+ * same moment, one with each form, can both insert, leaving two rows for one invoice, each of
+ * which can be fetched and announced with its own DocumentReceived. This needs concurrent intakes (overlapping
+ * polls) and a window that lists the invoice without metadata, so it is rare; consumers that must
+ * never handle an invoice twice deduplicate by KsefTransport::ksefNumberOf().
  */
 final class InboundRecorder
 {
