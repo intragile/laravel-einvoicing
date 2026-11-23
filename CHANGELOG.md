@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+1.2.0 adds French e-invoicing through B2Brouter and Polish KSeF, on top of
+`intragile/php-einvoicing` 1.2. There is no 1.1.0. KSeF is live-verified on KSeF TE (API 2.10 RC);
+DEMO and PRODUCTION are not verified.
+
 ### Added
 
 - **French e-invoicing (B2Brouter):** `EInvoicing::france(?string $transport = null)` returns the

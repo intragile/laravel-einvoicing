@@ -13,7 +13,7 @@ e-számlázás a B2Brouteren át és lengyel **KSeF** FA(3) számlák, Laravel a
 
 [English documentation → README.md](README.md)
 
-> **Állapot:** 1.0.0-s verzió, kiadva 2026-11-16-án. Mit és hogyan ellenőriztünk:
+> **Állapot:** 1.2.0-s verzió, kiadva 2026-11-23-án. Mit és hogyan ellenőriztünk:
 > [Mi van ellenőrizve](#mi-van-ellenőrizve) és [docs/VERIFICATION.md](docs/VERIFICATION.md) (angolul).
 
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
