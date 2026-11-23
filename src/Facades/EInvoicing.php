@@ -19,6 +19,7 @@ use LogicException;
  * @method static \IntrAgile\EInvoicing\Laravel\Models\OutboundMessage send(\IntrAgile\EInvoicing\Transport\OutboundDocument|\IntrAgile\EInvoicing\Model\Invoice|string $document, ?string $reference = null, ?string $transport = null)
  * @method static \IntrAgile\EInvoicing\Transport\InboundSource inbound(?string $name = null)
  * @method static \IntrAgile\EInvoicing\Laravel\Ksef\KsefManager ksef()
+ * @method static \IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager verifactu()
  * @method static \IntrAgile\EInvoicing\Transport\Webhook\WebhookParser webhook(string $name)
  * @method static string|null accountId(string $name)
  * @method static void extend(string $driver, \Closure $factory)

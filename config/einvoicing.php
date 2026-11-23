@@ -258,4 +258,89 @@ return [
         'middleware' => [],
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Spain: VERI*FACTU
+    |--------------------------------------------------------------------------
+    |
+    | Billing records for the Spanish tax authority (AEAT), kept in one hash
+    | chain per issuer, installation and environment. "environment" is "test"
+    | (pre-production) or "production"; production is never chosen unless it is
+    | set here. "driver" is "aeat" (direct submission with the issuer's
+    | certificate) or "b2brouter".
+    |
+    | "system" declares the billing software that produces the records
+    | (SistemaInformatico). Every value is required and none has a default: the
+    | producer of the installation declares itself. Give either "nif" or
+    | "foreign_id" (type, id, country), not both. Nothing here makes the library
+    | a certified billing system.
+    |
+    | "issuers" maps each obligated issuer's NIF to its "name" and, optionally,
+    | its own "driver", "representative" (name, nif) and "aeat" override of the
+    | credentials below. VERIFACTU_ISSUER_NIF and VERIFACTU_ISSUER_NAME fill a
+    | single issuer. "aeat.certificate" is a PKCS#12 file, or a PEM file with
+    | "private_key"; "port" is "personal" or "seal" and picks the AEAT host.
+    | "ca_bundle" null uses the CA bundle of the OpenSSL extension. "timeout"
+    | and "connect_timeout" are in seconds.
+    |
+    | "schemas_dir" is where einvoicing:verifactu-install-schemas puts the AEAT
+    | schemas (null: storage/einvoicing/verifactu).
+    |
+    | "submission" shapes the queue and the send throttle: "max_batch" (1 to
+    | 1000) records per request, "initial_wait" seconds between sends until the
+    | AEAT answers with its own wait, and "throttle_scope" ("installation" or
+    | "issuer"). "cross_check" is "strict" or "report" for B2Brouter results;
+    | records not settled after "stuck_after_minutes" are reported as stuck.
+    |
+    */
+
+    'verifactu' => [
+        'environment' => env('VERIFACTU_ENVIRONMENT', 'test'),
+        'driver' => env('VERIFACTU_DRIVER', 'aeat'),
+        'timezone' => 'Europe/Madrid',
+        'schemas_dir' => env('VERIFACTU_SCHEMAS_DIR'),
+        'system' => [
+            'name' => env('VERIFACTU_PRODUCER_NAME'),
+            'nif' => env('VERIFACTU_PRODUCER_NIF'),
+            'foreign_id' => [
+                'type' => null,
+                'id' => null,
+                'country' => null,
+            ],
+            'system_name' => env('VERIFACTU_SYSTEM_NAME'),
+            'system_id' => env('VERIFACTU_SYSTEM_ID'),
+            'version' => env('VERIFACTU_SYSTEM_VERSION'),
+            'installation_number' => env('VERIFACTU_INSTALLATION_NUMBER'),
+            'verifactu_only' => env('VERIFACTU_SYSTEM_VERIFACTU_ONLY'),
+            'multiple_taxpayers_possible' => env('VERIFACTU_SYSTEM_MULTIPLE_TAXPAYERS_POSSIBLE'),
+            'multiple_taxpayers_indicator' => env('VERIFACTU_SYSTEM_MULTIPLE_TAXPAYERS_INDICATOR'),
+        ],
+        'issuers' => env('VERIFACTU_ISSUER_NIF') !== null && env('VERIFACTU_ISSUER_NIF') !== ''
+            ? [(string) env('VERIFACTU_ISSUER_NIF') => ['name' => env('VERIFACTU_ISSUER_NAME')]]
+            : [],
+        'aeat' => [
+            'certificate' => env('VERIFACTU_AEAT_CERTIFICATE'),
+            'password' => env('VERIFACTU_AEAT_PASSWORD'),
+            'private_key' => env('VERIFACTU_AEAT_PRIVATE_KEY'),
+            'port' => 'personal',
+            'ca_bundle' => env('VERIFACTU_CA_BUNDLE'),
+            'timeout' => 30,
+            'connect_timeout' => 10,
+        ],
+        'b2brouter' => [
+            'transport' => env('VERIFACTU_B2BROUTER_TRANSPORT'),
+            'poll_attempts' => 10,
+            'poll_delay' => 30,
+        ],
+        'submission' => [
+            'queue' => null,
+            'connection' => null,
+            'max_batch' => 1000,
+            'initial_wait' => 60,
+            'throttle_scope' => 'installation',
+        ],
+        'cross_check' => 'strict',
+        'stuck_after_minutes' => 60,
+    ],
+
 ];

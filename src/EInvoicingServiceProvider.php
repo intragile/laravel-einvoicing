@@ -13,10 +13,14 @@ use IntrAgile\EInvoicing\Laravel\Console\KsefCertificateCommand;
 use IntrAgile\EInvoicing\Laravel\Console\KsefDeadlinesCommand;
 use IntrAgile\EInvoicing\Laravel\Console\PollInboundCommand;
 use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuInstallSchemasCommand;
 use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Ksef\DatabaseKsefCursorStore;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
+use IntrAgile\EInvoicing\Laravel\Verifactu\ConfigIssuerResolver;
+use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
+use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuIssuerResolver;
 use IntrAgile\EInvoicing\Transport\Ksef\Inbound\KsefCursorStore;
 
 final class EInvoicingServiceProvider extends ServiceProvider
@@ -37,6 +41,9 @@ final class EInvoicingServiceProvider extends ServiceProvider
         $this->app->alias(EInvoicingManager::class, 'einvoicing');
         $this->app->singleton(FranceManager::class, fn (Application $app): FranceManager => new FranceManager($app));
         $this->app->singleton(KsefManager::class, fn (Application $app): KsefManager => new KsefManager($app));
+        $this->app->singleton(VerifactuManager::class, fn (Application $app): VerifactuManager => new VerifactuManager($app));
+        // An application may bind its own issuer resolver; the configuration resolver is the default.
+        $this->app->bindIf(VerifactuIssuerResolver::class, fn (Application $app): VerifactuIssuerResolver => new ConfigIssuerResolver($app->make('config')), true);
         // An application may bind its own store; the database store is the default.
         $this->app->bindIf(KsefCursorStore::class, fn (Application $app): KsefCursorStore => new DatabaseKsefCursorStore($app->make('db')->connection()));
     }
@@ -60,7 +67,7 @@ final class EInvoicingServiceProvider extends ServiceProvider
         }
 
         if ($this->app->runningInConsole()) {
-            $this->commands([DoctorCommand::class, InstallRulesCommand::class, KsefCertificateCommand::class, KsefDeadlinesCommand::class, PollInboundCommand::class, ResolveCommand::class]);
+            $this->commands([DoctorCommand::class, InstallRulesCommand::class, KsefCertificateCommand::class, KsefDeadlinesCommand::class, PollInboundCommand::class, ResolveCommand::class, VerifactuInstallSchemasCommand::class]);
             $this->publishes([self::CONFIG => $this->app->configPath('einvoicing.php')], 'einvoicing-config');
             $now = time();
             $this->publishes([

@@ -19,6 +19,7 @@ use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
+use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
 use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterTransport;
@@ -222,6 +223,15 @@ final class EInvoicingManager
     public function ksef(): KsefManager
     {
         return ($this->app)()->make(KsefManager::class);
+    }
+
+    /**
+     * The VERI*FACTU manager of einvoicing.verifactu: the settings, the issuer resolver and the
+     * installed AEAT schemas.
+     */
+    public function verifactu(): VerifactuManager
+    {
+        return ($this->app)()->make(VerifactuManager::class);
     }
 
     /**

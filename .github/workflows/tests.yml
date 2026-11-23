@@ -29,7 +29,11 @@ jobs:
       - run: composer validate --strict
       - run: composer require "laravel/framework:${{ matrix.laravel }}" --no-update --no-interaction
       - run: composer update --prefer-dist --no-interaction --no-progress
+      - run: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
       - run: vendor/bin/phpunit
+      - run: vendor/bin/phpunit --group verifactu-official --fail-on-skipped
+        env:
+          EINVOICING_VERIFACTU_SCHEMAS: build/verifactu
       - run: vendor/bin/phpstan analyse --memory-limit=1G
       - run: vendor/bin/pint --test
 
@@ -48,7 +52,11 @@ jobs:
           coverage: none
       - run: composer require "laravel/framework:12.*" --no-update --no-interaction
       - run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-interaction --no-progress
+      - run: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
       - run: vendor/bin/phpunit
+      - run: vendor/bin/phpunit --group verifactu-official --fail-on-skipped
+        env:
+          EINVOICING_VERIFACTU_SCHEMAS: build/verifactu
 
   next-versions:
     # Early warning against the next PHP release and the next Laravel major,
@@ -98,4 +106,8 @@ jobs:
             file_put_contents("composer.json", json_encode($c, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
           '
       - run: composer update --prefer-dist --no-interaction --no-progress --ignore-platform-req=php+
+      - run: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
       - run: vendor/bin/phpunit
+      - run: vendor/bin/phpunit --group verifactu-official --fail-on-skipped
+        env:
+          EINVOICING_VERIFACTU_SCHEMAS: build/verifactu
