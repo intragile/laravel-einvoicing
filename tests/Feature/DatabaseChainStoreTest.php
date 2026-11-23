@@ -41,6 +41,7 @@ use IntrAgile\EInvoicing\Syntax\Verifactu\RecordWriter;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleKey;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleScope;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleState;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -545,6 +546,128 @@ final class DatabaseChainStoreTest extends TestCase
         $this->assertInstanceOf(DatabaseChainStore::class, $store);
         $store->append($this->key(), fn (): BillingRecord => $this->record('12345678/G33', ChainLink::first()));
         $this->assertSame(['383|test'], VerifactuThrottle::query()->pluck('key')->all());
+    }
+
+    public function test_stale_throttle_key_of_an_aeat_chain_is_updated(): void
+    {
+        $store = $this->store();
+        $key = $this->key();
+        $installation = ThrottleKey::for(VerifactuSamples::system(), VerifactuEnvironment::Test);
+        $issuer = ThrottleKey::for(VerifactuSamples::system(), VerifactuEnvironment::Test, ThrottleScope::Issuer, Nif::parse(VerifactuSamples::ISSUER_NIF));
+
+        $store->appendRow($key, IssuerDriver::Aeat, $installation, fn (?ChainHead $head): BillingRecord => $this->record('12345678/G33', $head?->link() ?? ChainLink::first()));
+        $this->assertSame('383|test', $store->chain($key)?->throttle_key);
+
+        // The throttle scope changed to "issuer": the next append moves the chain to the new key.
+        $store->appendRow($key, IssuerDriver::Aeat, $issuer, fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()));
+
+        $this->assertSame('89890001K|383|test', $store->chain($key)?->throttle_key);
+        $this->assertSame(['383|test', '89890001K|383|test'], VerifactuThrottle::query()->orderBy('id')->pluck('key')->all());
+    }
+
+    public function test_append_to_a_chain_of_the_other_driver_is_refused(): void
+    {
+        $store = $this->store();
+        $xml = VerifactuSamples::b2brouterFixture('record-1064490.xml');
+        $foreign = (new RecordReader)->read($xml);
+        $b2brouter = new ChainKey(Nif::parse(VerifactuSamples::SANDBOX_ISSUER_NIF), $foreign->system()->installationNumber, VerifactuEnvironment::Test);
+        $store->appendForeign($b2brouter, $foreign, $xml, $this->pendingRow('PROBE-ES-0001'));
+        $before = $store->head($b2brouter);
+
+        // Records generated here never join a B2Brouter chain.
+        $local = self::capture(fn () => $store->appendRow($b2brouter, IssuerDriver::Aeat, $this->throttle(), fn (?ChainHead $head): BillingRecord => RegistrationRecord::create(
+            VerifactuSamples::vectorDraft('LOCAL-1', '23-11-2026', VerifactuSamples::SANDBOX_ISSUER_NIF),
+            $head?->link() ?? ChainLink::first(),
+            VerifactuSamples::system(),
+            RecordTimestamp::of(new DateTimeImmutable('2026-11-24T10:00:00Z'), new DateTimeZone('Europe/Madrid')),
+        )));
+        $this->assertInstanceOf(ChainConflict::class, $local);
+        $this->assertEquals($before, $store->head($b2brouter));
+        $this->assertNull($store->chain($b2brouter)?->throttle_key);
+        $this->assertSame(0, VerifactuThrottle::query()->count());
+
+        // A B2Brouter record never joins a chain generated here.
+        $aeat = new ChainKey(Nif::parse(VerifactuSamples::SANDBOX_ISSUER_NIF), '383', VerifactuEnvironment::Test);
+        $store->seed($aeat, VerifactuSamples::invoiceId('PROBE-ES-0001', '23-11-2026', VerifactuSamples::SANDBOX_ISSUER_NIF), self::SEED_HASH);
+        $seeded = $store->head($aeat);
+        $linkedXml = VerifactuSamples::b2brouterFixture('record-1064493.xml');
+        $row = $this->pendingRow('PROBE-ES-UBL-0002');
+        // The record links to the seeded head, so only the driver refuses it.
+        $this->assertInstanceOf(ChainConflict::class, self::capture(fn () => $store->appendForeign($aeat, (new RecordReader)->read($linkedXml), $linkedXml, $row)));
+        $this->assertEquals($seeded, $store->head($aeat));
+        $this->assertNull($row->refresh()->chain_id);
+        $this->assertSame(1, VerifactuRecord::query()->whereNotNull('chain_id')->count());
+    }
+
+    public function test_append_to_a_closed_chain_is_refused(): void
+    {
+        $store = $this->store();
+        $key = $this->key();
+        $store->append($key, fn (): BillingRecord => $this->record('12345678/G33', ChainLink::first()));
+        VerifactuChain::query()->whereKey($store->chain($key)?->id)->update(['closed_at' => now()]);
+        $before = $store->head($key);
+
+        $this->assertInstanceOf(ChainConflict::class, self::capture(fn () => $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()))));
+        $this->assertInstanceOf(ChainConflict::class, self::capture(fn () => $store->appendRow($key, IssuerDriver::Aeat, $this->throttle(), fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()))));
+        $this->assertEquals($before, $store->head($key));
+        $this->assertSame(1, VerifactuRecord::query()->count());
+
+        $xml = VerifactuSamples::b2brouterFixture('record-1064490.xml');
+        $foreign = (new RecordReader)->read($xml);
+        $b2brouter = new ChainKey(Nif::parse(VerifactuSamples::SANDBOX_ISSUER_NIF), $foreign->system()->installationNumber, VerifactuEnvironment::Test);
+        $store->appendForeign($b2brouter, $foreign, $xml, $this->pendingRow('PROBE-ES-0001'));
+        VerifactuChain::query()->whereKey($store->chain($b2brouter)?->id)->update(['closed_at' => now()]);
+        $second = VerifactuSamples::b2brouterFixture('record-1064493.xml');
+        $row = $this->pendingRow('PROBE-ES-UBL-0002');
+        $this->assertInstanceOf(ChainConflict::class, self::capture(fn () => $store->appendForeign($b2brouter, (new RecordReader)->read($second), $second, $row)));
+        $this->assertNull($row->refresh()->chain_id);
+        $this->assertSame(1, $store->chain($b2brouter)?->sequence);
+    }
+
+    public function test_foreign_attributes_cannot_replace_the_invoice_columns(): void
+    {
+        $store = $this->store();
+        $xml = VerifactuSamples::b2brouterFixture('record-1064490.xml');
+        $record = (new RecordReader)->read($xml);
+        $key = new ChainKey(Nif::parse(VerifactuSamples::SANDBOX_ISSUER_NIF), $record->system()->installationNumber, VerifactuEnvironment::Test);
+
+        $row = $store->appendForeign($key, $record, $xml, $this->pendingRow('PROBE-ES-0001'), [
+            'issuer_nif' => '89890001K',
+            'number' => 'OTHER-1',
+            'issue_date' => '2020-01-01',
+            'environment' => VerifactuEnvironment::Production,
+            'driver' => IssuerDriver::Aeat,
+            'b2brouter_report_id' => '1064490',
+        ]);
+
+        $row->refresh();
+        $this->assertSame('B64829179', $row->issuer_nif);
+        $this->assertSame('PROBE-ES-0001', $row->number);
+        $this->assertSame('2026-11-23', $row->issue_date);
+        $this->assertSame(VerifactuEnvironment::Test, $row->environment);
+        $this->assertSame(IssuerDriver::B2Brouter, $row->driver);
+        $this->assertSame('1064490', $row->b2brouter_report_id);
+    }
+
+    public function test_foreign_row_is_checked_as_stored(): void
+    {
+        $store = $this->store();
+        $xml = VerifactuSamples::b2brouterFixture('record-1064490.xml');
+        $record = (new RecordReader)->read($xml);
+        $key = new ChainKey(Nif::parse(VerifactuSamples::SANDBOX_ISSUER_NIF), $record->system()->installationNumber, VerifactuEnvironment::Test);
+
+        // The in-memory model says the right invoice, the stored row another one.
+        $other = $this->pendingRow('PROBE-ES-0001');
+        VerifactuRecord::query()->whereKey($other->id)->update(['number' => 'OTHER-1']);
+        $this->assertInstanceOf(InvalidArgumentException::class, self::capture(fn () => $store->appendForeign($key, $record, $xml, $other)));
+
+        // A row of the other environment does not belong to this chain.
+        $production = $this->pendingRow('PROBE-ES-0001');
+        VerifactuRecord::query()->whereKey($production->id)->update(['environment' => VerifactuEnvironment::Production->value]);
+        $this->assertInstanceOf(InvalidArgumentException::class, self::capture(fn () => $store->appendForeign($key, $record, $xml, $production)));
+
+        $this->assertSame(0, VerifactuRecord::query()->whereNotNull('chain_id')->count());
+        $this->assertNull($store->head($key));
     }
 
     private function store(): DatabaseChainStore

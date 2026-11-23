@@ -43,7 +43,8 @@ use UnexpectedValueException;
  *    meanwhile fails the write with ChainConflict instead of forking the chain.
  *
  * The head stores the head invoice's number and issue date; its issuer is the chain's issuer, so
- * a record of another issuer is refused.
+ * a record of another issuer is refused. A closed chain, and a chain of the other driver (records
+ * generated here vs records B2Brouter wrote), take no further record.
  */
 final class DatabaseChainStore implements ChainStore
 {
@@ -86,8 +87,7 @@ final class DatabaseChainStore implements ChainStore
         $throttle = ($this->defaultThrottle)($key);
 
         $this->db->transaction(function () use ($key, $head, $throttle): void {
-            $this->ensureChain($key, IssuerDriver::Aeat, $throttle);
-            [$chainId, $sequence, $current] = $this->lockChain($key);
+            [$chainId, $sequence, $current] = $this->openChain($key, IssuerDriver::Aeat, $throttle);
 
             if ($current !== null) {
                 throw new ChainConflict(sprintf('Chain %s already has a head and cannot be seeded.', $key->toString()));
@@ -108,7 +108,8 @@ final class DatabaseChainStore implements ChainStore
      * @param  Closure(?ChainHead): BillingRecord  $build
      * @param  array<string, mixed>  $attributes
      *
-     * @throws ChainConflict when the built record does not link to the head, or the head moved
+     * @throws ChainConflict when the built record does not link to the head, the head moved, or the
+     *                       chain is closed or a B2Brouter chain
      */
     public function appendRow(ChainKey $key, IssuerDriver $driver, ThrottleKey $throttle, Closure $build, array $attributes = []): VerifactuRecord
     {
@@ -125,17 +126,22 @@ final class DatabaseChainStore implements ChainStore
      *
      * @param  array<string, mixed>  $attributes
      *
-     * @throws ChainConflict when the record does not link to the head, or the row is already attached
-     * @throws InvalidArgumentException when the row belongs to another invoice
+     * @throws ChainConflict when the record does not link to the head, the row is already attached,
+     *                       or the chain is closed or an AEAT chain
+     * @throws InvalidArgumentException when the stored row belongs to another invoice, environment or driver
      */
     public function appendForeign(ChainKey $key, BillingRecord $record, string $xml, VerifactuRecord $row, array $attributes = []): VerifactuRecord
     {
         self::assertIssuer($key, $record->invoiceId());
-        self::assertRowIsFor($row, $record->invoiceId());
 
         $this->db->transaction(function () use ($key, $record, $xml, $row, $attributes): void {
-            $this->ensureChain($key, IssuerDriver::B2Brouter, null);
-            [$chainId, $current, $head] = $this->lockChain($key);
+            [$chainId, $current, $head] = $this->openChain($key, IssuerDriver::B2Brouter, null);
+
+            $target = $this->records()->whereKey($row->id)->whereNull('chain_id')->lockForUpdate()->first();
+            if ($target === null) {
+                throw new ChainConflict(sprintf('The VERI*FACTU record row %d is already attached to a chain.', $row->id));
+            }
+            self::assertRowIsFor($target, $record->invoiceId(), $key);
 
             $previous = $record->chainLink()->previous();
             if ($head === null && $previous !== null) {
@@ -148,14 +154,11 @@ final class DatabaseChainStore implements ChainStore
             self::assertLinked($key, $record, $head);
             $sequence = $head === null ? 1 : $head->sequence + 1;
 
-            $target = $this->records()->whereKey($row->id)->whereNull('chain_id')->lockForUpdate()->first();
-            if ($target === null) {
-                throw new ChainConflict(sprintf('The VERI*FACTU record row %d is already attached to a chain.', $row->id));
-            }
             $target->forceFill([
                 'state' => VerifactuRecordState::Registered,
                 ...$attributes,
                 ...self::chainColumns($chainId, $sequence, $record),
+                ...self::invoiceColumns($key, IssuerDriver::B2Brouter, $record),
                 'xml' => $xml,
             ])->save();
 
@@ -183,8 +186,7 @@ final class DatabaseChainStore implements ChainStore
     private function appendRecord(ChainKey $key, IssuerDriver $driver, ThrottleKey $throttle, Closure $build, array $attributes): array
     {
         return $this->db->transaction(function () use ($key, $driver, $throttle, $build, $attributes): array {
-            $this->ensureChain($key, $driver, $throttle);
-            [$chainId, $current, $head] = $this->lockChain($key);
+            [$chainId, $current, $head] = $this->openChain($key, $driver, $throttle);
 
             $record = $build($head);
             self::assertIssuer($key, $record->invoiceId());
@@ -197,11 +199,7 @@ final class DatabaseChainStore implements ChainStore
                 'attempts' => 0,
                 ...$attributes,
                 ...self::chainColumns($chainId, $sequence, $record),
-                'issuer_nif' => $key->issuer->value,
-                'number' => $record->invoiceId()->number,
-                'issue_date' => $record->invoiceId()->issueDate->format('Y-m-d'),
-                'environment' => $key->environment,
-                'driver' => $driver,
+                ...self::invoiceColumns($key, $driver, $record),
                 'xml' => $this->writer->write($record),
                 'qr_url' => $record instanceof RegistrationRecord ? VerifactuQr::url($record, $key->environment) : null,
             ])->save();
@@ -238,16 +236,39 @@ final class DatabaseChainStore implements ChainStore
     }
 
     /**
-     * Reads the chain row under a row lock.
+     * Creates the chain row if needed and reads it under a row lock, refusing a closed chain and a
+     * chain of the other driver. An AEAT chain moves to the given throttle when its stored one
+     * differs (the throttle scope changed), so its records are sent under the current key.
      *
      * @return array{int, int, ?ChainHead} the row id, the stored sequence and the head
+     *
+     * @throws ChainConflict when the chain is closed or belongs to the other driver
      */
-    private function lockChain(ChainKey $key): array
+    private function openChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): array
     {
+        $this->ensureChain($key, $driver, $throttle);
         $row = $this->chainQuery($key)->lockForUpdate()->first()
             ?? throw new UnexpectedValueException(sprintf('The row of chain %s is missing.', $key->toString()));
+        $columns = (array) $row;
 
-        return self::readChain($row, $key);
+        $stored = self::text($columns, 'driver', $key);
+        if ($stored !== $driver->value) {
+            throw new ChainConflict(sprintf('Chain %s is a %s chain; a %s record cannot join it.', $key->toString(), $stored ?? 'unknown', $driver->value));
+        }
+        if (($columns['closed_at'] ?? null) !== null) {
+            throw new ChainConflict(sprintf('Chain %s is closed; nothing more can be appended to it.', $key->toString()));
+        }
+
+        [$id, $sequence, $head] = self::readChain($row, $key);
+
+        if ($driver === IssuerDriver::Aeat && $throttle !== null && self::text($columns, 'throttle_key', $key) !== $throttle->toString()) {
+            $this->db->table(VerifactuChain::TABLE)->where('id', $id)->update([
+                'throttle_key' => $throttle->toString(),
+                'updated_at' => Carbon::now(),
+            ]);
+        }
+
+        return [$id, $sequence, $head];
     }
 
     /**
@@ -397,14 +418,34 @@ final class DatabaseChainStore implements ChainStore
         }
     }
 
-    private static function assertRowIsFor(VerifactuRecord $row, InvoiceId $id): void
+    /**
+     * The invoice columns of a record row, always taken from the key and the record.
+     *
+     * @return array<string, mixed>
+     */
+    private static function invoiceColumns(ChainKey $key, IssuerDriver $driver, BillingRecord $record): array
+    {
+        return [
+            'issuer_nif' => $key->issuer->value,
+            'number' => $record->invoiceId()->number,
+            'issue_date' => $record->invoiceId()->issueDate->format('Y-m-d'),
+            'environment' => $key->environment,
+            'driver' => $driver,
+        ];
+    }
+
+    /** Checks the stored row against the invoice and the chain's environment. */
+    private static function assertRowIsFor(VerifactuRecord $row, InvoiceId $id, ChainKey $key): void
     {
         if ($row->issuer_nif !== $id->issuer->value
             || trim($row->number) !== $id->number
-            || substr($row->issue_date, 0, 10) !== $id->issueDate->format('Y-m-d')) {
+            || substr($row->issue_date, 0, 10) !== $id->issueDate->format('Y-m-d')
+            || $row->environment !== $key->environment
+            || $row->driver !== IssuerDriver::B2Brouter) {
             throw new InvalidArgumentException(sprintf(
-                'The VERI*FACTU record row %d is not the row of invoice %s of %s.',
+                'The VERI*FACTU record row %d is not the %s B2Brouter row of invoice %s of %s.',
                 $row->id,
+                $key->environment->value,
                 $id->number,
                 $id->dateText(),
             ));
