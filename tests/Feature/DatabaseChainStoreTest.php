@@ -7,6 +7,7 @@ namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
+use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\SQLiteConnection;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -355,29 +356,15 @@ final class DatabaseChainStoreTest extends TestCase
 
     public function test_server_databases_lock_an_existing_chain_without_inserting(): void
     {
-        // A SQLite connection that reports a server driver runs the statements MySQL and PostgreSQL get.
-        config()->set('database.connections.server', ['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '', 'foreign_key_constraints' => true]);
-        DB::extend('server', static fn (array $config, string $name): SQLiteConnection => new class(new PDO('sqlite::memory:'), ':memory:', '', $config + ['name' => $name]) extends SQLiteConnection
-        {
-            public function getDriverName(): string
-            {
-                return 'mysql';
-            }
-        });
-        $this->artisan('migrate', [
-            '--database' => 'server',
-            '--path' => dirname(__DIR__, 2).'/database/migrations/add_verifactu_to_einvoicing_tables.php',
-            '--realpath' => true,
-        ])->assertSuccessful();
-
-        $db = DB::connection('server');
+        $db = $this->serverConnection();
         $store = new DatabaseChainStore($db, new RecordWriter, $this->throttle());
         $key = $this->key();
 
         $db->enableQueryLog();
         $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345678/G33', $head?->link() ?? ChainLink::first()));
         $first = self::chainStatements($db->getQueryLog());
-        $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $first[0]);
+        // The missing row is created and committed before the write transaction locks it.
+        $this->assertStringStartsWith('select exists(select * from "einvoicing_verifactu_chains"', $first[0]);
         $this->assertStringStartsWith('insert or ignore into "einvoicing_verifactu_chains"', $first[1]);
         $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $first[2]);
 
@@ -386,9 +373,36 @@ final class DatabaseChainStoreTest extends TestCase
         $db->flushQueryLog();
         $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()));
         $second = self::chainStatements($db->getQueryLog());
-        $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $second[0]);
+        $this->assertStringStartsWith('select exists(select * from "einvoicing_verifactu_chains"', $second[0]);
+        $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $second[1]);
         $this->assertSame([], array_values(array_filter($second, static fn (string $sql): bool => str_starts_with($sql, 'insert'))));
         $this->assertSame(2, $store->head($key)?->sequence);
+    }
+
+    public function test_an_unused_chain_row_is_taken_over_by_the_next_driver(): void
+    {
+        $db = $this->serverConnection();
+        $store = new DatabaseChainStore($db, new RecordWriter, $this->throttle());
+        $key = $this->key();
+
+        // On a server database the row is committed before the write, so a failed first write leaves it.
+        $failed = self::capture(fn () => $store->appendRow($key, IssuerDriver::B2Brouter, $this->throttle(), static function (): BillingRecord {
+            throw new RuntimeException('build failed');
+        }));
+        $this->assertInstanceOf(RuntimeException::class, $failed);
+        $this->assertSame(1, $db->table(VerifactuChain::TABLE)->count());
+        $this->assertNull($store->head($key));
+
+        $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345678/G33', $head?->link() ?? ChainLink::first()));
+
+        $chain = $store->chain($key);
+        $this->assertNotNull($chain);
+        $this->assertSame(IssuerDriver::Aeat, $chain->driver);
+        $this->assertSame($this->throttle()->toString(), $chain->throttle_key);
+        $this->assertSame(1, $store->head($key)?->sequence);
+
+        // Once it holds a record, the other driver is refused again.
+        $this->assertInstanceOf(ChainConflict::class, self::capture(fn () => $store->appendRow($key, IssuerDriver::B2Brouter, $this->throttle(), fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()))));
     }
 
     public function test_cas_refuses_a_head_moved_during_build(): void
@@ -765,6 +779,29 @@ final class DatabaseChainStoreTest extends TestCase
             'driver' => IssuerDriver::B2Brouter,
             'state' => VerifactuRecordState::Pending,
         ]);
+    }
+
+    /**
+     * A migrated SQLite connection that reports a server driver, so the store runs the statements
+     * MySQL and PostgreSQL get.
+     */
+    private function serverConnection(): Connection
+    {
+        config()->set('database.connections.server', ['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '', 'foreign_key_constraints' => true]);
+        DB::extend('server', static fn (array $config, string $name): SQLiteConnection => new class(new PDO('sqlite::memory:'), ':memory:', '', $config + ['name' => $name]) extends SQLiteConnection
+        {
+            public function getDriverName(): string
+            {
+                return 'mysql';
+            }
+        });
+        $this->artisan('migrate', [
+            '--database' => 'server',
+            '--path' => dirname(__DIR__, 2).'/database/migrations/add_verifactu_to_einvoicing_tables.php',
+            '--realpath' => true,
+        ])->assertSuccessful();
+
+        return DB::connection('server');
     }
 
     /**

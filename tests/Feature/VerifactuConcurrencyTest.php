@@ -82,11 +82,8 @@ final class VerifactuConcurrencyTest extends TestCase
 
     public function test_forked_writers_never_fork_the_chain(): void
     {
-        // Only the VERI*FACTU tables: the chain store needs nothing else.
-        $this->artisan('migrate:fresh', [
-            '--path' => dirname(__DIR__, 2).'/database/migrations/add_verifactu_to_einvoicing_tables.php',
-            '--realpath' => true,
-        ])->assertSuccessful();
+        // All package tables, so the server databases also run every migration.
+        $this->artisan('migrate:fresh')->assertSuccessful();
         $key = $this->key();
 
         // A child must not share the parent's socket or file handle: the parent closes its
@@ -98,7 +95,10 @@ final class VerifactuConcurrencyTest extends TestCase
         $children = [];
         for ($writer = 1; $writer <= self::WRITERS; $writer++) {
             $pid = pcntl_fork();
-            $this->assertNotSame(-1, $pid, 'pcntl_fork() failed.');
+            if ($pid === -1) {
+                $this->stop($children);
+                $this->fail(sprintf('pcntl_fork() failed for writer %d.', $writer));
+            }
             if ($pid === 0) {
                 $this->runWriter($writer, $key, $start);
             }
@@ -177,7 +177,7 @@ final class VerifactuConcurrencyTest extends TestCase
      * Reaps the children, killing any still running after WAIT_SECONDS.
      *
      * @param  array<int, int>  $children  pid => writer
-     * @return array<int, int> writer => exit code (-1 when killed or ended by a signal)
+     * @return array<int, int> writer => exit code (minus the signal number when a signal ended it)
      */
     private function waitFor(array $children): array
     {
@@ -188,17 +188,13 @@ final class VerifactuConcurrencyTest extends TestCase
             foreach ($children as $pid => $writer) {
                 $status = 0;
                 if (pcntl_waitpid($pid, $status, WNOHANG) === $pid) {
-                    $codes[$writer] = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : -1;
+                    $codes[$writer] = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : -pcntl_wtermsig($status);
                     unset($children[$pid]);
                 }
             }
 
             if ($children !== [] && microtime(true) > $deadline) {
-                foreach ($children as $pid => $writer) {
-                    posix_kill($pid, SIGKILL);
-                    pcntl_waitpid($pid, $status);
-                    $codes[$writer] = -1;
-                }
+                $this->stop($children);
                 $this->fail(sprintf('Writers %s were still running after %d seconds.', implode(', ', $children), self::WAIT_SECONDS));
             }
 
@@ -208,6 +204,19 @@ final class VerifactuConcurrencyTest extends TestCase
         ksort($codes);
 
         return $codes;
+    }
+
+    /**
+     * Kills and reaps the given children, so none outlives a failed test.
+     *
+     * @param  array<int, int>  $children  pid => writer
+     */
+    private function stop(array $children): void
+    {
+        foreach (array_keys($children) as $pid) {
+            posix_kill($pid, SIGKILL);
+            pcntl_waitpid($pid, $status);
+        }
     }
 
     private function key(): ChainKey

@@ -95,10 +95,10 @@ jobs:
       - run: composer require "laravel/framework:13.*" --no-update --no-interaction
       - run: composer update --prefer-dist --no-interaction --no-progress
       - run: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
-      - run: vendor/bin/phpunit --colors=never --group verifactu-concurrency --fail-on-skipped
+      - run: vendor/bin/phpunit --colors=never --group verifactu-concurrency --fail-on-skipped --fail-on-empty-test-suite
         env:
           EINVOICING_TEST_DB_URL: mysql://root:einvoicing@127.0.0.1:3306/einvoicing
-      - run: vendor/bin/phpunit --colors=never --group verifactu-concurrency --fail-on-skipped
+      - run: vendor/bin/phpunit --colors=never --group verifactu-concurrency --fail-on-skipped --fail-on-empty-test-suite
         env:
           EINVOICING_TEST_DB_URL: pgsql://einvoicing:einvoicing@127.0.0.1:5432/einvoicing
 

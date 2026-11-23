@@ -35,8 +35,9 @@ use UnexpectedValueException;
  * Keeps VERI*FACTU chains in the einvoicing_verifactu_* tables.
  *
  * Every write runs in one transaction (retried on deadlock) that:
- * 1. reads the chain row with a row lock (inserting it when it is missing) and rebuilds the head
- *    from it; on SQLite the insert comes first, so the database write lock is held before the read;
+ * 1. reads the chain row with a row lock and rebuilds the head from it; on SQLite the row is
+ *    inserted (or ignored) first, so the database write lock is held before the read, while on
+ *    MySQL and PostgreSQL a missing row is created in a short transaction before this one;
  * 2. inserts the throttle row if it is missing;
  * 3. builds the record and checks that it links to that head;
  * 4. stores the record row with the written XML and the literal timestamp text;
@@ -87,6 +88,7 @@ final class DatabaseChainStore implements ChainStore
         $head = ChainHead::seeded($last, $fingerprint);
         $throttle = ($this->defaultThrottle)($key);
 
+        $this->prepareChain($key, IssuerDriver::Aeat, $throttle);
         $this->db->transaction(function () use ($key, $head, $throttle): void {
             [$chainId, $sequence, $current] = $this->openChain($key, IssuerDriver::Aeat, $throttle);
 
@@ -135,6 +137,7 @@ final class DatabaseChainStore implements ChainStore
     {
         self::assertIssuer($key, $record->invoiceId());
 
+        $this->prepareChain($key, IssuerDriver::B2Brouter, null);
         $this->db->transaction(function () use ($key, $record, $xml, $row, $attributes): void {
             [$chainId, $current, $head] = $this->openChain($key, IssuerDriver::B2Brouter, null);
 
@@ -186,6 +189,8 @@ final class DatabaseChainStore implements ChainStore
      */
     private function appendRecord(ChainKey $key, IssuerDriver $driver, ThrottleKey $throttle, Closure $build, array $attributes): array
     {
+        $this->prepareChain($key, $driver, $throttle);
+
         return $this->db->transaction(function () use ($key, $driver, $throttle, $build, $attributes): array {
             [$chainId, $current, $head] = $this->openChain($key, $driver, $throttle);
 
@@ -244,16 +249,36 @@ final class DatabaseChainStore implements ChainStore
     }
 
     /**
-     * Reads the chain row under a row lock, inserting it first when it is missing.
+     * On MySQL and PostgreSQL, creates a missing chain row in a short transaction of its own,
+     * before the write transaction locks it.
+     *
+     * Inside the write transaction, an INSERT IGNORE of an existing row takes a shared lock on
+     * MySQL, and writers upgrading theirs to the row lock deadlock. Writers that all find the row
+     * missing hold gap locks, and their inserts deadlock as well, sometimes on every retry: a run
+     * of four writers starting an empty chain at once exhausted the three attempts. Created and
+     * committed first, the row exists before any write transaction starts, and those only take
+     * the row lock. An empty row left by a write that then fails is taken over by the next one
+     * (see openChain()). SQLite needs none of this (see lockChain()).
+     */
+    private function prepareChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): void
+    {
+        if ($this->isSqlite() || $this->chainQuery($key)->exists()) {
+            return;
+        }
+
+        $this->db->transaction(fn () => $this->insertChain($key, $driver, $throttle), 3);
+    }
+
+    /**
+     * Reads the chain row under a row lock.
      *
      * SQLite locks the whole database, and only a transaction whose first statement writes waits
-     * for the lock instead of failing, so there the insert always comes first. On MySQL an
-     * INSERT IGNORE of an existing row takes a shared lock, and two writers upgrading theirs to the
-     * row lock deadlock; servers therefore read with the lock first and insert only a missing row.
+     * for the lock instead of failing, so there the row is inserted (or ignored) first. Server
+     * databases find the row created by prepareChain(); it is inserted here only if it vanished.
      */
     private function lockChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): object
     {
-        $sqlite = $this->db instanceof Connection && $this->db->getDriverName() === 'sqlite';
+        $sqlite = $this->isSqlite();
 
         if ($sqlite) {
             $this->insertChain($key, $driver, $throttle);
@@ -265,6 +290,11 @@ final class DatabaseChainStore implements ChainStore
         }
 
         return $row ?? throw new UnexpectedValueException(sprintf('The row of chain %s is missing.', $key->toString()));
+    }
+
+    private function isSqlite(): bool
+    {
+        return $this->db instanceof Connection && $this->db->getDriverName() === 'sqlite';
     }
 
     /**
@@ -282,6 +312,18 @@ final class DatabaseChainStore implements ChainStore
         $columns = (array) $row;
 
         $stored = self::text($columns, 'driver', $key);
+        if ($stored !== $driver->value && self::isUnused($columns, $key)) {
+            // A chain row that never held a record or a seed (its first write failed) belongs
+            // to whichever driver writes to it first.
+            $this->db->table(VerifactuChain::TABLE)->where('id', self::integer($columns, 'id', $key))->update([
+                'driver' => $driver->value,
+                'throttle_key' => $throttle?->toString(),
+                'updated_at' => Carbon::now(),
+            ]);
+            $columns = ['driver' => $driver->value, 'throttle_key' => $throttle?->toString()] + $columns;
+            $row = (object) $columns;
+            $stored = $driver->value;
+        }
         if ($stored !== $driver->value) {
             throw new ChainConflict(sprintf('Chain %s is a %s chain; a %s record cannot join it.', $key->toString(), $stored ?? 'unknown', $driver->value));
         }
@@ -302,6 +344,16 @@ final class DatabaseChainStore implements ChainStore
         }
 
         return [$id, $sequence, $head];
+    }
+
+    /**
+     * Whether a chain row has neither records nor a seed.
+     *
+     * @param  array<array-key, mixed>  $row
+     */
+    private static function isUnused(array $row, ChainKey $key): bool
+    {
+        return self::integer($row, 'sequence', $key) === 0 && self::text($row, 'head_hash', $key) === null;
     }
 
     /**
