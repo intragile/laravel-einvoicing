@@ -24,7 +24,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: dom, libxml, mbstring
+          extensions: dom, libxml, mbstring, gd, pcntl
           coverage: none
       - run: composer validate --strict
       - run: composer require "laravel/framework:${{ matrix.laravel }}" --no-update --no-interaction
@@ -48,7 +48,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
-          extensions: dom, libxml, mbstring
+          extensions: dom, libxml, mbstring, gd, pcntl
           coverage: none
       - run: composer require "laravel/framework:12.*" --no-update --no-interaction
       - run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-interaction --no-progress
@@ -57,6 +57,50 @@ jobs:
       - run: vendor/bin/phpunit --group verifactu-official --fail-on-skipped
         env:
           EINVOICING_VERIFACTU_SCHEMAS: build/verifactu
+
+  databases:
+    # Proves that concurrent writers never fork a VERI*FACTU chain on the server databases
+    # (the tests job covers SQLite). Each URL names a throwaway database; the test migrates it.
+    runs-on: ubuntu-latest
+    name: PHP 8.5 / Laravel 13 / MySQL + PostgreSQL
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: einvoicing
+          MYSQL_DATABASE: einvoicing
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -peinvoicing --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: einvoicing
+          POSTGRES_PASSWORD: einvoicing
+          POSTGRES_DB: einvoicing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U einvoicing -d einvoicing"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: dom, libxml, mbstring, gd, pcntl, pdo_mysql, pdo_pgsql
+          coverage: none
+      - run: composer require "laravel/framework:13.*" --no-update --no-interaction
+      - run: composer update --prefer-dist --no-interaction --no-progress
+      - run: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
+      - run: vendor/bin/phpunit --colors=never --group verifactu-concurrency --fail-on-skipped
+        env:
+          EINVOICING_TEST_DB_URL: mysql://root:einvoicing@127.0.0.1:3306/einvoicing
+      - run: vendor/bin/phpunit --colors=never --group verifactu-concurrency --fail-on-skipped
+        env:
+          EINVOICING_TEST_DB_URL: pgsql://einvoicing:einvoicing@127.0.0.1:5432/einvoicing
 
   next-versions:
     # Early warning against the next PHP release and the next Laravel major,
@@ -81,7 +125,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: dom, libxml, mbstring
+          extensions: dom, libxml, mbstring, gd, pcntl
           coverage: none
       - name: Retarget composer.json at the upcoming versions
         run: |
