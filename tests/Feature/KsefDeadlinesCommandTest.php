@@ -33,8 +33,9 @@ final class KsefDeadlinesCommandTest extends TestCase
 
         Event::fake([KsefOfflineDeadlineApproaching::class]);
         config()->set('einvoicing.ksef.nip', FakeKsefApi::NIP);
-        // Monday 2026-11-23, 10:00 in Warsaw.
-        $this->travelTo(new DateTimeImmutable('2026-11-23T10:00:00+01:00'));
+        // Monday 2026-11-23, 10:00 in Warsaw, given in UTC (the application timezone): older Carbon
+        // releases read database timestamps in the timezone of the test clock.
+        $this->travelTo(new DateTimeImmutable('2026-11-23T09:00:00Z'));
     }
 
     /**
