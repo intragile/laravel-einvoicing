@@ -1,5 +1,8 @@
 * text=auto eol=lf
 
+# Fixtures are kept byte for byte (line endings and Base64 layout included).
+/tests/fixtures/verifactu/** -text -eol
+
 # Development files are left out of the Composer dist archive.
 /.github            export-ignore
 /docs               export-ignore
