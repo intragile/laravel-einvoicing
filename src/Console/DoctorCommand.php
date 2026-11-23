@@ -137,9 +137,10 @@ final class DoctorCommand extends Command
         if ((bool) $this->option('live')) {
             foreach ($manager->names() as $name) {
                 if ($name === EInvoicingManager::KSEF) {
-                    // The name resolves to the KSeF transport, and reading its inbox would spend a
-                    // metadata query and save a cursor window; KSeF itself is never called here.
-                    $this->row("transport {$name}: inbox", self::INFO, 'not read: the name is shadowed by einvoicing.ksef, and the doctor never calls KSeF');
+                    // The name always resolves to the KSeF transport of einvoicing.ksef, configured
+                    // or not, and reading its inbox would spend a metadata query and save a cursor
+                    // window; KSeF itself is never called here.
+                    $this->row("transport {$name}: inbox", self::INFO, 'not read: the name "ksef" is reserved for the KSeF transport (einvoicing.ksef), and the doctor never calls KSeF');
 
                     continue;
                 }

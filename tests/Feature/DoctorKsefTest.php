@@ -131,11 +131,23 @@ final class DoctorKsefTest extends TestCase
         $code = Artisan::call('einvoicing:doctor', ['--live' => true]);
         $output = Artisan::output();
 
-        $this->assertRow($output, 'transport ksef: inbox', 'info', 'not read');
+        $this->assertRow($output, 'transport ksef: inbox', 'info', 'reserved for the KSeF transport');
         $this->assertSame([], $api->paths());
         $this->assertCount(1, $this->latarniaRequests);
         $this->assertSame('/status', $this->latarniaRequests[0]->getUri()->getPath());
         $this->assertNotSame(2, $code);
+    }
+
+    public function test_doctor_live_skips_a_ksef_named_transport_when_einvoicing_ksef_is_unset(): void
+    {
+        config()->set('einvoicing.ksef', null);
+        config()->set('einvoicing.transports.ksef', ['driver' => 'recommand', 'api_key_id' => 'key', 'secret' => 'sec', 'company_id' => 'c_test']);
+
+        Artisan::call('einvoicing:doctor', ['--live' => true]);
+        $output = Artisan::output();
+
+        $this->assertRow($output, 'transport ksef: inbox', 'info', 'reserved for the KSeF transport');
+        $this->assertStringNotContainsString('shadowed by einvoicing.ksef, and', $output);
     }
 
     public function test_doctor_retry_after_accounts_for_the_ksef_job_timeouts(): void
