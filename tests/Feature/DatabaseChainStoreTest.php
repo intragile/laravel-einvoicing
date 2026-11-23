@@ -8,6 +8,7 @@ use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
 use Illuminate\Database\QueryException;
+use Illuminate\Database\SQLiteConnection;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
@@ -42,6 +43,7 @@ use IntrAgile\EInvoicing\Transport\Aeat\ThrottleKey;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleScope;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleState;
 use InvalidArgumentException;
+use PDO;
 use RuntimeException;
 use Throwable;
 
@@ -335,6 +337,58 @@ final class DatabaseChainStoreTest extends TestCase
         $early = new Chainer(VerifactuSamples::system(), static fn (): DateTimeImmutable => new DateTimeImmutable('2026-10-25T01:29:59Z'));
         $this->assertInstanceOf(ChainConflict::class, self::capture(fn () => $early->appendTo($this->store(), $key, VerifactuSamples::vectorDraft('DST-4', '25-10-2026'))));
         $this->assertSame(3, VerifactuRecord::query()->count());
+    }
+
+    public function test_sqlite_writes_before_it_reads_the_chain(): void
+    {
+        $store = $this->store();
+        $key = $this->key();
+        $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345678/G33', $head?->link() ?? ChainLink::first()));
+
+        DB::connection()->flushQueryLog();
+        DB::connection()->enableQueryLog();
+        $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()));
+
+        // The first statement takes SQLite's write lock, so the head is never read under a shared lock.
+        $this->assertStringStartsWith('insert or ignore into "einvoicing_verifactu_chains"', self::chainStatements(DB::connection()->getQueryLog())[0]);
+    }
+
+    public function test_server_databases_lock_an_existing_chain_without_inserting(): void
+    {
+        // A SQLite connection that reports a server driver runs the statements MySQL and PostgreSQL get.
+        config()->set('database.connections.server', ['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '', 'foreign_key_constraints' => true]);
+        DB::extend('server', static fn (array $config, string $name): SQLiteConnection => new class(new PDO('sqlite::memory:'), ':memory:', '', $config + ['name' => $name]) extends SQLiteConnection
+        {
+            public function getDriverName(): string
+            {
+                return 'mysql';
+            }
+        });
+        $this->artisan('migrate', [
+            '--database' => 'server',
+            '--path' => dirname(__DIR__, 2).'/database/migrations/add_verifactu_to_einvoicing_tables.php',
+            '--realpath' => true,
+        ])->assertSuccessful();
+
+        $db = DB::connection('server');
+        $store = new DatabaseChainStore($db, new RecordWriter, $this->throttle());
+        $key = $this->key();
+
+        $db->enableQueryLog();
+        $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345678/G33', $head?->link() ?? ChainLink::first()));
+        $first = self::chainStatements($db->getQueryLog());
+        $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $first[0]);
+        $this->assertStringStartsWith('insert or ignore into "einvoicing_verifactu_chains"', $first[1]);
+        $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $first[2]);
+
+        // On an existing chain an INSERT IGNORE would take a shared row lock first, and two writers
+        // upgrading theirs to the row lock deadlock on MySQL; only the locking read may run.
+        $db->flushQueryLog();
+        $store->append($key, fn (?ChainHead $head): BillingRecord => $this->record('12345679/G34', $head?->link() ?? ChainLink::first()));
+        $second = self::chainStatements($db->getQueryLog());
+        $this->assertStringStartsWith('select * from "einvoicing_verifactu_chains"', $second[0]);
+        $this->assertSame([], array_values(array_filter($second, static fn (string $sql): bool => str_starts_with($sql, 'insert'))));
+        $this->assertSame(2, $store->head($key)?->sequence);
     }
 
     public function test_cas_refuses_a_head_moved_during_build(): void
@@ -711,6 +765,20 @@ final class DatabaseChainStoreTest extends TestCase
             'driver' => IssuerDriver::B2Brouter,
             'state' => VerifactuRecordState::Pending,
         ]);
+    }
+
+    /**
+     * The logged statements that touch the chain table, in order.
+     *
+     * @param  array<array-key, array{query: string}>  $log
+     * @return list<string>
+     */
+    private static function chainStatements(array $log): array
+    {
+        return array_values(array_filter(
+            array_map(static fn (array $entry): string => $entry['query'], $log),
+            static fn (string $sql): bool => str_contains($sql, '"einvoicing_verifactu_chains"'),
+        ));
     }
 
     private static function capture(Closure $call): ?Throwable

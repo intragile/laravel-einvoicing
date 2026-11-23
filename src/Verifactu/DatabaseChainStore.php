@@ -35,8 +35,9 @@ use UnexpectedValueException;
  * Keeps VERI*FACTU chains in the einvoicing_verifactu_* tables.
  *
  * Every write runs in one transaction (retried on deadlock) that:
- * 1. inserts the chain row if it is missing, so SQLite takes its write lock before the head is read;
- * 2. reads the chain row with a row lock and rebuilds the head from it;
+ * 1. reads the chain row with a row lock (inserting it when it is missing) and rebuilds the head
+ *    from it; on SQLite the insert comes first, so the database write lock is held before the read;
+ * 2. inserts the throttle row if it is missing;
  * 3. builds the record and checks that it links to that head;
  * 4. stores the record row with the written XML and the literal timestamp text;
  * 5. moves the head with a compare-and-set on the sequence, so a head moved by any other writer
@@ -210,8 +211,8 @@ final class DatabaseChainStore implements ChainStore
         }, 3);
     }
 
-    /** Inserts the chain row (and the throttle row) unless they exist. */
-    private function ensureChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): void
+    /** Inserts the chain row unless it exists. */
+    private function insertChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): void
     {
         $now = Carbon::now();
         $this->db->table(VerifactuChain::TABLE)->insertOrIgnore([
@@ -225,14 +226,45 @@ final class DatabaseChainStore implements ChainStore
             'created_at' => $now,
             'updated_at' => $now,
         ]);
+    }
 
-        if ($throttle !== null) {
-            $this->db->table(VerifactuThrottle::TABLE)->insertOrIgnore([
-                'key' => $throttle->toString(),
-                'created_at' => $now,
-                'updated_at' => $now,
-            ]);
+    /** Inserts the throttle row unless it exists. */
+    private function ensureThrottle(ThrottleKey $throttle): void
+    {
+        if ($this->db->table(VerifactuThrottle::TABLE)->where('key', $throttle->toString())->exists()) {
+            return;
         }
+
+        $now = Carbon::now();
+        $this->db->table(VerifactuThrottle::TABLE)->insertOrIgnore([
+            'key' => $throttle->toString(),
+            'created_at' => $now,
+            'updated_at' => $now,
+        ]);
+    }
+
+    /**
+     * Reads the chain row under a row lock, inserting it first when it is missing.
+     *
+     * SQLite locks the whole database, and only a transaction whose first statement writes waits
+     * for the lock instead of failing, so there the insert always comes first. On MySQL an
+     * INSERT IGNORE of an existing row takes a shared lock, and two writers upgrading theirs to the
+     * row lock deadlock; servers therefore read with the lock first and insert only a missing row.
+     */
+    private function lockChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): object
+    {
+        $sqlite = $this->db instanceof Connection && $this->db->getDriverName() === 'sqlite';
+
+        if ($sqlite) {
+            $this->insertChain($key, $driver, $throttle);
+        }
+        $row = $this->chainQuery($key)->lockForUpdate()->first();
+        if ($row === null && ! $sqlite) {
+            $this->insertChain($key, $driver, $throttle);
+            $row = $this->chainQuery($key)->lockForUpdate()->first();
+        }
+
+        return $row ?? throw new UnexpectedValueException(sprintf('The row of chain %s is missing.', $key->toString()));
     }
 
     /**
@@ -246,9 +278,7 @@ final class DatabaseChainStore implements ChainStore
      */
     private function openChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): array
     {
-        $this->ensureChain($key, $driver, $throttle);
-        $row = $this->chainQuery($key)->lockForUpdate()->first()
-            ?? throw new UnexpectedValueException(sprintf('The row of chain %s is missing.', $key->toString()));
+        $row = $this->lockChain($key, $driver, $throttle);
         $columns = (array) $row;
 
         $stored = self::text($columns, 'driver', $key);
@@ -261,6 +291,9 @@ final class DatabaseChainStore implements ChainStore
 
         [$id, $sequence, $head] = self::readChain($row, $key);
 
+        if ($throttle !== null) {
+            $this->ensureThrottle($throttle);
+        }
         if ($driver === IssuerDriver::Aeat && $throttle !== null && self::text($columns, 'throttle_key', $key) !== $throttle->toString()) {
             $this->db->table(VerifactuChain::TABLE)->where('id', $id)->update([
                 'throttle_key' => $throttle->toString(),
