@@ -55,9 +55,17 @@ return new class extends Migration
                 static fn (string $column): bool => Schema::hasColumn('einvoicing_outbound_documents', $column),
             ));
             if ($present !== []) {
-                Schema::table('einvoicing_outbound_documents', function (Blueprint $table) use ($present): void {
-                    if (in_array('ksef_number', $present, true)) {
-                        $table->dropIndex(['ksef_number']);
+                // The index is looked up by its column: created with the table it has the explicit
+                // name of create_einvoicing_tables, added here the name Laravel generated.
+                $index = null;
+                foreach (Schema::getIndexes('einvoicing_outbound_documents') as $candidate) {
+                    if ($candidate['columns'] === ['ksef_number'] && ! $candidate['primary']) {
+                        $index = $candidate['name'];
+                    }
+                }
+                Schema::table('einvoicing_outbound_documents', function (Blueprint $table) use ($present, $index): void {
+                    if ($index !== null) {
+                        $table->dropIndex($index);
                     }
                     $table->dropColumn($present);
                 });

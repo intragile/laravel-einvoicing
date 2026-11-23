@@ -10,19 +10,23 @@ return new class extends Migration
 {
     public function up(): void
     {
+        // Every index is named explicitly: MySQL refuses names longer than 64 characters, and the
+        // names Laravel generates for the transport/provider uniques are longer. The other names
+        // are the ones Laravel generates without a table prefix.
+        //
         // The package loads this migration itself; a published copy must not fail on it.
         if (! Schema::hasTable('einvoicing_outbound_documents')) {
             Schema::create('einvoicing_outbound_documents', function (Blueprint $table): void {
                 $table->id();
                 $table->string('transport', 64);
-                $table->string('reference')->nullable()->index();
+                $table->string('reference')->nullable()->index('einvoicing_outbound_documents_reference_index');
                 $table->string('sender');
                 $table->string('receiver');
                 $table->text('document_type');
                 $table->string('process');
                 $table->char('country_c1', 2)->nullable();
                 $table->longText('xml');
-                $table->string('state', 16)->index();
+                $table->string('state', 16)->index('einvoicing_outbound_documents_state_index');
                 $table->unsignedSmallInteger('attempts')->default(0);
                 $table->unsignedSmallInteger('status_checks')->default(0);
                 $table->string('provider_document_id')->nullable();
@@ -34,13 +38,13 @@ return new class extends Migration
                 $table->timestamp('sent_at')->nullable();
                 $table->timestamp('finished_at')->nullable();
                 // KSeF columns, as add_ksef_to_einvoicing_tables adds them to an existing table.
-                $table->string('ksef_number', 64)->nullable()->index();
+                $table->string('ksef_number', 64)->nullable()->index('einvoicing_outbound_documents_ksef_number_index');
                 $table->string('invoicing_mode', 16)->nullable();
                 $table->timestamp('offline_deadline')->nullable();
                 $table->longText('upo')->nullable();
                 $table->timestamps();
 
-                $table->unique(['transport', 'provider_document_id']);
+                $table->unique(['transport', 'provider_document_id'], 'einv_outbound_transport_provider_id_unique');
             });
         }
 
@@ -53,7 +57,7 @@ return new class extends Migration
                 $table->string('receiver')->nullable();
                 $table->text('document_type')->nullable();
                 $table->timestamp('received_at')->nullable();
-                $table->string('state', 16)->index();
+                $table->string('state', 16)->index('einvoicing_inbound_documents_state_index');
                 $table->longText('xml')->nullable();
                 $table->string('envelope_id')->nullable();
                 $table->unsignedSmallInteger('fetch_attempts')->default(0);
@@ -62,7 +66,7 @@ return new class extends Migration
                 $table->timestamp('acknowledged_at')->nullable();
                 $table->timestamps();
 
-                $table->unique(['transport', 'provider_document_id']);
+                $table->unique(['transport', 'provider_document_id'], 'einv_inbound_transport_provider_id_unique');
             });
         }
     }

@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Fresh installs on MySQL failed at `migrate`: the generated names of the transport/provider
+  unique indexes of `einvoicing_outbound_documents` and `einvoicing_inbound_documents` exceeded
+  MySQL's 64-character limit. Every index of the base migration now has an explicit name of at
+  most 54 characters; only those two uniques get new names
+  (`einv_outbound_transport_provider_id_unique`, `einv_inbound_transport_provider_id_unique`).
+  Existing databases are not changed. Rolling back the KSeF migration now finds the `ksef_number`
+  index by its column, so it also works under a table prefix.
+
 ## [1.2.0] - 2026-11-23
 
 1.2.0 adds French e-invoicing through B2Brouter and Polish KSeF, on top of
