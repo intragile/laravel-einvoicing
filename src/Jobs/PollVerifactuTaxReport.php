@@ -65,12 +65,14 @@ use UnexpectedValueException;
  *   previous report of the check is rebuilt from the stored predecessor in the chain, never read
  *   through B2Brouter's opaque previous_id.
  *
- * Records attach in chain order. A registered record that does not link to the chain head (or
- * would seed an empty chain) while an older B2Brouter record of the same issuer and environment is
- * still pending waits: it stays pending with error_code awaiting_predecessor, without using up its
- * polls, and is polled again once an older record settles (attached, rejected or failed). Only a
- * record that still does not link when no older record is pending is failed and left out of the
- * chain; the chain then stays blocked until an operator acts.
+ * Records attach in chain order, as the records themselves state it. A registered record that does
+ * not link to the chain head (or would seed an empty chain) while the invoice its RegistroAnterior
+ * names is a pending B2Brouter row of the same issuer and environment waits: it stays pending with
+ * error_code awaiting_predecessor, without using up its polls, and is polled again once a record of
+ * the issuer settles (attached, rejected or failed). Row ids play no part. A record whose named
+ * predecessor is not pending is attempted against the head (seeding an empty chain from its link);
+ * if it does not link it is failed and left out of the chain, which then stays blocked until an
+ * operator acts.
  *
  * The record is registered (accepted_with_errors for registered_with_errors) and
  * VerifactuRecordRegistered fires, unless the cross-check fails in the strict mode: the record is
@@ -245,8 +247,8 @@ final class PollVerifactuTaxReport implements ShouldQueue
             return;
         }
 
-        VerifactuRecordRejected::dispatch($row, $code, $message);
         self::wakeSuccessors($row);
+        VerifactuRecordRejected::dispatch($row, $code, $message);
     }
 
     /**
@@ -273,8 +275,8 @@ final class PollVerifactuTaxReport implements ShouldQueue
         $store = $manager->store();
         $key = new ChainKey($record->invoiceId()->issuer, $record->system()->installationNumber, $row->environment);
         $head = $store->head($key);
-        if (! self::links($record, $head) && ($older = self::olderPending($row)) !== null) {
-            $this->await($row, $report, $older);
+        if (! self::links($record, $head) && ($named = self::namedPredecessor($row, $record)) !== null) {
+            $this->await($row, $report, $record, $named);
 
             return;
         }
@@ -307,13 +309,14 @@ final class PollVerifactuTaxReport implements ShouldQueue
             return;
         }
 
+        // Successors are woken before the events, so a failing listener cannot stall them.
+        self::wakeSuccessors($row);
         if (! $strictFailure) {
             VerifactuRecordRegistered::dispatch($row);
         }
         if (! $result->passed()) {
             VerifactuCrossCheckFailed::dispatch($row, $result);
         }
-        self::wakeSuccessors($row);
     }
 
     /**
@@ -321,17 +324,17 @@ final class PollVerifactuTaxReport implements ShouldQueue
      * keeps its polls until an older record settles. When none is pending any more by the time the
      * mark is written, the record is polled again at once.
      */
-    private function await(VerifactuRecord $row, TaxReport $report, VerifactuRecord $older): void
+    private function await(VerifactuRecord $row, TaxReport $report, BillingRecord $record, VerifactuRecord $predecessor): void
     {
         $parked = self::settle($row, [
             'b2brouter_report_id' => $report->id,
             'error_code' => self::AWAITING_PREDECESSOR,
             'error_message' => sprintf(
-                'B2Brouter registered the record, but it does not link to the chain head yet: it waits for the older B2Brouter record row %d to settle.',
-                $older->id,
+                'B2Brouter registered the record, but it does not link to the chain head yet: it waits for B2Brouter record row %d, the invoice its RegistroAnterior names, to settle.',
+                $predecessor->id,
             ),
         ]);
-        if ($parked && self::olderPending($row) === null) {
+        if ($parked && self::namedPredecessor($row, $record) === null) {
             self::schedule($row->id, 0, $this->attempt);
         }
     }
@@ -352,8 +355,8 @@ final class PollVerifactuTaxReport implements ShouldQueue
             return;
         }
 
-        VerifactuCrossCheckFailed::dispatch($row, $result);
         self::wakeSuccessors($row);
+        VerifactuCrossCheckFailed::dispatch($row, $result);
     }
 
     /**
@@ -405,16 +408,27 @@ final class PollVerifactuTaxReport implements ShouldQueue
         return $head === null ? $record->chainLink()->isFirst() : $head->isLinkedBy($record);
     }
 
-    /** The oldest B2Brouter record of the row's issuer and environment imported before it and still pending. */
-    private static function olderPending(VerifactuRecord $row): ?VerifactuRecord
+    /**
+     * The pending, unattached B2Brouter row of the record's issuer and environment for the invoice
+     * the record names in RegistroAnterior, or null when the record names none or no such row is
+     * pending.
+     */
+    private static function namedPredecessor(VerifactuRecord $row, BillingRecord $record): ?VerifactuRecord
     {
+        $previous = $record->chainLink()->previous();
+        if ($previous === null || $previous->issuer->value !== $row->issuer_nif) {
+            return null;
+        }
+
         return VerifactuRecord::query()
             ->where('issuer_nif', $row->issuer_nif)
             ->where('environment', $row->environment->value)
             ->where('driver', IssuerDriver::B2Brouter->value)
             ->where('state', VerifactuRecordState::Pending->value)
             ->whereNull('chain_id')
-            ->where('id', '<', $row->id)
+            ->where('number', $previous->number)
+            ->where('issue_date', $previous->issueDate->format('Y-m-d'))
+            ->whereKeyNot($row->id)
             ->orderBy('id')
             ->first();
     }
@@ -431,7 +445,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
             ->where('state', VerifactuRecordState::Pending->value)
             ->whereNull('chain_id')
             ->where('error_code', self::AWAITING_PREDECESSOR)
-            ->where('id', '>', $row->id)
+            ->whereKeyNot($row->id)
             ->orderBy('id')
             ->get();
 

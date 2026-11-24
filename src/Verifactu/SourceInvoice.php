@@ -298,9 +298,14 @@ final class SourceInvoice
 
     private static function date(mixed $value): DateTimeImmutable
     {
-        $date = DateTimeImmutable::createFromFormat('!Y-m-d', self::text($value));
+        $text = self::text($value);
+        $date = DateTimeImmutable::createFromFormat('!Y-m-d', $text);
+        // An overflowing date (2026-02-31) is parsed as another day; only an exact round trip counts.
+        if ($date === false || $date->format('Y-m-d') !== $text) {
+            throw new UnexpectedValueException(sprintf('"%s" is not a Y-m-d date', $text));
+        }
 
-        return $date === false ? throw new UnexpectedValueException('a date is not Y-m-d') : $date;
+        return $date;
     }
 
     private static function text(mixed $value): string

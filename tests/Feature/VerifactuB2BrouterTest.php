@@ -638,10 +638,11 @@ final class VerifactuB2BrouterTest extends TestCase
 
         $this->runPoll($b->id);
         $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+        $this->assertSame(1, $this->pollsOf($b));
 
         $this->runPoll($a->id);
         $this->assertSame(VerifactuRecordState::Failed, $a->refresh()->state);
-        Queue::assertPushed(PollVerifactuTaxReport::class, static fn (PollVerifactuTaxReport $job): bool => $job->recordId === $b->id);
+        $this->assertSame(2, $this->pollsOf($b));
 
         // No older record is pending any more: B starts the chain from its own link.
         $this->runPoll($b->id);
@@ -661,8 +662,10 @@ final class VerifactuB2BrouterTest extends TestCase
 
         $this->runPoll($c->id);
         $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $c->refresh()->error_code);
+        $this->assertSame(1, $this->pollsOf($c));
         $this->runPoll($b->id);
         $this->assertSame(VerifactuRecordState::Failed, $b->refresh()->state);
+        $this->assertSame(2, $this->pollsOf($c));
 
         // C links to B, which AEAT never registered: it cannot join the chain.
         $this->runPoll($c->id);
@@ -672,6 +675,127 @@ final class VerifactuB2BrouterTest extends TestCase
         $this->assertNull($c->chain_id);
         $this->assertSame(1, VerifactuChain::query()->sole()->sequence);
         Event::assertDispatched(VerifactuCrossCheckFailed::class, static fn (VerifactuCrossCheckFailed $event): bool => $event->record->id === $c->id);
+    }
+
+    public function test_record_waits_on_the_predecessor_it_names_whatever_the_row_order(): void
+    {
+        // Two concurrent register() calls: B2Brouter wrote A first, then B, but B's row was inserted first.
+        Queue::fake();
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $a = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        $this->assertLessThan($a->id, $b->id);
+
+        // B names A (PROBE-ES-0001) in RegistroAnterior, and A is pending: B waits, nothing is seeded.
+        $this->runPoll($b->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+        $this->assertStringContainsString((string) $a->id, (string) $b->error_message);
+        $this->assertSame(0, VerifactuChain::query()->count());
+
+        $this->runPoll($a->id);
+        $this->assertSame(VerifactuRecordState::Registered, $a->refresh()->state, (string) json_encode($a->cross_check));
+        $this->assertSame(1, $a->sequence);
+        $this->assertSame(2, $this->pollsOf($b));
+
+        $this->runPoll($b->id);
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $b->state, (string) json_encode($b->cross_check));
+        $this->assertSame(2, $b->sequence);
+        $this->assertFalse(VerifactuChain::query()->sole()->seeded);
+    }
+
+    public function test_retried_import_written_after_a_newer_row_waits_on_it(): void
+    {
+        // X's import outcome is unknown; Y is imported; X is retried and B2Brouter writes it after Y.
+        Queue::fake();
+        $this->api->onImport(new Response(503));
+        $this->catch(fn () => $this->manager()->register($this->ubl2Invoice()));
+        $x = VerifactuRecord::query()->sole();
+        $y = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        $this->api->importable('24433033', $this->ubl2Invoice()->number, '1064493')
+            ->report('1064493', VerifactuSamples::b2brouterFixture('record-1064493.xml'))
+            ->onImport('24433033');
+        $this->manager()->retryB2BrouterImport($x);
+
+        $this->runPoll($x->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $x->refresh()->error_code);
+        $this->runPoll($y->id);
+        $this->assertSame(1, $y->refresh()->sequence);
+        $this->runPoll($x->id);
+
+        $x->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $x->state, (string) json_encode($x->cross_check));
+        $this->assertSame(2, $x->sequence);
+    }
+
+    public function test_record_does_not_wait_on_a_pending_row_it_does_not_name(): void
+    {
+        Queue::fake();
+        // Pending, same issuer, environment and issue date, but another number than B's RegistroAnterior.
+        $other = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-9999'), '24433009', '1064499', 'record-1064490.xml', ['processing']);
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+
+        $this->runPoll($b->id);
+
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $b->state, (string) json_encode($b->cross_check));
+        $this->assertSame(1, $b->sequence);
+        $this->assertTrue(VerifactuChain::query()->sole()->seeded);
+        $this->assertSame(VerifactuRecordState::Pending, $other->refresh()->state);
+    }
+
+    public function test_successors_are_woken_before_a_listener_can_fail(): void
+    {
+        Queue::fake();
+        $a = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+        Event::listen(VerifactuRecordRegistered::class, static function (): void {
+            throw new RuntimeException('listener failed');
+        });
+
+        $exception = $this->catch(fn () => $this->runPoll($a->id));
+
+        $this->assertInstanceOf(RuntimeException::class, $exception);
+        $this->assertSame(1, $a->refresh()->sequence);
+        $this->assertSame(2, $this->pollsOf($b));
+    }
+
+    public function test_successor_of_a_record_failed_unattached_is_woken(): void
+    {
+        $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        Queue::fake();
+        // B2Brouter registered B, but its record cannot be read: B fails without joining the chain.
+        $this->api->invoice('24433033', SpanishInvoices::NUMBER, '1064493')
+            ->report('1064493', '<not-a-record/>')
+            ->onImport('24433033');
+        $b = $this->manager()->register($this->ubl2Invoice());
+        $c = $this->import($this->exemptProbe(ExemptOperation::E6), '24433050', '1064500', 'record-1064500.xml');
+
+        $this->runPoll($c->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $c->refresh()->error_code);
+        $this->assertSame(1, $this->pollsOf($c));
+
+        $this->runPoll($b->id);
+        $this->assertSame('unreadable_record', $b->refresh()->error_code);
+        $this->assertSame(2, $this->pollsOf($c));
+
+        $this->runPoll($c->id);
+        $this->assertSame('chain_conflict', $c->refresh()->error_code);
+    }
+
+    public function test_stored_date_that_overflows_is_refused(): void
+    {
+        $data = SourceInvoice::toArray(new SpanishInvoice(
+            type: InvoiceType::F3,
+            substituted: [new InvoiceId(Nif::parse(self::ISSUER), 'OLD-1', new DateTimeImmutable('2026-02-28'))],
+        ));
+        $this->assertEquals('2026-02-28', $data['substituted'][0]['issue_date']);
+        $data['substituted'][0]['issue_date'] = '2026-02-31';
+
+        $exception = $this->catch(static fn () => SourceInvoice::fromArray($data));
+
+        $this->assertInstanceOf(UnexpectedValueException::class, $exception);
+        $this->assertStringContainsString('2026-02-31', $exception->getMessage());
     }
 
     public function test_second_run_after_attach_changes_nothing(): void
@@ -882,6 +1006,12 @@ final class VerifactuB2BrouterTest extends TestCase
             ->onImport($invoiceId);
 
         return $this->manager()->register($invoice);
+    }
+
+    /** The polls of the row queued so far. */
+    private function pollsOf(VerifactuRecord $row): int
+    {
+        return Queue::pushed(PollVerifactuTaxReport::class, static fn (PollVerifactuTaxReport $job): bool => $job->recordId === $row->id)->count();
     }
 
     /** Makes the next read of the row see it as still pending and unattached, as a concurrent run would. */
