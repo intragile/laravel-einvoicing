@@ -270,10 +270,11 @@ return [
     | certificate) or "b2brouter".
     |
     | "system" declares the billing software that produces the records
-    | (SistemaInformatico). Every value is required and none has a default: the
-    | producer of the installation declares itself. Give either "nif" or
-    | "foreign_id" (type, id, country), not both. Nothing here makes the library
-    | a certified billing system.
+    | (SistemaInformatico). Every value is required for the "aeat" driver and
+    | none has a default: the producer of the installation declares itself.
+    | While every issuer uses "b2brouter", which writes its own, it may stay
+    | empty. Give either "nif" or "foreign_id" (type, id, country), not both.
+    | Nothing here makes the library a certified billing system.
     |
     | "issuers" maps each obligated issuer's NIF to its "name" and, optionally,
     | its own "driver", "representative" (name, nif) and "aeat" override of the

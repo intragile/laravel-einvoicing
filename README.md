@@ -8,8 +8,9 @@ Developed and maintained by [IntrAgile Kft.](https://intragile.eu)
 [![License](https://img.shields.io/packagist/l/intragile/laravel-einvoicing.svg)](LICENSE)
 
 The Laravel bridge for [`intragile/php-einvoicing`](https://github.com/intragile/php-einvoicing):
-send and receive EN 16931 invoices over **Peppol**, French e-invoicing through B2Brouter and
-Polish **KSeF** FA(3) invoices from a Laravel application.
+send and receive EN 16931 invoices over **Peppol**, French e-invoicing through B2Brouter,
+Polish **KSeF** FA(3) invoices and Spanish **VERI\*FACTU** billing records from a Laravel
+application.
 
 [Magyar nyelvű leírás → README.hu.md](README.hu.md)
 
@@ -34,6 +35,10 @@ Polish **KSeF** FA(3) invoices from a Laravel application.
 - **Polish KSeF:** queued FA(3) sending with the KSeF number and receipt stored, inbox polling
   within KSeF's read limits, offline deadlines and KSeF certificates; see
   [Polish KSeF](#polish-ksef).
+- **Spanish VERI\*FACTU:** billing records generated, chained and stored per issuer and
+  installation, with the QR URL at once; queued submission to AEAT under its flow control, or
+  B2Brouter as the asynchronous alternative, cross-checked against our own engine; see
+  [Spanish VERI\*FACTU](#spanish-verifactu).
 - `EInvoicing::fake()` for your tests, and `einvoicing:doctor` to check an installation.
 
 > **Live testing, per driver.** Recommand is live-tested on the Peppol test network, through this
@@ -814,6 +819,336 @@ even with `--live`. The `retry_after` check includes the KSeF jobs' timeouts (se
 - **The offline deadline helper** treats every offline row as offline24 and knows only the outages
   Latarnia announces.
 
+## Spanish VERI\*FACTU
+
+`EInvoicing::verifactu()` keeps the VERI\*FACTU billing records of Spanish invoices for the Spanish
+tax authority (AEAT): it generates each record (`RegistroAlta`, `RegistroAnulacion`) from an
+EN 16931 invoice of the core model, chains it with its SHA-256 `Huella` in the database, returns
+its QR URL at once so the invoice can be printed, and submits it through the queue under the AEAT
+flow control. B2Brouter can take the AEAT side instead, asynchronously. Requires
+`intragile/php-einvoicing` 1.3 or later; the core's
+[SPAIN.md](https://github.com/intragile/php-einvoicing/blob/main/docs/countries/SPAIN.md)
+describes the mapping, the chain and the transports in detail.
+
+> **Release label:** Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-checked); direct AEAT submission verified offline only — it needs a Spanish NIF and a qualified certificate
+
+**Scope: VERI\*FACTU mode only.** Not covered, each deferred to a later release or connector:
+
+- **non-VERI\*FACTU mode** (XAdES-signed local records, the event log and its chain, the 6-hour
+  summary event, the chain self-check and the requerimiento endpoint);
+- **TicketBAI** (the Basque foral territories) and **Navarra**, which run their own regimes;
+- **Facturae 3.2.x / FACe** (B2G invoices);
+- **SII**: SII taxpayers are outside VERI\*FACTU;
+- **the Crea y Crece B2B e-invoicing mandate** (RD 238/2026, Orden HAC/1028/2026);
+- **the paginated `ConsultaFactuSistemaFacturacion` export**: only a single-invoice lookup is
+  available (`einvoicing:verifactu-status --lookup`).
+
+**Dates.** Under current law (RDL 15/2025) VERI\*FACTU applies from 1 January 2027 to corporate-tax
+payers and from 1 July 2027 to everyone else. On 5 October 2026 the Ministry announced a move of
+both to October 2028 (**announced, not enacted**: nothing had been published in the BOE as of
+23 November 2026). Nothing in this package depends on which date applies.
+
+**No certification, no declaration.** This package is a component, not a certified billing
+system (SIF). IntrAgile does not act as the producer of your billing software and signs no
+*declaración responsable*; see [Your declaration](#your-declaration-declaración-responsable).
+
+### Installation and the AEAT schemas
+
+```bash
+php artisan migrate                              # the chain, throttle and record tables
+php artisan einvoicing:verifactu-install-schemas # downloads the AEAT schemas into schemas_dir
+```
+
+The AEAT XSDs (and the W3C xmldsig schema they import) are **downloaded, never bundled**: they
+carry no licence that allows redistribution. The command downloads the pinned files and checks
+their checksums into `einvoicing.verifactu.schemas_dir` (default `storage/einvoicing/verifactu`).
+For an offline install, download them elsewhere and pass `--from=DIR`, the folder holding the eight
+schema files by name; the checksums are checked the same way. `register()`, `cancel()` and
+`correct()` refuse to run until the schemas are installed.
+
+### Configuration
+
+```dotenv
+VERIFACTU_ENVIRONMENT=test               # test (AEAT pre-production) or production; production only when set
+VERIFACTU_DRIVER=aeat                    # aeat (direct submission) or b2brouter
+VERIFACTU_ISSUER_NIF=B12345674           # a single issuer; see "issuers" for several
+VERIFACTU_ISSUER_NAME="Mi Empresa S.L."
+
+# The billing software that produces the records (SistemaInformatico): yours, never IntrAgile.
+VERIFACTU_PRODUCER_NAME="Your Software S.L."
+VERIFACTU_PRODUCER_NIF=A39200019
+VERIFACTU_SYSTEM_NAME=YourInvoicing
+VERIFACTU_SYSTEM_ID=01
+VERIFACTU_SYSTEM_VERSION=2.4.1
+VERIFACTU_INSTALLATION_NUMBER=0001
+VERIFACTU_SYSTEM_VERIFACTU_ONLY=true
+VERIFACTU_SYSTEM_MULTIPLE_TAXPAYERS_POSSIBLE=false
+VERIFACTU_SYSTEM_MULTIPLE_TAXPAYERS_INDICATOR=false
+
+# Direct AEAT submission (driver aeat)
+VERIFACTU_AEAT_CERTIFICATE=/run/secrets/aeat.p12   # a PKCS#12 file, or a PEM certificate ...
+# VERIFACTU_AEAT_PRIVATE_KEY=/run/secrets/aeat.key.pem  # ... with its private key
+VERIFACTU_AEAT_PASSWORD=...
+# VERIFACTU_CA_BUNDLE=/etc/ssl/aeat-ca.pem          # must contain the FNMT root (see below)
+
+# B2Brouter (driver b2brouter): the name of a b2brouter transport of einvoicing.transports
+# VERIFACTU_B2BROUTER_TRANSPORT=b2brouter
+
+# VERIFACTU_SCHEMAS_DIR=/var/lib/verifactu
+```
+
+The `einvoicing.verifactu` block also holds `timezone` (`Europe/Madrid`, the zone of the
+generation timestamp), `system.foreign_id` (for a producer without a Spanish NIF: give either `nif`
+or `foreign_id`), `aeat.port` (`personal` or `seal`, which picks the AEAT host), `aeat.timeout`
+(30 s) and `aeat.connect_timeout` (10 s), `b2brouter.poll_attempts` (10) and
+`b2brouter.poll_delay` (30 s), `submission` (`queue`, `connection`, `max_batch` 1 to 1000,
+`initial_wait` 60 s, `throttle_scope`), `cross_check` (`strict` or `report`) and
+`stuck_after_minutes` (60). The `system` block has no defaults: the producer of the installation
+declares itself. It is needed for the AEAT driver; while every issuer uses B2Brouter, which writes
+its own `SistemaInformatico`, it may stay empty.
+
+**Issuers.** `einvoicing.verifactu.issuers` maps each obligated issuer's NIF to its `name` and,
+optionally, its own `driver`, a `representative` (`name`, `nif`) and an `aeat` override of the
+certificate settings:
+
+```php
+// config/einvoicing.php
+return [
+    // ...
+    'verifactu' => [
+        // ...
+        'issuers' => [
+            'B12345674' => ['name' => 'Mi Empresa S.L.'],
+            'A58818501' => [
+                'name' => 'Cliente Prueba S.A.',
+                'driver' => 'aeat',
+                'aeat' => ['certificate' => '/run/secrets/a58818501.p12', 'password' => env('AEAT_A58818501_PASSWORD')],
+            ],
+        ],
+    ],
+];
+```
+
+Issuers are resolved at run time through the core's `VerifactuIssuerResolver`; the config-backed
+`ConfigIssuerResolver` is the default. An application that keeps its tenants in the database binds
+its own, which returns an `IssuerContext` (name, driver, environment, credentials, representative)
+per NIF and lists every issuer for the doctor:
+
+```php
+use IntrAgile\EInvoicing\Spain\Nif;
+use IntrAgile\EInvoicing\Spain\Verifactu\AeatCredentials;
+use IntrAgile\EInvoicing\Spain\CertificateKind;
+use IntrAgile\EInvoicing\Spain\Verifactu\IssuerContext;
+use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
+use IntrAgile\EInvoicing\Spain\Verifactu\Exception\UnknownIssuer;
+use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuIssuerResolver;
+use IntrAgile\EInvoicing\Spain\VerifactuEnvironment;
+
+final class TenantIssuerResolver implements VerifactuIssuerResolver
+{
+    public function resolve(Nif $issuer): IssuerContext
+    {
+        $tenant = Tenant::query()->where('nif', $issuer->value)->first()
+            ?? throw new UnknownIssuer("No tenant for {$issuer->value}.");
+
+        return new IssuerContext(
+            $issuer,
+            $tenant->legal_name,
+            IssuerDriver::Aeat,
+            VerifactuEnvironment::from(config('einvoicing.verifactu.environment')),
+            new AeatCredentials($tenant->certificate_path, $tenant->certificatePassword(), null, CertificateKind::Personal),
+        );
+    }
+
+    public function issuers(): array
+    {
+        return Tenant::query()->pluck('nif')->map(fn (string $nif): Nif => Nif::parse($nif))->all();
+    }
+}
+
+// AppServiceProvider::register()
+$this->app->singleton(VerifactuIssuerResolver::class, TenantIssuerResolver::class);
+```
+
+The context's environment must be the configured `einvoicing.verifactu.environment`; another one
+is refused.
+
+### The AEAT certificate and TLS
+
+Direct submission authenticates with the issuer's (or its representative's) qualified certificate
+over mutual TLS. `aeat.certificate` is a PKCS#12 file with its password, or a PEM certificate with
+`aeat.private_key`. The bridge writes the certificate and key as PEM files (mode 0600) into a 0700
+folder under `storage/einvoicing/verifactu/tls`, hands them to its Guzzle client (`cert`,
+`ssl_key`, `verify` with the CA bundle) and deletes them when the client is dropped; files a killed
+worker left behind are removed after a day. One client is kept per credential set, and a
+certificate renewed in place is picked up on the next use. TLS verification is never disabled.
+
+AEAT's servers chain to the FNMT root **AC RAIZ FNMT-RCM SERVIDORES SEGUROS**, which many system CA
+bundles lack. `aeat.ca_bundle` (`VERIFACTU_CA_BUNDLE`) points to a bundle that contains it; `null`
+uses the OpenSSL default. The doctor warns when the bundle has no FNMT root, shows the certificate
+holder and its days to expiry, and fails on an expired one.
+
+### Registering, cancelling and correcting
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Spain\Nif;
+use IntrAgile\EInvoicing\Spain\Verifactu\InvoiceId;
+
+$record = EInvoicing::verifactu()->register($invoice, reference: 'order-1042');
+$record->qr_url;   // print it on the invoice now (AEAT driver)
+$record->hash;     // the Huella; $record->state is "generated" until AEAT answers
+
+$id = new InvoiceId(Nif::parse('B12345674'), 'F-2027-0042', new \DateTimeImmutable('2027-01-15'));
+EInvoicing::verifactu()->cancel($id, reference: 'void-17');
+EInvoicing::verifactu()->correct($rectifiedInvoice);       // SpanishInvoice::$operation: not Initial
+EInvoicing::verifactu()->record($id);                      // the latest record row, or null
+```
+
+- **`register(Invoice $invoice, ?string $reference = null)`** generates the `RegistroAlta`
+  synchronously under the chain lock, stores the exact XML and the literal timestamp text, and
+  returns the `VerifactuRecord` row with its `qr_url`, so the invoice can be printed at once.
+  Spanish data the EN 16931 model does not carry (invoice type, correction type, exemption
+  article, recipients without a VAT number, the operation flags) comes from a core
+  `SpanishInvoice` extension on the invoice. An invoice that already has a registration record in
+  its chain is refused.
+- **`cancel(InvoiceId $invoice, ?string $reference = null, AnulacionOperation $operation = Normal, bool $registeredByPreviousSystem = false)`**
+  appends a `RegistroAnulacion`. Use `AnulacionOperation::WithoutPriorRecord` for an invoice AEAT
+  never received. An invoice registered by the software used before the chain was seeded has no
+  local record: pass `registeredByPreviousSystem: true`, which only a seeded chain accepts.
+- **`correct(Invoice $invoice, ?string $reference = null)`** appends a new registration of an
+  invoice that already has one, for a correction (`Subsanacion`) or a new submission after a
+  rejection; the operation comes from `SpanishInvoice::$operation`.
+- **`record(InvoiceId $invoice)`** returns the latest record row of the invoice.
+
+A record that AEAT rejects stays in the chain as generated; the chain is never rewritten. Fix the
+invoice and submit it again with `correct()`.
+
+### Queue and AEAT flow control
+
+Records are sent by `SubmitVerifactuRecords` on `submission.connection` / `submission.queue`
+(`null` falls back to `einvoicing.queue`). AEAT binds its wait between submissions
+(`TiempoEsperaEnvio`) to the billing system, so by default there is **one throttle per
+installation** (`NumeroInstalacion` and environment), shared by every issuer of the installation:
+each run sends at most one request, of one issuer, with up to `max_batch` records in chain order,
+and waits `initial_wait` seconds until AEAT names its own wait. The wait is skipped only for a
+submission of 1,000 records, as Orden HAC/1177/2024 art. 16.2 allows. With written confirmation
+from AEAT that your issuers may be throttled separately, set `throttle_scope` to `issuer`.
+
+The bytes sent are the bytes stored. A send without an answer leaves its records `unconfirmed`;
+they are resent with the same bytes after the `einvoicing.sending.backoff` delays, up to
+`sending.max_attempts`, and an AEAT duplicate answer then confirms them. A submission refused as a
+whole (a non-transient SOAP `Client` fault or an authentication fault) registered nothing: its
+records keep their state, the throttle row is blocked and `VerifactuSubmissionBlocked` fires;
+`einvoicing:verifactu-submit` clears the block once the cause is fixed. The job's timeout is set,
+and the doctor checks it against `retry_after`.
+
+### B2Brouter mode
+
+With the driver `b2brouter` (globally or per issuer), B2Brouter is the billing system: it
+generates, chains and submits the record on its own installation, and also delivers the invoice
+through the contact's transport. `register()` imports the invoice (UBL) synchronously and returns
+a **`pending`** row without QR or hash; `PollVerifactuTaxReport` then polls the tax report (15 reads
+3 s apart per run, then again after `poll_delay`, `poll_attempts` runs in all). Once AEAT registered
+the record, the bridge stores B2Brouter's XML, its `Huella` and the QR URL B2Brouter prints (the
+production `www2.agenciatributaria.gob.es` host, in B2Brouter's sandbox too), attaches it to a
+B2Brouter chain of its own, and fires `VerifactuRecordRegistered`. `registered_with_errors` (AEAT's
+*AceptadoConErrores*) is stored as `accepted_with_errors` and attached. `cancel()` and `correct()`
+are refused in this mode; manage cancellations in B2Brouter. An import whose outcome is unknown is
+looked up by number before it is ever imported again (`einvoicing:verifactu-submit
+--retry-unconfirmed`).
+
+Every registered record is **cross-checked** against our own engine: the XML against the schema,
+the `Huella` recomputed from its text, its link to the previous stored record, a semantic
+comparison with our own record of the same invoice, and the URL in B2Brouter's QR code. In `strict`
+mode a failed check fails the row (it stays attached, since AEAT holds it); in `report` mode it is
+only reported. Either way `VerifactuCrossCheckFailed` fires. Two differences are **known
+divergences**, never failures: the exemption article follows the B2Brouter account's default
+(`OperacionExenta` E1 for any exempt line), and a credit note by difference (R1, I) carries
+positive amounts, where AEAT expects the signed difference. Reading the QR image needs
+`chillerlan/php-qrcode` with `ext-gd` or `ext-imagick`; without it the URL is compared by its
+parameters.
+
+Records attach in the order the records themselves state: a record whose predecessor is still
+pending waits for it, and a record that does not link is failed and left out of the chain, which
+the doctor then reports as blocked.
+
+### Seeding a chain and switching drivers
+
+A chain is keyed by issuer NIF, installation number and environment, so test and production
+records never share one. To continue a chain that another implementation started, seed it with
+the last record that software registered; its `Huella` is trusted and verification starts after
+it:
+
+```bash
+php artisan einvoicing:verifactu-seed-chain B12345674 F-2026-0999 2026-12-31 "$HUELLA"   # the 64-character Huella of that record
+```
+
+Switching an issuer between the AEAT and B2Brouter drivers starts a new chain on a different
+billing system, so `register()` and the doctor refuse while an open chain of the other driver
+exists. The cut-over is explicit: settle the old chain's records, then close it with
+`einvoicing:verifactu-close-chain --issuer=B12345674`, which refuses while any of its records is
+`generated`, `sending`, `unconfirmed` or `pending`.
+
+### Events
+
+| Event | When |
+|---|---|
+| `VerifactuRecordGenerated(record)` | a record was generated and queued (AEAT driver) |
+| `VerifactuRecordAccepted(record, withErrors, errorCode)` | AEAT accepted it, possibly with errors (*AceptadoConErrores*) |
+| `VerifactuRecordRejected(record, errorCode, errorMessage)` | AEAT rejected it, or the B2Brouter tax report failed |
+| `VerifactuRecordUnconfirmed(record)` | its outcome is unknown after the automatic resends or polls |
+| `VerifactuRecordRegistered(record)` | B2Brouter mode: AEAT registered B2Brouter's record; QR URL and hash are on the row |
+| `VerifactuCrossCheckFailed(record, result)` | B2Brouter's record differs from ours beyond the known divergences |
+| `VerifactuSubmissionBlocked(throttleKey, code, message)` | AEAT refused a whole submission; sending waits for `einvoicing:verifactu-submit` |
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `einvoicing:verifactu-install-schemas [--from=DIR]` | download (or copy) and check the AEAT schemas |
+| `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | clear a blocked submission and send the due records now; `--retry-unconfirmed` takes again the records no longer resent or polled automatically, including `sending` rows left by a killed worker |
+| `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup]` | the stored state, CSV and errors; `--lookup` asks AEAT (or B2Brouter) about the latest record, never submits, and marks an `unconfirmed` record accepted when AEAT holds the same `Huella` (without a CSV, which AEAT cannot return later) |
+| `einvoicing:verifactu-verify-chain [--issuer=]` | recompute every stored hash and link, and compare each head with its last record; fails only on integrity breaks |
+| `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | continue a chain from another implementation |
+| `einvoicing:verifactu-close-chain [--issuer=] [--driver=]` | close the chains of the driver an issuer no longer uses |
+
+### Doctor
+
+`einvoicing:doctor` adds `verifactu` rows once an issuer is configured: the configuration, the
+installed schemas and their checksums, the declared system, every issuer the resolver lists, each
+AEAT certificate (holder, days to expiry; expired fails), the CA bundle's FNMT root (a warning), the
+B2Brouter key against the environment (`test_` outside production), the tables, driver switches,
+chain heads against their last records, seeded chains, records stuck beyond `stuck_after_minutes`,
+blocked or held-back B2Brouter chains, failed cross-checks and blocked submissions. `--live` adds a
+TLS handshake with the configured AEAT endpoint, never a submission; run it yourself, with your
+certificate.
+
+### Your declaration (declaración responsable)
+
+The producer of a billing system signs a *declaración responsable* that the system meets the
+RRSIF (RD 1007/2023, Orden HAC/1177/2024). **IntrAgile does not act as producer, signs no
+declaration and ships no template for one.** This package implements record generation, the
+`Huella` and the chain, the record XML, the QR URL and the AEAT SOAP client. Your application must
+still guarantee:
+
+- the indefectible coupling of every invoice and its record (no invoice without a record);
+- that records are never deleted or altered;
+- that records are sent immediately;
+- the correction and cancellation flows;
+- its own `SistemaInformatico` identity (the `system` block);
+- the declaration itself, naming this library and its version as a component.
+
+### Limits
+
+- **Direct AEAT submission is verified offline only**, against the AEAT schemas, the published
+  examples and a local TLS endpoint; a live AEAT run needs a Spanish NIF and a qualified
+  certificate.
+- **B2Brouter mode:** no cancellation or correction through the bridge; the exemption article and
+  the credit-note sign follow the B2Brouter account settings.
+- **Lookups:** one invoice at a time; no paginated export.
+- **Non-VERI\*FACTU mode** and the other Spanish regimes listed above are not covered.
+
 ## Queues
 
 Configure the connection and queue name with `einvoicing.queue.connection` and
@@ -948,6 +1283,7 @@ configured secret while faked.
 | `einvoicing:ksef-deadlines` | list offline KSeF invoices not yet delivered with their deadlines and fire `KsefOfflineDeadlineApproaching`; schedule it hourly |
 | `einvoicing:poll-inbound [--transport=] [--include-capped]` | record waiting inbound documents and queue their intake; schedule it. `--include-capped` gives each document at `inbound.max_fetch_attempts` one more attempt. `--transport=ksef` reads the KSeF inbox, at most once per `einvoicing.ksef.inbound_min_interval_minutes` |
 | `einvoicing:resolve ID (--sent=DOCUMENT-ID \| --resend) [--force]` | resolve an `unconfirmed` send, or queue a document again |
+| `einvoicing:verifactu-*` | install the AEAT schemas, submit, status and lookup, verify, seed and close VERI\*FACTU chains; see [Commands](#commands) |
 
 ## What is verified
 
@@ -959,6 +1295,7 @@ configured secret while faked.
 | B2Brouter and e-invoice.be drivers | Core offline contract tests with fixtures written from each provider's public API reference, core live groups `b2brouter-live` and `einvoicebe-live`; manager, config, doctor and webhook routing tested here | **Live-tested against the provider sandbox (simulated network)** (2026-11-15, core) |
 | French flow (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | Core offline contract tests and core live group `b2brouter-france-live`; bridge live smoke run `B2BrouterFranceSmokeTest`: the `Annuaire` binding, a send that reaches `Deposited` and a full payment that reads `Collected` | **Live-tested against the B2Brouter sandbox** (2026-11-18: core run and bridge run, French sandbox account); an accepted Flux 10 deposit is not yet live-tested |
 | Polish KSeF (`EInvoicing::ksef()`, `SendKsefInvoice`, `PollKsefStatus`, KSeF inbox, deadlines, certificate command, doctor row) | Offline feature tests against canned KSeF answers; bridge live run `KsefLiveTest` (group `ksef-live`) on KSeF TE: a queued send on the `sync` connection that ends delivered with its KSeF number and receipt, and the buyer's `einvoicing:poll-inbound --transport=ksef` that fires `DocumentReceived` within 15 metadata queries; the core live group `ksef-live` covers offline sending, KSeF certificates and the QR links | **Live-tested on KSeF TE** (2026-11-22, bridge run on PHP 8.5 and 8.3); offline deadlines, the certificate command and the doctor row are tested offline here |
+| Spanish VERI\*FACTU (`EInvoicing::verifactu()`, chain store, `SubmitVerifactuRecords`, `PollVerifactuTaxReport`, commands, doctor rows) | Offline feature tests against the AEAT schemas, canned AEAT SOAP answers, B2Brouter answers copied from the core's live captures and a local TLS endpoint; chain concurrency with forked writers on SQLite (MySQL and PostgreSQL in the `databases` CI job); bridge live run `B2BrouterVerifactuLiveTest` (group `b2brouter-spain-live`) on the B2Brouter Spanish sandbox, `sync` queue: two chained F1 invoices, an exempt invoice and an R1/I credit note, each `registered`, attached to one B2Brouter chain and cross-checked (exemption article and credit-note sign as known divergences), then `einvoicing:verifactu-verify-chain` | **Verifactu live-verified on the B2Brouter sandbox** (2026-11-24, bridge run on PHP 8.5); direct AEAT submission verified offline only |
 | Webhook signatures | Offline tests against each provider's documented scheme (e-invoice.be also against its published test vector) | Verified offline; **B2Brouter webhooks live-tested** (2026-11-18: real signed sandbox deliveries replayed through the bridge); Recommand and e-invoice.be webhooks not live-tested |
 
 The core requires `brick/math` ^0.14.8, which Laravel 13 also accepts.
@@ -967,14 +1304,18 @@ The run results, with dates and commits, are in the core's
 [VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md). Webhook signatures are verified offline against each provider's documented scheme (e-invoice.be also against its published test vector); only B2Brouter's webhooks were live-tested (2026-11-18, sandbox deliveries replayed through the Laravel bridge).
 
 The default test run of this package makes no network call; the live smoke run is excluded from
-it (groups `recommand-live`, `b2brouter-france-live` and `ksef-live`, testsuite `Live`). The KSeF
+it (groups `recommand-live`, `b2brouter-france-live`, `ksef-live` and `b2brouter-spain-live`,
+testsuite `Live`). The KSeF
 run needs no account: it reaches only KSeF TE (`https://api-test.ksef.mf.gov.pl/v2`, every other
 KSeF host is refused), uses random NIPs with self-signed seals written to a temporary directory
 (mode 0600), every request has a timeout, and it does not start between 15:40 and 18:00
 Europe/Warsaw, around TE's daily maintenance. The Recommand run
 refuses unless the key belongs to a Recommand playground on the Peppol test network; the French
 run (`B2BROUTER_API_KEY` and `B2BROUTER_ACCOUNT_ID` of a French B2Brouter account) refuses any key
-but a `test_` key on the sandbox host or a `stag_` key on the staging host.
+but a `test_` key on the sandbox host or a `stag_` key on the staging host. The Spanish run
+(`B2BROUTER_ES_API_KEY` and `B2BROUTER_ES_ACCOUNT_ID` of a Spanish B2Brouter sandbox account) refuses
+any key but a `test_` key on `https://api.b2brouter.net` before its first request, never calls
+AEAT, and creates four sandbox invoices per run.
 `B2BrouterWebhookReplayTest` in the same group replays webhook deliveries captured from B2Brouter
 (`B2BROUTER_WEBHOOK_CAPTURE_DIR`, `B2BROUTER_WEBHOOK_SECRET`) through the webhook route without
 any network call. The core has opt-in live groups:
@@ -1011,7 +1352,14 @@ composer test        # PHPUnit
 composer analyse     # PHPStan, max level
 composer format      # Pint
 EINVOICING_PEPPOL_FROM=/path/to/peppol/sch vendor/bin/phpunit --group peppol-rules
+php artisan einvoicing:verifactu-install-schemas   # or: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
+vendor/bin/phpunit --group verifactu-official --fail-on-skipped
+EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency
 ```
+
+**`EINVOICING_TEST_DB_URL` points the chain concurrency test at a MySQL or PostgreSQL database,
+which it wipes (it drops and re-creates every table).** Give it a throwaway database, never one
+that holds data; without the variable the test runs on a temporary SQLite file.
 
 ## License
 

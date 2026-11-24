@@ -9,7 +9,8 @@ Fejlesztő és karbantartó: [IntrAgile Kft.](https://intragile.eu)
 
 Laravel-integráció az [`intragile/php-einvoicing`](https://github.com/intragile/php-einvoicing)
 csomaghoz: EN 16931 szerinti számlák küldése és fogadása **Peppol** hálózaton, francia
-e-számlázás a B2Brouteren át és lengyel **KSeF** FA(3) számlák, Laravel alkalmazásból.
+e-számlázás a B2Brouteren át, lengyel **KSeF** FA(3) számlák és spanyol **VERI\*FACTU**
+nyilvántartási rekordok, Laravel alkalmazásból.
 
 [English documentation → README.md](README.md)
 
@@ -35,6 +36,10 @@ e-számlázás a B2Brouteren át és lengyel **KSeF** FA(3) számlák, Laravel a
 - **Lengyel KSeF:** sorba állított FA(3) küldés a KSeF-szám és a nyugta tárolásával,
   postafiók-lekérdezés a KSeF olvasási keretein belül, offline határidők és KSeF-tanúsítványok;
   lásd: [Lengyel KSeF](#lengyel-ksef).
+- **Spanyol VERI\*FACTU:** kibocsátónként és telepítésenként előállított, láncolt és tárolt
+  nyilvántartási rekordok, azonnali QR URL-lel; sorba állított beküldés az AEAT-nak a
+  forgalomszabályozása szerint, vagy aszinkron alternatívaként a B2Brouter, a saját motorunkkal
+  keresztellenőrizve; lásd: [Spanyol VERI\*FACTU](#spanyol-verifactu).
 - `EInvoicing::fake()` a saját tesztekhez, `einvoicing:doctor` a telepítés ellenőrzéséhez.
 
 > **Éles tesztelés driverenként.** A Recommandot a Peppol teszthálózaton teszteltük élesben, e
@@ -847,6 +852,347 @@ ellenőrzése a KSeF-jobok időkorlátját is figyelembe veszi (lásd: [Queue](#
 - **Az offline határidő-segéd** minden offline sort offline24-ként kezel, és csak a Latarnia
   által bejelentett üzemzavarokról tud.
 
+## Spanyol VERI\*FACTU
+
+Az `EInvoicing::verifactu()` a spanyol számlák VERI\*FACTU nyilvántartási rekordjait kezeli a
+spanyol adóhatóság (AEAT) felé: a core modell EN 16931 szerinti számlájából előállítja a rekordot
+(`RegistroAlta`, `RegistroAnulacion`), SHA-256 `Huella`-val láncba fűzi az adatbázisban, azonnal
+visszaadja a QR URL-t, hogy a számla rögtön nyomtatható legyen, és a queue-n át, az AEAT
+forgalomszabályozását betartva beküldi. Az AEAT felőli oldalt a B2Brouter is átveheti,
+aszinkron módon. Az `intragile/php-einvoicing` 1.3-as vagy újabb verzióját igényli; a core
+[SPAIN.md](https://github.com/intragile/php-einvoicing/blob/main/docs/countries/SPAIN.md)
+leírása (angolul) részletesen ismerteti a leképezést, a láncot és a transportokat.
+
+> **Release label:** Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-checked); direct AEAT submission verified offline only — it needs a Spanish NIF and a qualified certificate
+>
+> Magyarul: a VERI\*FACTU élesben ellenőrzött a B2Brouter sandboxán (regisztrált rekordok; a hash
+> és a QR keresztellenőrizve); a közvetlen AEAT-beküldés csak offline ellenőrzött, mert ahhoz
+> spanyol adószám (NIF) és minősített tanúsítvány kell.
+
+**Hatókör: csak VERI\*FACTU mód.** Nem része, mindegyik egy későbbi kiadásra vagy connectorra
+marad:
+
+- **a nem VERI\*FACTU mód** (XAdES-aláírású helyi rekordok, az eseménynapló és annak lánca, a
+  6 óránkénti összesítő esemény, a lánc önellenőrzése és a requerimiento végpont);
+- **a TicketBAI** (a baszk foral területek) és **Navarra**, amelyeknek saját rendszerük van;
+- **a Facturae 3.2.x / FACe** (B2G számlák);
+- **az SII**: az SII hatálya alá tartozó adózók kívül esnek a VERI\*FACTU-n;
+- **a Crea y Crece B2B e-számlázási kötelezettség** (RD 238/2026, Orden HAC/1028/2026);
+- **a lapozós `ConsultaFactuSistemaFacturacion` export**: csak egyetlen számla lekérdezése
+  érhető el (`einvoicing:verifactu-status --lookup`).
+
+**Határidők.** A hatályos szabály (RDL 15/2025) szerint a VERI\*FACTU 2027. január 1-jétől a
+társasági adó alanyaira, 2027. július 1-jétől mindenki másra vonatkozik. 2026. október 5-én a
+minisztérium bejelentette, hogy mindkettőt 2028 októberére tolja (**bejelentve, nem kihirdetve**:
+2026. november 23-ig a BOE-ben semmi nem jelent meg). A csomag működése nem függ attól, melyik
+dátum lesz érvényes.
+
+**Nincs tanúsítás, nincs nyilatkozat.** Ez a csomag egy komponens, nem tanúsított számlázó
+rendszer (SIF). Az IntrAgile nem lép fel a számlázó szoftver gyártójaként, és nem ír alá
+*declaración responsable*-t; lásd [A saját nyilatkozatod](#a-saját-nyilatkozatod-declaración-responsable).
+
+### Telepítés és az AEAT sémák
+
+```bash
+php artisan migrate                              # a lánc-, throttle- és rekordtáblák
+php artisan einvoicing:verifactu-install-schemas # letölti az AEAT sémákat a schemas_dir mappába
+```
+
+Az AEAT XSD-ket (és az általuk importált W3C xmldsig sémát) **letöltjük, sosem csomagoljuk**:
+nincs olyan licencük, amely továbbterjesztést engedne. A parancs letölti a rögzített fájlokat, és
+ellenőrzőösszeggel együtt az `einvoicing.verifactu.schemas_dir` mappába teszi (alapértelmezés:
+`storage/einvoicing/verifactu`). Offline telepítéshez töltsd le őket máshol, és add meg a
+`--from=DIR` kapcsolót: a mappát, amely a nyolc sémafájlt név szerint tartalmazza; az
+ellenőrzőösszegeket ugyanúgy ellenőrzi. A `register()`, `cancel()` és `correct()` nem fut, amíg a
+sémák nincsenek telepítve.
+
+### Beállítás
+
+```dotenv
+VERIFACTU_ENVIRONMENT=test               # test (AEAT pre-production) vagy production; production csak ha beállítod
+VERIFACTU_DRIVER=aeat                    # aeat (közvetlen beküldés) vagy b2brouter
+VERIFACTU_ISSUER_NIF=B12345674           # egyetlen kibocsátó; többhöz lásd az "issuers" kulcsot
+VERIFACTU_ISSUER_NAME="Mi Empresa S.L."
+
+# A rekordokat előállító számlázó szoftver (SistemaInformatico): a tiéd, sosem az IntrAgile.
+VERIFACTU_PRODUCER_NAME="Your Software S.L."
+VERIFACTU_PRODUCER_NIF=A39200019
+VERIFACTU_SYSTEM_NAME=YourInvoicing
+VERIFACTU_SYSTEM_ID=01
+VERIFACTU_SYSTEM_VERSION=2.4.1
+VERIFACTU_INSTALLATION_NUMBER=0001
+VERIFACTU_SYSTEM_VERIFACTU_ONLY=true
+VERIFACTU_SYSTEM_MULTIPLE_TAXPAYERS_POSSIBLE=false
+VERIFACTU_SYSTEM_MULTIPLE_TAXPAYERS_INDICATOR=false
+
+# Közvetlen AEAT-beküldés (aeat driver)
+VERIFACTU_AEAT_CERTIFICATE=/run/secrets/aeat.p12   # PKCS#12 fájl, vagy PEM tanúsítvány ...
+# VERIFACTU_AEAT_PRIVATE_KEY=/run/secrets/aeat.key.pem  # ... a privát kulcsával
+VERIFACTU_AEAT_PASSWORD=...
+# VERIFACTU_CA_BUNDLE=/etc/ssl/aeat-ca.pem          # tartalmaznia kell az FNMT gyökeret (lásd lent)
+
+# B2Brouter (b2brouter driver): az einvoicing.transports egy b2brouter transportjának neve
+# VERIFACTU_B2BROUTER_TRANSPORT=b2brouter
+
+# VERIFACTU_SCHEMAS_DIR=/var/lib/verifactu
+```
+
+Az `einvoicing.verifactu` blokkban van még a `timezone` (`Europe/Madrid`, a generálási időbélyeg
+zónája), a `system.foreign_id` (spanyol NIF nélküli gyártónak: vagy `nif`, vagy `foreign_id`), az
+`aeat.port` (`personal` vagy `seal`, ez választja az AEAT hostot), az `aeat.timeout` (30 s) és az
+`aeat.connect_timeout` (10 s), a `b2brouter.poll_attempts` (10) és a `b2brouter.poll_delay`
+(30 s), a `submission` (`queue`, `connection`, `max_batch` 1–1000, `initial_wait` 60 s,
+`throttle_scope`), a `cross_check` (`strict` vagy `report`) és a `stuck_after_minutes` (60). A
+`system` blokknak nincs alapértéke: a telepítés gyártója maga nyilatkozik. Az AEAT driverhez
+kötelező; amíg minden kibocsátó a B2Brouteren megy, amely a saját `SistemaInformatico`-ját írja,
+üresen maradhat.
+
+**Kibocsátók.** Az `einvoicing.verifactu.issuers` minden kötelezett kibocsátó NIF-jéhez megadja a
+`name` értéket, és opcionálisan a saját `driver`, `representative` (`name`, `nif`) és a
+tanúsítványbeállításokat felülíró `aeat` kulcsot:
+
+```php
+// config/einvoicing.php
+return [
+    // ...
+    'verifactu' => [
+        // ...
+        'issuers' => [
+            'B12345674' => ['name' => 'Mi Empresa S.L.'],
+            'A58818501' => [
+                'name' => 'Cliente Prueba S.A.',
+                'driver' => 'aeat',
+                'aeat' => ['certificate' => '/run/secrets/a58818501.p12', 'password' => env('AEAT_A58818501_PASSWORD')],
+            ],
+        ],
+    ],
+];
+```
+
+A kibocsátókat futásidőben a core `VerifactuIssuerResolver` oldja fel; az alapértelmezett a
+konfigurációból olvasó `ConfigIssuerResolver`. Ha az alkalmazás adatbázisban tartja a tenantokat,
+saját resolvert köt be, amely NIF-enként `IssuerContext`-et ad vissza (név, driver, környezet,
+hozzáférési adatok, képviselő), és a doctor számára felsorolja az összes kibocsátót:
+
+```php
+use IntrAgile\EInvoicing\Spain\CertificateKind;
+use IntrAgile\EInvoicing\Spain\Nif;
+use IntrAgile\EInvoicing\Spain\Verifactu\AeatCredentials;
+use IntrAgile\EInvoicing\Spain\Verifactu\Exception\UnknownIssuer;
+use IntrAgile\EInvoicing\Spain\Verifactu\IssuerContext;
+use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
+use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuIssuerResolver;
+use IntrAgile\EInvoicing\Spain\VerifactuEnvironment;
+
+final class TenantIssuerResolver implements VerifactuIssuerResolver
+{
+    public function resolve(Nif $issuer): IssuerContext
+    {
+        $tenant = Tenant::query()->where('nif', $issuer->value)->first()
+            ?? throw new UnknownIssuer("No tenant for {$issuer->value}.");
+
+        return new IssuerContext(
+            $issuer,
+            $tenant->legal_name,
+            IssuerDriver::Aeat,
+            VerifactuEnvironment::from(config('einvoicing.verifactu.environment')),
+            new AeatCredentials($tenant->certificate_path, $tenant->certificatePassword(), null, CertificateKind::Personal),
+        );
+    }
+
+    public function issuers(): array
+    {
+        return Tenant::query()->pluck('nif')->map(fn (string $nif): Nif => Nif::parse($nif))->all();
+    }
+}
+
+// AppServiceProvider::register()
+$this->app->singleton(VerifactuIssuerResolver::class, TenantIssuerResolver::class);
+```
+
+A context környezetének meg kell egyeznie a beállított `einvoicing.verifactu.environment`
+értékkel; mást elutasít.
+
+### Az AEAT-tanúsítvány és a TLS
+
+A közvetlen beküldés a kibocsátó (vagy képviselője) minősített tanúsítványával, kölcsönös TLS-sel
+hitelesít. Az `aeat.certificate` egy PKCS#12 fájl a jelszavával, vagy egy PEM tanúsítvány az
+`aeat.private_key` kulccsal. A bridge a tanúsítványt és a kulcsot PEM fájlként (0600-as joggal)
+egy 0700-as mappába írja a `storage/einvoicing/verifactu/tls` alatt, átadja a Guzzle kliensének
+(`cert`, `ssl_key`, `verify` a CA-csomaggal), és törli őket, amikor a kliens megszűnik; a leállított
+worker után maradt fájlokat egy nap után eltávolítja. Hozzáférési adatkészletenként egy kliens él,
+és a helyben megújított tanúsítványt a következő használatkor felveszi. A TLS-ellenőrzés soha nincs
+kikapcsolva.
+
+Az AEAT szerverei az **AC RAIZ FNMT-RCM SERVIDORES SEGUROS** FNMT gyökérre láncolnak, amely sok
+rendszer CA-csomagjából hiányzik. Az `aeat.ca_bundle` (`VERIFACTU_CA_BUNDLE`) egy ezt tartalmazó
+csomagra mutat; `null` esetén az OpenSSL alapértelmezése érvényes. A doctor figyelmeztet, ha a
+csomagban nincs FNMT gyökér, megmutatja a tanúsítvány tulajdonosát és a lejáratig hátralévő
+napokat, a lejárt tanúsítványnál pedig hibát jelez.
+
+### Rögzítés, sztornó és helyesbítés
+
+```php
+use IntrAgile\EInvoicing\Laravel\Facades\EInvoicing;
+use IntrAgile\EInvoicing\Spain\Nif;
+use IntrAgile\EInvoicing\Spain\Verifactu\InvoiceId;
+
+$record = EInvoicing::verifactu()->register($invoice, reference: 'order-1042');
+$record->qr_url;   // most nyomtasd a számlára (AEAT driver)
+$record->hash;     // a Huella; a $record->state "generated", amíg az AEAT nem válaszol
+
+$id = new InvoiceId(Nif::parse('B12345674'), 'F-2027-0042', new \DateTimeImmutable('2027-01-15'));
+EInvoicing::verifactu()->cancel($id, reference: 'void-17');
+EInvoicing::verifactu()->correct($rectifiedInvoice);       // SpanishInvoice::$operation: nem Initial
+EInvoicing::verifactu()->record($id);                      // a legutóbbi rekordsor, vagy null
+```
+
+- **`register(Invoice $invoice, ?string $reference = null)`** a lánc zárolása alatt, szinkron
+  módon előállítja a `RegistroAlta` rekordot, eltárolja a pontos XML-t és az időbélyeg szó
+  szerinti szövegét, és visszaadja a `VerifactuRecord` sort a `qr_url` értékkel, így a számla
+  azonnal nyomtatható. Az EN 16931 modellben nem szereplő spanyol adatok (számlatípus,
+  helyesbítés típusa, mentességi jogcím, adószám nélküli címzettek, a műveleti jelzők) a számlán
+  lévő core `SpanishInvoice` kiterjesztésből jönnek. Ha a számlának már van rögzítési rekordja a
+  láncában, elutasítja.
+- **`cancel(InvoiceId $invoice, ?string $reference = null, AnulacionOperation $operation = Normal, bool $registeredByPreviousSystem = false)`**
+  `RegistroAnulacion` rekordot fűz a lánchoz. Olyan számlához, amelyet az AEAT sosem kapott meg,
+  az `AnulacionOperation::WithoutPriorRecord` kell. A lánc beoltása előtt használt szoftverrel
+  rögzített számlának nincs helyi rekordja: add meg a `registeredByPreviousSystem: true`
+  argumentumot, amelyet csak beoltott lánc fogad el.
+- **`correct(Invoice $invoice, ?string $reference = null)`** új rögzítést fűz egy olyan
+  számlához, amelynek már van ilyen: helyesbítéshez (`Subsanacion`) vagy elutasítás utáni
+  újraküldéshez; a műveletet a `SpanishInvoice::$operation` adja.
+- **`record(InvoiceId $invoice)`** a számla legutóbbi rekordsorát adja vissza.
+
+Az AEAT által elutasított rekord előállítottként a láncban marad; a lánc sosem íródik át. Javítsd
+a számlát, és küldd be újra a `correct()` hívással.
+
+### Queue és AEAT forgalomszabályozás
+
+A rekordokat a `SubmitVerifactuRecords` küldi a `submission.connection` / `submission.queue`
+beállításon (`null` esetén az `einvoicing.queue` érvényes). Az AEAT a beküldések közti várakozást
+(`TiempoEsperaEnvio`) a számlázó rendszerhez köti, ezért alapból **telepítésenként egy throttle**
+van (`NumeroInstalacion` és környezet), amelyen a telepítés minden kibocsátója osztozik: egy futás
+legfeljebb egy kérést küld, egy kibocsátóét, legfeljebb `max_batch` rekorddal lánc-sorrendben, és
+`initial_wait` másodpercet vár, amíg az AEAT meg nem adja a saját várakozását. A várakozás csak
+1000 rekordos beküldésnél marad el, ahogy az Orden HAC/1177/2024 16.2. cikke megengedi. Ha az AEAT
+írásban megerősítette, hogy a kibocsátóid külön szabályozhatók, állítsd a `throttle_scope`
+értékét `issuer`-re.
+
+Az elküldött bájtok azonosak a tároltakkal. Válasz nélküli küldés után a rekordok `unconfirmed`
+állapotba kerülnek; az `einvoicing.sending.backoff` késleltetései után, legfeljebb
+`sending.max_attempts` alkalommal ugyanazokkal a bájtokkal újraküldjük őket, és az AEAT
+duplikátum-válasza megerősíti őket. Az egészében elutasított beküldés (nem átmeneti SOAP `Client`
+hiba vagy hitelesítési hiba) semmit nem rögzített: a rekordok állapota marad, a throttle sor
+blokkolt lesz, és `VerifactuSubmissionBlocked` esemény fut le; a hiba elhárítása után az
+`einvoicing:verifactu-submit` oldja fel a blokkot. A job timeoutja be van állítva, a doctor ezt a
+`retry_after` értékkel veti össze.
+
+### B2Brouter mód
+
+A `b2brouter` driverrel (globálisan vagy kibocsátónként) a B2Brouter a számlázó rendszer: a saját
+telepítésén állítja elő, láncolja és küldi be a rekordot, és a számlát is kézbesíti a partner
+transportján. A `register()` szinkron módon importálja a számlát (UBL), és **`pending`** sort ad
+vissza QR és hash nélkül; ezután a `PollVerifactuTaxReport` lekérdezi a tax reportot (futásonként
+15 olvasás 3 s-onként, majd `poll_delay` után újra, összesen `poll_attempts` futás). Amint az AEAT
+regisztrálta a rekordot, a bridge eltárolja a B2Brouter XML-jét, a `Huella`-t és a B2Brouter által
+nyomtatott QR URL-t (az éles `www2.agenciatributaria.gob.es` hostot, a B2Brouter sandboxában is),
+egy saját B2Brouter-láncba fűzi, és `VerifactuRecordRegistered` esemény fut le. A
+`registered_with_errors` (az AEAT *AceptadoConErrores* válasza) `accepted_with_errors` állapotként
+kerül a láncba. Ebben a módban a `cancel()` és a `correct()` nem érhető el; a sztornót a
+B2Brouterben kezeld. Az ismeretlen kimenetelű importot újraimportálás előtt szám szerint
+megkeressük (`einvoicing:verifactu-submit --retry-unconfirmed`).
+
+Minden regisztrált rekordot **keresztellenőrzünk** a saját motorunkkal: az XML-t a séma szerint, a
+szövegéből újraszámolt `Huella`-t, a kapcsolódását az előző tárolt rekordhoz, szemantikailag a
+számla saját rekordunkkal való összevetését, és a B2Brouter QR-kódjában lévő URL-t. `strict`
+módban a sikertelen ellenőrzés hibásnak jelöli a sort (az láncban marad, mert az AEAT-nál
+megvan); `report` módban csak jelezzük. A `VerifactuCrossCheckFailed` mindkét esetben lefut. Két
+eltérés **ismert eltérés**, sosem hiba: a mentességi jogcím a B2Brouter-fiók alapértelmezését
+követi (`OperacionExenta` E1 minden mentes tételre), és a különbözeti helyesbítő számla (R1, I)
+pozitív összegeket tartalmaz, ahol az AEAT az előjeles különbséget várja. A QR-kép olvasásához a
+`chillerlan/php-qrcode` csomag kell `ext-gd` vagy `ext-imagick` kiterjesztéssel; nélküle az URL-t a
+paraméterei alapján vetjük össze.
+
+A rekordok abban a sorrendben kerülnek a láncba, ahogy maguk a rekordok megnevezik az elődjüket:
+amelyiknek az elődje még függőben van, megvárja, a nem kapcsolódó rekord pedig hibás lesz és
+kimarad a láncból, amelyet a doctor ekkor blokkoltként jelez.
+
+### Lánc beoltása és driverváltás
+
+A láncot a kibocsátó NIF-je, a telepítés száma és a környezet azonosítja, így a teszt és az éles
+rekordok sosem kerülnek egy láncba. Egy másik implementáció által kezdett lánc folytatásához oltsd
+be a láncot azzal az utolsó rekorddal, amelyet az a szoftver rögzített; ennek `Huella`-ja
+megbízható bemenet, az ellenőrzés utána kezdődik:
+
+```bash
+php artisan einvoicing:verifactu-seed-chain B12345674 F-2026-0999 2026-12-31 "$HUELLA"   # annak a rekordnak a 64 karakteres Huella-ja
+```
+
+Ha egy kibocsátót az AEAT és a B2Brouter driver között váltasz, új lánc indul egy másik számlázó
+rendszeren, ezért a `register()` és a doctor elutasít, amíg a másik drivernek nyitott lánca van. Az
+átállás kifejezett lépés: rendezd a régi lánc rekordjait, majd zárd le az
+`einvoicing:verifactu-close-chain --issuer=B12345674` paranccsal, amely elutasít, amíg bármelyik
+rekordja `generated`, `sending`, `unconfirmed` vagy `pending` állapotú.
+
+### Események
+
+| Esemény | Mikor |
+|---|---|
+| `VerifactuRecordGenerated(record)` | egy rekord elkészült és sorba állt (AEAT driver) |
+| `VerifactuRecordAccepted(record, withErrors, errorCode)` | az AEAT elfogadta, esetleg hibákkal (*AceptadoConErrores*) |
+| `VerifactuRecordRejected(record, errorCode, errorMessage)` | az AEAT elutasította, vagy a B2Brouter tax report hibával zárult |
+| `VerifactuRecordUnconfirmed(record)` | a kimenetele az automatikus újraküldések vagy lekérdezések után is ismeretlen |
+| `VerifactuRecordRegistered(record)` | B2Brouter mód: az AEAT regisztrálta a B2Brouter rekordját; a QR URL és a hash a soron van |
+| `VerifactuCrossCheckFailed(record, result)` | a B2Brouter rekordja az ismert eltéréseken túl is eltér a miénktől |
+| `VerifactuSubmissionBlocked(throttleKey, code, message)` | az AEAT egy teljes beküldést elutasított; a küldés az `einvoicing:verifactu-submit` parancsra vár |
+
+### Parancsok
+
+| Parancs | Mire való |
+|---|---|
+| `einvoicing:verifactu-install-schemas [--from=DIR]` | letölti (vagy átmásolja) és ellenőrzi az AEAT sémákat |
+| `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | feloldja a blokkolt beküldést, és most elküldi az esedékes rekordokat; a `--retry-unconfirmed` újra felveszi azokat a rekordokat, amelyeket már nem küldünk vagy kérdezünk le automatikusan, a leállított worker után `sending` állapotban maradt sorokat is |
+| `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup]` | a tárolt állapot, CSV és hibák; a `--lookup` az AEAT-tól (vagy a B2Broutertől) kérdezi le a legutóbbi rekordot, sosem küld be, és az `unconfirmed` rekordot elfogadottnak jelöli, ha az AEAT ugyanazt a `Huella`-t tartja nyilván (CSV nélkül, mert azt az AEAT később nem adja vissza) |
+| `einvoicing:verifactu-verify-chain [--issuer=]` | újraszámol minden tárolt hasht és kapcsolatot, és minden láncfejet összevet az utolsó rekordjával; csak integritási hibánál bukik |
+| `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | lánc folytatása egy másik implementációtól |
+| `einvoicing:verifactu-close-chain [--issuer=] [--driver=]` | lezárja annak a drivernek a láncait, amelyet a kibocsátó már nem használ |
+
+### Doctor
+
+Ha van beállított kibocsátó, az `einvoicing:doctor` `verifactu` sorokat ad hozzá: a konfiguráció,
+a telepített sémák és ellenőrzőösszegeik, a deklarált rendszer, a resolver által felsorolt összes
+kibocsátó, minden AEAT-tanúsítvány (tulajdonos, napok a lejáratig; a lejárt hiba), a CA-csomag FNMT
+gyökere (figyelmeztetés), a B2Brouter-kulcs a környezethez mérve (`test_` az élesen kívül), a
+táblák, a driverváltások, a láncfejek az utolsó rekordjukhoz mérve, a beoltott láncok, a
+`stuck_after_minutes` után is elakadt rekordok, a blokkolt vagy visszatartott B2Brouter-láncok, a
+sikertelen keresztellenőrzések és a blokkolt beküldések. A `--live` egy TLS-kézfogást ad hozzá a
+beállított AEAT végponttal, beküldést soha; ezt te futtasd, a saját tanúsítványoddal.
+
+### A saját nyilatkozatod (declaración responsable)
+
+A számlázó rendszer gyártója *declaración responsable*-t ír alá arról, hogy a rendszer megfelel
+az RRSIF-nek (RD 1007/2023, Orden HAC/1177/2024). **Az IntrAgile nem lép fel gyártóként, nem ír alá
+nyilatkozatot, és nem ad hozzá sablont.** Ez a csomag a rekordok előállítását, a `Huella`-t és a
+láncot, a rekord XML-t, a QR URL-t és az AEAT SOAP klienst valósítja meg. Az alkalmazásodnak
+továbbra is garantálnia kell:
+
+- minden számla és rekordja elválaszthatatlan összekapcsolását (nincs számla rekord nélkül);
+- hogy a rekordokat soha nem törlik és nem módosítják;
+- hogy a rekordokat azonnal elküldik;
+- a helyesbítési és sztornófolyamatokat;
+- a saját `SistemaInformatico` azonosságát (a `system` blokk);
+- magát a nyilatkozatot, amely ezt a könyvtárat és verzióját komponensként megnevezi.
+
+### Korlátok
+
+- **A közvetlen AEAT-beküldés csak offline ellenőrzött**, az AEAT sémái, a közzétett példák és
+  egy helyi TLS-végpont ellen; élő AEAT-futáshoz spanyol NIF és minősített tanúsítvány kell.
+- **B2Brouter mód:** sztornó és helyesbítés nem érhető el a bridge-en át; a mentességi jogcím és
+  a helyesbítő számla előjele a B2Brouter-fiók beállításait követi.
+- **Lekérdezés:** egyszerre egy számla; lapozós export nincs.
+- **A nem VERI\*FACTU mód** és a fent felsorolt többi spanyol rendszer nem része.
+
 ## Queue
 
 A kapcsolatot és a queue nevét az `einvoicing.queue.connection` és az `einvoicing.queue.name`
@@ -990,6 +1336,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 | `einvoicing:ksef-deadlines` | felsorolja a még nem kézbesített offline KSeF-számlákat a határidejükkel, és kiváltja a `KsefOfflineDeadlineApproaching` eseményt; óránként ütemezd |
 | `einvoicing:poll-inbound [--transport=] [--include-capped]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd. A `--include-capped` minden, az `inbound.max_fetch_attempts` keretet elhasznált dokumentumnak még egy kísérletet ad. A `--transport=ksef` a KSeF postafiókot olvassa, legfeljebb `einvoicing.ksef.inbound_min_interval_minutes` percenként egyszer |
 | `einvoicing:resolve ID (--sent=DOKUMENTUM-ID \| --resend) [--force]` | rendez egy `unconfirmed` küldést, vagy újra sorba állít egy dokumentumot |
+| `einvoicing:verifactu-*` | az AEAT sémák telepítése, beküldés, állapot és lekérdezés, a VERI\*FACTU láncok ellenőrzése, beoltása és lezárása; lásd: [Parancsok](#parancsok) |
 
 ## Mi van ellenőrizve
 
@@ -1001,6 +1348,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 | B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel, a core `b2brouter-live` és `einvoicebe-live` éles csoportjai; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat)** (2026-11-15, core) |
 | Francia folyamat (`EInvoicing::france()`, `EInvoicing::annuaire()`, `Annuaire` binding) | A core offline szerződéstesztjei és `b2brouter-france-live` éles csoportja; a híd `B2BrouterFranceSmokeTest` éles futtatása: az `Annuaire` binding, egy küldés `Deposited` állapotig és egy teljes fizetés, amely `Collected`-ként olvasható vissza | **Élesben tesztelve a B2Brouter sandbox ellen** (2026-11-18: core- és hídfuttatás, francia sandboxfiók); az elfogadott Flux 10 beküldést még nem teszteltük élesben |
 | Lengyel KSeF (`EInvoicing::ksef()`, `SendKsefInvoice`, `PollKsefStatus`, KSeF postafiók, határidők, tanúsítványparancs, doctor sor) | Offline feature tesztek előre rögzített KSeF-válaszokkal; a híd `KsefLiveTest` éles futtatása (`ksef-live` csoport) a KSeF TE-n: egy `sync` kapcsolaton sorba állított küldés, amely KSeF-számmal és nyugtával `delivered` lesz, és a vevő `einvoicing:poll-inbound --transport=ksef` futása, amely legfeljebb 15 metaadat-lekérdezéssel `DocumentReceived` eseményt vált ki; a core `ksef-live` éles csoportja lefedi az offline küldést, a KSeF-tanúsítványokat és a QR-linkeket | **Élesben tesztelve a KSeF TE-n** (2026-11-22, hídfuttatás PHP 8.5-ön és 8.3-on); az offline határidők, a tanúsítványparancs és a doctor sor itt offline tesztelt |
+| Spanyol VERI\*FACTU (`EInvoicing::verifactu()`, láncstore, `SubmitVerifactuRecords`, `PollVerifactuTaxReport`, parancsok, doctor sorok) | Offline feature tesztek az AEAT sémái, előre rögzített AEAT SOAP-válaszok, a core éles felvételeiből másolt B2Brouter-válaszok és egy helyi TLS-végpont ellen; láncpárhuzamosság forkolt írókkal SQLite-on (MySQL és PostgreSQL a `databases` CI jobban); a híd `B2BrouterVerifactuLiveTest` éles futtatása (`b2brouter-spain-live` csoport) a B2Brouter spanyol sandboxán, `sync` queue-val: két láncolt F1 számla, egy mentes számla és egy R1/I helyesbítő számla, mindegyik `registered`, egy B2Brouter-láncba fűzve és keresztellenőrizve (a mentességi jogcím és a helyesbítés előjele ismert eltérés), majd `einvoicing:verifactu-verify-chain` | **A VERI\*FACTU élesben ellenőrzött a B2Brouter sandboxán** (2026-11-24, hídfuttatás PHP 8.5-ön); a közvetlen AEAT-beküldés csak offline ellenőrzött |
 | Webhook-aláírások | Offline tesztek a szolgáltatók dokumentált sémája szerint (az e-invoice.be-nél a közzétett tesztvektorral is) | Offline ellenőrizve; **a B2Brouter webhookjait élesben teszteltük** (2026-11-18: valódi, aláírt sandbox-kézbesítések a hídon visszajátszva); a Recommand és az e-invoice.be webhookjait nem |
 
 A core `brick/math` ^0.14.8-at kér, ezt a Laravel 13 is elfogadja.
@@ -1009,7 +1357,8 @@ A futtatások eredménye dátummal és commitokkal a core
 [VERIFICATION.md](https://github.com/intragile/php-einvoicing/blob/main/docs/VERIFICATION.md) fájljában van (angolul). A webhook-aláírásokat a szolgáltatók dokumentált sémája szerint offline ellenőrizzük (az e-invoice.be-ét a közzétett tesztvektorral is); élesben csak a B2Brouter webhookjait teszteltük (2026-11-18, sandbox-kézbesítések a Laravel hídon visszajátszva).
 
 A csomag alapértelmezett tesztfuttatása nem használ hálózatot; az éles smoke-futtatás ki van
-zárva belőle (`recommand-live`, `b2brouter-france-live` és `ksef-live` csoport, `Live` testsuite).
+zárva belőle (`recommand-live`, `b2brouter-france-live`, `ksef-live` és `b2brouter-spain-live`
+csoport, `Live` testsuite).
 A KSeF futtatáshoz nem kell fiók: csak a KSeF TE-t éri el (`https://api-test.ksef.mf.gov.pl/v2`,
 minden más KSeF hostot elutasít), véletlen NIP-eket használ önaláírt bélyegzőkkel, amelyeket
 ideiglenes könyvtárba ír (0600), minden kérésnek van időkorlátja, és 15:40 és 18:00 (Europe/Warsaw)
@@ -1017,7 +1366,10 @@ között, a TE napi karbantartása körül nem indul. A Recommand
 futtatás csak akkor indul, ha a kulcs a Peppol teszthálózaton lévő Recommand playgroundhoz
 tartozik; a francia futtatás (egy francia B2Brouter-fiók `B2BROUTER_API_KEY` és
 `B2BROUTER_ACCOUNT_ID` értékével) csak sandbox hoston `test_`, staging hoston `stag_` kulccsal
-indul. Ugyanebben a csoportban a `B2BrouterWebhookReplayTest` a B2Brouter-től elmentett
+indul. A spanyol futtatás (egy spanyol B2Brouter sandboxfiók `B2BROUTER_ES_API_KEY` és
+`B2BROUTER_ES_ACCOUNT_ID` értékével) az első kérés előtt elutasít minden kulcsot, ami nem `test_`
+kulcs a `https://api.b2brouter.net` hoston, az AEAT-ot sosem hívja, és futásonként négy
+sandboxszámlát hoz létre. Ugyanebben a csoportban a `B2BrouterWebhookReplayTest` a B2Brouter-től elmentett
 webhook-kézbesítéseket (`B2BROUTER_WEBHOOK_CAPTURE_DIR`, `B2BROUTER_WEBHOOK_SECRET`) játssza vissza
 a webhook-útvonalon, hálózati hívás nélkül. A core-ban opcionális éles csoportok
 vannak:
@@ -1056,7 +1408,15 @@ composer test        # PHPUnit
 composer analyse     # PHPStan, max szint
 composer format      # Pint
 EINVOICING_PEPPOL_FROM=/path/to/peppol/sch vendor/bin/phpunit --group peppol-rules
+php artisan einvoicing:verifactu-install-schemas   # vagy: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
+vendor/bin/phpunit --group verifactu-official --fail-on-skipped
+EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency
 ```
+
+**Az `EINVOICING_TEST_DB_URL` egy MySQL vagy PostgreSQL adatbázisra irányítja a lánc
+párhuzamossági tesztjét, amely azt az adatbázist kiüríti (minden táblát eldob és újra létrehoz).**
+Eldobható adatbázist adj meg, soha olyat, amelyben adat van; a változó nélkül a teszt ideiglenes
+SQLite fájlon fut.
 
 ## Licenc
 

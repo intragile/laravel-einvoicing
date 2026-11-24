@@ -8,6 +8,61 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Spain: VERI\*FACTU billing records from Laravel, on top of `intragile/php-einvoicing` 1.3.
+
+Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-checked); direct AEAT submission verified offline only — it needs a Spanish NIF and a qualified certificate
+
+### Added
+
+- **Spain:** `EInvoicing::verifactu()` returns the `VerifactuManager`: `register()` generates the
+  `RegistroAlta` of an invoice synchronously under the chain lock and returns the stored row with
+  its QR URL, `cancel()` and `correct()` append a `RegistroAnulacion` or a new registration, and
+  `record()` reads the latest record of an invoice. The written XML and the literal timestamp text
+  are stored, so the bytes sent are the bytes hashed.
+- **Spain:** the `einvoicing.verifactu` configuration (environment, driver, the declared
+  `SistemaInformatico`, issuers with their own driver, representative and AEAT credentials, the
+  AEAT certificate, CA bundle and timeouts, B2Brouter polling, submission and cross-check
+  settings), with a single-issuer env shortcut. Issuers are resolved at run time through the
+  core's `VerifactuIssuerResolver`; `ConfigIssuerResolver` is the default and an application may
+  bind its own.
+- **Spain:** one migration adds `einvoicing_verifactu_chains`, `einvoicing_verifactu_throttles`
+  and `einvoicing_verifactu_records`. `DatabaseChainStore` serialises the writes of a chain (issuer
+  NIF, installation number and environment) with a row lock and a compare-and-set on the head,
+  proven with forked writers on SQLite, MySQL and PostgreSQL.
+- **Spain:** `SubmitVerifactuRecords` submits the due records to AEAT under its flow control, one
+  throttle per installation by default (`throttle_scope` `issuer` on request): AEAT's wait, batches
+  of up to 1,000 records per issuer, resends of the same bytes for unconfirmed records, and a
+  blocked throttle with `VerifactuSubmissionBlocked` when AEAT refuses a whole submission. The AEAT
+  client presents the issuer's certificate through Guzzle, built once per credential set.
+- **Spain:** the B2Brouter driver: `register()` imports the invoice, and `PollVerifactuTaxReport`
+  polls its tax report, attaches B2Brouter's registered record to a B2Brouter chain in the order
+  the records name, cross-checks it against our own engine (`strict` or `report`; the exemption
+  article and the credit-note sign are known divergences) and fires `VerifactuRecordRegistered`.
+  An import whose outcome is unknown is looked up by number before it is imported again. While
+  every issuer uses B2Brouter, no `SistemaInformatico` needs to be declared.
+- **Spain:** events `VerifactuRecordGenerated`, `VerifactuRecordAccepted`,
+  `VerifactuRecordRejected`, `VerifactuRecordUnconfirmed`, `VerifactuRecordRegistered`,
+  `VerifactuCrossCheckFailed` and `VerifactuSubmissionBlocked`.
+- **Spain:** commands `einvoicing:verifactu-install-schemas` (downloads the AEAT schemas, never
+  bundled; `--from` for offline installs), `einvoicing:verifactu-submit`,
+  `einvoicing:verifactu-status` (`--lookup`), `einvoicing:verifactu-verify-chain`,
+  `einvoicing:verifactu-seed-chain` and `einvoicing:verifactu-close-chain`.
+- **Spain:** `verifactu` rows in `einvoicing:doctor` (schemas, system, issuers, certificates, the
+  FNMT root in the CA bundle, the B2Brouter key, tables, driver switches, chain heads, seeded,
+  stuck and blocked records, failed cross-checks, blocked submissions; `--live` adds a TLS
+  handshake with AEAT, never a submission), and the VERI\*FACTU jobs in the `retry_after` check.
+- **Spain:** the live group `b2brouter-spain-live` registers two chained invoices, an exempt one
+  and a credit note by difference through the B2Brouter sandbox and cross-checks each record.
+- Docs: the "Spanish VERI\*FACTU" section of both READMEs, with the scope (VERI\*FACTU mode only),
+  both legal dates, and what the integrator must still guarantee for its *declaración
+  responsable*, which IntrAgile does not sign.
+
+### Changed
+
+- Requires `intragile/php-einvoicing` ^1.3. `chillerlan/php-qrcode` ^5 is a development
+  dependency (the cross-check tests read QR codes with it). Branch alias `dev-main` →
+  `1.3.x-dev`.
+
 ### Fixed
 
 - Fresh installs on MySQL failed at `migrate`: the generated names of the transport/provider
