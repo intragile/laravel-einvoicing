@@ -18,7 +18,6 @@ use IntrAgile\EInvoicing\Syntax\SafeXml;
 use IntrAgile\EInvoicing\Syntax\Verifactu\RecordReader;
 use InvalidArgumentException;
 use Symfony\Component\Console\Formatter\OutputFormatter;
-use UnexpectedValueException;
 
 /**
  * Verifies every stored VERI*FACTU chain of the configured environment, of either driver, from the
@@ -151,7 +150,7 @@ final class VerifactuVerifyChainCommand extends Command
             }
             $recomputed = Fingerprint::recompute($element);
             $record = $reader->read($xml);
-        } catch (InvalidRecord|UnsupportedDocument|UnsafeXml|InvalidArgumentException|UnexpectedValueException $exception) {
+        } catch (InvalidRecord|UnsupportedDocument|UnsafeXml|InvalidArgumentException $exception) {
             return ['the stored XML cannot be read: '.$exception->getMessage()];
         }
 
