@@ -1450,7 +1450,7 @@ composer format      # Pint
 EINVOICING_PEPPOL_FROM=/path/to/peppol/sch vendor/bin/phpunit --group peppol-rules
 vendor/bin/einvoicing-rules install spain --dir=build/verifactu
 vendor/bin/phpunit --group verifactu-official --fail-on-skipped
-EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency,verifactu-databases --fail-on-skipped
+EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency --group verifactu-databases --fail-on-skipped
 ```
 
 **Minden tesztfuttatás, amelyben az `EINVOICING_TEST_DB_URL` be van állítva, kiüríti azt az
