@@ -19,15 +19,10 @@ use IntrAgile\EInvoicing\Laravel\Ksef\DatabaseKsefCursorStore;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Verifactu\ConfigIssuerResolver;
-use IntrAgile\EInvoicing\Laravel\Verifactu\DatabaseChainStore;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuClients;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
-use IntrAgile\EInvoicing\Spain\Verifactu\ChainKey;
 use IntrAgile\EInvoicing\Spain\Verifactu\ChainStore;
 use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuIssuerResolver;
-use IntrAgile\EInvoicing\Syntax\Verifactu\RecordWriter;
-use IntrAgile\EInvoicing\Transport\Aeat\ThrottleKey;
-use IntrAgile\EInvoicing\Transport\Aeat\ThrottleScope;
 use IntrAgile\EInvoicing\Transport\Ksef\Inbound\KsefCursorStore;
 
 final class EInvoicingServiceProvider extends ServiceProvider
@@ -58,18 +53,7 @@ final class EInvoicingServiceProvider extends ServiceProvider
         // An application may bind its own store; the database store is the default.
         $this->app->bindIf(KsefCursorStore::class, fn (Application $app): KsefCursorStore => new DatabaseKsefCursorStore($app->make('db')->connection()));
         // Built on first use only: the store needs the computer system and the installed schemas.
-        $this->app->bindIf(ChainStore::class, static function (Application $app): ChainStore {
-            $manager = $app->make(VerifactuManager::class);
-            $settings = $manager->settings();
-            $system = $settings->system();
-            $scope = $settings->throttleScope;
-
-            return new DatabaseChainStore(
-                $app->make('db')->connection(),
-                new RecordWriter($manager->schemas()),
-                static fn (ChainKey $key): ThrottleKey => ThrottleKey::for($system, $key->environment, $scope, $scope === ThrottleScope::Issuer ? $key->issuer : null),
-            );
-        });
+        $this->app->bindIf(ChainStore::class, static fn (Application $app): ChainStore => $app->make(VerifactuManager::class)->store());
     }
 
     public function boot(): void
