@@ -567,7 +567,10 @@ final class VerifactuCommandsTest extends TestCase
             'attempts' => 1,
         ]);
         $this->assertSame(1, Artisan::call('einvoicing:verifactu-submit', ['--retry-unconfirmed' => true]));
-        $this->assertStringContainsString('invoice F<comment>1', Artisan::output());
+        $output = Artisan::output();
+        $this->assertStringContainsString('invoice F<comment>1', $output);
+        // The way out for an import B2Brouter truly refuses.
+        $this->assertStringContainsString('einvoicing:verifactu-status NUMBER --date=Y-m-d --abandon', $output);
     }
 
     /**

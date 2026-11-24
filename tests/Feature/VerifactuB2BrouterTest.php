@@ -9,11 +9,13 @@ use DateTimeImmutable;
 use GuzzleHttp\Psr7\Response;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use IntrAgile\EInvoicing\CodeList\CountryCode;
 use IntrAgile\EInvoicing\CodeList\VatCategory;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuStatusCommand;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Events\VerifactuCrossCheckFailed;
@@ -875,6 +877,106 @@ final class VerifactuB2BrouterTest extends TestCase
         $b->refresh();
         $this->assertNotSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->error_code);
         $this->assertNotNull($b->chain_id, (string) json_encode([$b->state, $b->error_code, $b->error_message]));
+    }
+
+    public function test_abandon_command_fails_the_import_and_releases_the_waiting_successor(): void
+    {
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+        Event::fake([VerifactuRecordRejected::class]);
+
+        $this->artisan('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true, '--force' => true])
+            ->expectsOutputToContain('is now failed (import_abandoned)')
+            ->assertExitCode(0);
+
+        $a->refresh();
+        $this->assertSame(VerifactuRecordState::Failed, $a->state);
+        $this->assertSame(VerifactuStatusCommand::IMPORT_ABANDONED, $a->error_code);
+        $this->assertSame('Refused by B2Brouter; abandoned by an operator.', $a->error_message);
+        // The operator decided, not AEAT.
+        Event::assertNotDispatched(VerifactuRecordRejected::class);
+        $this->assertSame(2, $this->pollsOf($b));
+        $this->runPoll($b->id);
+
+        $b->refresh();
+        $this->assertNotSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->error_code);
+        $this->assertNotNull($b->chain_id, (string) json_encode([$b->state, $b->error_code, $b->error_message]));
+    }
+
+    public function test_abandon_command_asks_first(): void
+    {
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $question = sprintf('Mark record row %d failed? Do this only when B2Brouter refuses the invoice and does not hold it; the invoice is then not registered with AEAT.', $a->id);
+
+        $this->artisan('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true])
+            ->expectsConfirmation($question, 'no')
+            ->expectsOutputToContain('Nothing was changed')
+            ->assertExitCode(1);
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $a->refresh()->state);
+
+        // Without a terminal, the question is answered "no".
+        $this->assertSame(1, Artisan::call('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true, '--no-interaction' => true]));
+        $this->assertStringContainsString('Nothing was changed', Artisan::output());
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $a->refresh()->state);
+
+        $this->artisan('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true])
+            ->expectsConfirmation($question, 'yes')
+            ->assertExitCode(0);
+        $this->assertSame(VerifactuRecordState::Failed, $a->refresh()->state);
+    }
+
+    public function test_abandon_command_refuses_any_other_record(): void
+    {
+        Queue::fake();
+        $pending = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->artisan('einvoicing:verifactu-status', ['number' => $pending->number, '--abandon' => true, '--force' => true])
+            ->expectsOutputToContain('cannot be abandoned: it is pending with the b2brouter driver and B2Brouter invoice 24433033')
+            ->assertExitCode(1);
+
+        $this->runPoll($pending->id);
+        $this->assertSame(VerifactuRecordState::Registered, $pending->refresh()->state);
+        $this->artisan('einvoicing:verifactu-status', ['number' => $pending->number, '--abandon' => true, '--force' => true])
+            ->expectsOutputToContain('cannot be abandoned: it is registered')
+            ->assertExitCode(1);
+        $this->assertSame(VerifactuRecordState::Registered, $pending->refresh()->state);
+
+        $adopted = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        DB::table('einvoicing_verifactu_records')->where('id', $adopted->id)->update(['b2brouter_invoice_id' => '24433001']);
+        $this->artisan('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true, '--force' => true])
+            ->expectsOutputToContain('cannot be abandoned: it is unconfirmed with the b2brouter driver and B2Brouter invoice 24433001')
+            ->assertExitCode(1);
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $adopted->refresh()->state);
+
+        $this->artisan('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true, '--lookup' => true])
+            ->expectsOutputToContain('Pass either --lookup or --abandon, not both.')
+            ->assertExitCode(1);
+    }
+
+    public function test_abandon_command_leaves_a_record_another_process_changed(): void
+    {
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+        // A retry adopts the invoice right after the command read the row.
+        $once = true;
+        VerifactuRecord::retrieved(static function (VerifactuRecord $model) use (&$once, $a): void {
+            if ($once && $model->id === $a->id) {
+                $once = false;
+                DB::table('einvoicing_verifactu_records')->where('id', $a->id)->update(['b2brouter_invoice_id' => '24433001']);
+            }
+        });
+
+        $this->artisan('einvoicing:verifactu-status', ['number' => 'PROBE-ES-0001', '--abandon' => true, '--force' => true])
+            ->expectsOutputToContain('changed by another process meanwhile')
+            ->assertExitCode(1);
+
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $a->refresh()->state);
+        $this->assertSame(1, $this->pollsOf($b));
     }
 
     public function test_successors_are_woken_through_the_shared_hook(): void

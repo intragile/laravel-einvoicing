@@ -1087,9 +1087,25 @@ When an import stays `unconfirmed` after `--retry-unconfirmed`:
    instance), fix it and run `php artisan einvoicing:verifactu-submit --retry-unconfirmed` again:
    the row is looked up by number first, so an invoice B2Brouter already holds is adopted, never
    imported twice.
-3. If B2Brouter truly refuses the invoice and does not hold it, no command marks the row failed.
-   Mark it failed in the database yourself (add your connection's table prefix, if any, and put
-   the row id in place of `42`):
+3. If B2Brouter truly refuses the invoice and does not hold it, abandon the import:
+
+   ```bash
+   php artisan einvoicing:verifactu-status PROBE-ES-0001 --date=2026-11-24 --abandon
+   ```
+
+   The command prints the records of the invoice, asks for confirmation (`--force` skips the
+   question; without a terminal it is answered "no") and marks the latest record `failed` with
+   error code `import_abandoned`. It refuses any record that is not an `unconfirmed` B2Brouter
+   import without a B2Brouter invoice id, and fires no event: the operator decides, not AEAT.
+   The records that waited for this import (`pending` with `awaiting_predecessor`) are polled
+   again at once: they attach if they link to the chain head (an empty chain, for instance);
+   otherwise they are failed (`chain_conflict`) and need an operator. The invoice itself is then
+   not registered with AEAT: issue it again, or handle it in B2Brouter.
+
+   Without the command (before 1.4), the same change is one SQL statement (add your connection's
+   table prefix, if any, and put the row id in place of `42`); exactly one row must change, and
+   `php artisan einvoicing:verifactu-submit --retry-unconfirmed` must run afterwards to poll the
+   waiting records:
 
    ```sql
    UPDATE einvoicing_verifactu_records
@@ -1097,12 +1113,6 @@ When an import stays `unconfirmed` after `--retry-unconfirmed`:
           error_message = 'Refused by B2Brouter; abandoned by an operator.', updated_at = CURRENT_TIMESTAMP
     WHERE id = 42 AND driver = 'b2brouter' AND state = 'unconfirmed' AND b2brouter_invoice_id IS NULL;
    ```
-
-   Exactly one row must change. Then run `php artisan einvoicing:verifactu-submit
-   --retry-unconfirmed` once more, so the records that waited for this import (`pending` with
-   `awaiting_predecessor`) are polled again: they attach if they link to the chain head (an empty
-   chain, for instance); otherwise they are failed (`chain_conflict`) and need an operator. The
-   invoice itself is then not registered with AEAT: issue it again, or handle it in B2Brouter.
 
 Every registered record is **cross-checked** against our own engine: the XML against the schema,
 the `Huella` recomputed from its text, its link to the previous stored record, a semantic
@@ -1171,7 +1181,7 @@ issuers on the same throttle key go on sending; restore the credentials and run
 |---|---|
 | `einvoicing:verifactu-install-schemas [--from=DIR]` | download (or copy) and check the AEAT schemas |
 | `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | clear a blocked submission and schedule a submission run for the due records (the run applies the AEAT wait); `--retry-unconfirmed` takes again the records no longer resent or polled automatically, including `sending` rows left by a killed worker |
-| `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup]` | the stored state, CSV and errors; `--lookup` asks AEAT (or B2Brouter) about the latest record, never submits, and marks an `unconfirmed` record accepted when AEAT holds the same `Huella` (without a CSV, which AEAT cannot return later) |
+| `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup] [--abandon [--force]]` | the stored state, CSV and errors; `--lookup` asks AEAT (or B2Brouter) about the latest record, never submits, and marks an `unconfirmed` record accepted when AEAT holds the same `Huella` (without a CSV, which AEAT cannot return later); `--abandon` marks an `unconfirmed` B2Brouter import that B2Brouter refuses `failed` (`import_abandoned`) after a confirmation and polls the records waiting for it |
 | `einvoicing:verifactu-verify-chain [--issuer=]` | recompute every stored hash and link, and compare each head with its last record; fails only on integrity breaks |
 | `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | continue a chain from another implementation (`--installation` only confirms `system.installation_number`) |
 | `einvoicing:verifactu-close-chain [--issuer=] [--driver=]` | close the chains of the driver an issuer no longer uses |

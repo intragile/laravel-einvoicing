@@ -1135,9 +1135,25 @@ Ha egy import a `--retry-unconfirmed` után is `unconfirmed` marad:
    javítsd, és futtasd újra a `php artisan einvoicing:verifactu-submit --retry-unconfirmed`
    parancsot: a sort először szám szerint keressük, így a B2Brouternél már meglévő számlát
    átvesszük, sosem importáljuk kétszer.
-3. Ha a B2Brouter valóban elutasítja a számlát, és nincs meg nála, egyetlen parancs sem jelöli a
-   sort hibásnak. Jelöld hibásnak közvetlenül az adatbázisban (a kapcsolatod esetleges
-   táblaelőtagjával, a `42` helyére a sor azonosítóját írva):
+3. Ha a B2Brouter valóban elutasítja a számlát, és nincs meg nála, add fel az importot:
+
+   ```bash
+   php artisan einvoicing:verifactu-status PROBE-ES-0001 --date=2026-11-24 --abandon
+   ```
+
+   A parancs kiírja a számla rekordjait, megerősítést kér (a `--force` kihagyja a kérdést;
+   terminál nélkül a válasz „nem”), és a legutóbbi rekordot `failed` állapotúra jelöli
+   `import_abandoned` hibakóddal. Minden más rekordot elutasít, ami nem B2Brouter-azonosító nélküli,
+   `unconfirmed` B2Brouter-import, és nem küld eseményt: itt az operátor dönt, nem az AEAT. Az erre
+   az importra váró rekordokat (`pending`, `awaiting_predecessor`) azonnal újra lekérdezzük: ha a
+   lánc fejéhez kapcsolódnak (például üres láncnál), láncba kerülnek; különben hibásak lesznek
+   (`chain_conflict`), és operátori beavatkozást igényelnek. Maga a számla így nincs regisztrálva
+   az AEAT-nál: állítsd ki újra, vagy kezeld a B2Brouterben.
+
+   A parancs nélkül (1.4 előtt) ugyanez egyetlen SQL-utasítás (a kapcsolatod esetleges
+   táblaelőtagjával, a `42` helyére a sor azonosítóját írva); pontosan egy sornak kell változnia,
+   és utána le kell futtatni a `php artisan einvoicing:verifactu-submit --retry-unconfirmed`
+   parancsot, hogy a várakozó rekordokat újra lekérdezzük:
 
    ```sql
    UPDATE einvoicing_verifactu_records
@@ -1145,13 +1161,6 @@ Ha egy import a `--retry-unconfirmed` után is `unconfirmed` marad:
           error_message = 'Refused by B2Brouter; abandoned by an operator.', updated_at = CURRENT_TIMESTAMP
     WHERE id = 42 AND driver = 'b2brouter' AND state = 'unconfirmed' AND b2brouter_invoice_id IS NULL;
    ```
-
-   Pontosan egy sornak kell változnia. Ezután futtasd még egyszer az `php artisan
-   einvoicing:verifactu-submit --retry-unconfirmed` parancsot, hogy az erre az importra váró
-   rekordokat (`pending`, `awaiting_predecessor`) újra lekérdezzük: ha a lánc fejéhez kapcsolódnak
-   (például üres láncnál), láncba kerülnek; különben hibásak lesznek (`chain_conflict`), és
-   operátori beavatkozást igényelnek. Maga a számla így nincs regisztrálva az AEAT-nál: állítsd ki
-   újra, vagy kezeld a B2Brouterben.
 
 Minden regisztrált rekordot **keresztellenőrzünk** a saját motorunkkal: az XML-t a séma szerint, a
 szövegéből újraszámolt `Huella`-t, a kapcsolódását az előző tárolt rekordhoz, szemantikailag a
@@ -1223,7 +1232,7 @@ hitelesítőadatokat, és futtasd az `einvoicing:verifactu-submit` parancsot.
 |---|---|
 | `einvoicing:verifactu-install-schemas [--from=DIR]` | letölti (vagy átmásolja) és ellenőrzi az AEAT sémákat |
 | `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | feloldja a blokkolt beküldést, és beütemez egy beküldési futást az esedékes rekordokra (a futás betartja az AEAT várakozását); a `--retry-unconfirmed` újra felveszi azokat a rekordokat, amelyeket már nem küldünk vagy kérdezünk le automatikusan, a leállított worker után `sending` állapotban maradt sorokat is |
-| `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup]` | a tárolt állapot, CSV és hibák; a `--lookup` az AEAT-tól (vagy a B2Broutertől) kérdezi le a legutóbbi rekordot, sosem küld be, és az `unconfirmed` rekordot elfogadottnak jelöli, ha az AEAT ugyanazt a `Huella`-t tartja nyilván (CSV nélkül, mert azt az AEAT később nem adja vissza) |
+| `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup] [--abandon [--force]]` | a tárolt állapot, CSV és hibák; a `--lookup` az AEAT-tól (vagy a B2Broutertől) kérdezi le a legutóbbi rekordot, sosem küld be, és az `unconfirmed` rekordot elfogadottnak jelöli, ha az AEAT ugyanazt a `Huella`-t tartja nyilván (CSV nélkül, mert azt az AEAT később nem adja vissza); az `--abandon` megerősítés után `failed` (`import_abandoned`) állapotúra jelöli a B2Brouter által elutasított `unconfirmed` B2Brouter-importot, és újra lekérdezi a rá váró rekordokat |
 | `einvoicing:verifactu-verify-chain [--issuer=]` | újraszámol minden tárolt hasht és kapcsolatot, és minden láncfejet összevet az utolsó rekordjával; csak integritási hibánál bukik |
 | `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | lánc folytatása egy másik implementációtól (a `--installation` csak a `system.installation_number` értékét erősíti meg) |
 | `einvoicing:verifactu-close-chain [--issuer=] [--driver=]` | lezárja annak a drivernek a láncait, amelyet a kibocsátó már nem használ |

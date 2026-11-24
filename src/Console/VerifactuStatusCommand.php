@@ -13,6 +13,7 @@ use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordAccepted;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\Jobs\PollVerifactuTaxReport;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuRecord;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuClients;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
@@ -46,21 +47,38 @@ use Symfony\Component\Console\Formatter\OutputFormatter;
  *
  * A failed lookup (no answer, an authentication fault, rate limiting, an invalid query) is printed
  * and leaves the row unchanged; the exit code is then 1, as it is when no record matches.
+ *
+ * With --abandon, the latest record is marked failed (error code import_abandoned) when it is a
+ * B2Brouter import that stayed unconfirmed and B2Brouter never confirmed (no B2Brouter invoice
+ * id); the records waiting for it (awaiting_predecessor) are polled again. It is for an import
+ * B2Brouter truly refuses and does not hold, asks for confirmation unless --force is given, and
+ * fires no event: the operator decides, not AEAT. Any other record is refused with exit code 1.
  */
 final class VerifactuStatusCommand extends Command
 {
     use InteractsWithVerifactu;
 
+    /** The error code of a B2Brouter import an operator abandoned. */
+    public const IMPORT_ABANDONED = 'import_abandoned';
+
     protected $signature = 'einvoicing:verifactu-status
         {number : The invoice number (NumSerieFactura)}
         {--date= : The issue date, Y-m-d}
         {--issuer= : The issuer NIF; defaults to the only configured issuer}
-        {--lookup : Check the latest record with AEAT or B2Brouter (never a submission)}';
+        {--lookup : Check the latest record with AEAT or B2Brouter (never a submission)}
+        {--abandon : Mark an unconfirmed B2Brouter import that B2Brouter refuses as failed}
+        {--force : Abandon without asking for confirmation}';
 
     protected $description = 'Show the VERI*FACTU records of an invoice, optionally checking them with AEAT or B2Brouter';
 
     public function handle(VerifactuManager $verifactu, VerifactuClients $clients): int
     {
+        if ($this->option('abandon') === true && $this->option('lookup') === true) {
+            $this->components->error('Pass either --lookup or --abandon, not both.');
+
+            return self::FAILURE;
+        }
+
         try {
             $settings = $verifactu->settings();
             $issuer = $this->requiredIssuer($verifactu);
@@ -101,12 +119,14 @@ final class VerifactuStatusCommand extends Command
 
         $this->printRows($rows);
 
-        if ($this->option('lookup') !== true) {
-            return self::SUCCESS;
-        }
-
         $latest = $rows->last();
         if ($latest === null) {
+            return self::SUCCESS;
+        }
+        if ($this->option('abandon') === true) {
+            return $this->abandon($latest);
+        }
+        if ($this->option('lookup') !== true) {
             return self::SUCCESS;
         }
 
@@ -238,6 +258,61 @@ final class VerifactuStatusCommand extends Command
         $row->refresh();
         VerifactuRecordAccepted::dispatch($row, $withErrors, $code);
         $this->components->info(self::escape(sprintf('AEAT holds this record: it is now %s (without a CSV, which AEAT does not return later).', $row->state->value)));
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Marks an unconfirmed B2Brouter import failed and wakes the records waiting for it.
+     */
+    private function abandon(VerifactuRecord $row): int
+    {
+        $this->newLine();
+        if ($row->driver !== IssuerDriver::B2Brouter || $row->state !== VerifactuRecordState::Unconfirmed || $row->b2brouter_invoice_id !== null) {
+            $this->components->error(self::escape(sprintf(
+                'Record row %d cannot be abandoned: it is %s with the %s driver%s. Only an unconfirmed B2Brouter import without a B2Brouter invoice id can be.',
+                $row->id,
+                $row->state->value,
+                $row->driver->value,
+                $row->b2brouter_invoice_id === null ? '' : ' and B2Brouter invoice '.$row->b2brouter_invoice_id,
+            )));
+
+            return self::FAILURE;
+        }
+
+        if ($this->option('force') !== true && ! $this->confirm(sprintf(
+            'Mark record row %d failed? Do this only when B2Brouter refuses the invoice and does not hold it; the invoice is then not registered with AEAT.',
+            $row->id,
+        ))) {
+            $this->components->warn('Nothing was changed; pass --force to abandon without the question.');
+
+            return self::FAILURE;
+        }
+
+        $abandoned = VerifactuRecord::query()
+            ->whereKey($row->id)
+            ->where('driver', IssuerDriver::B2Brouter->value)
+            ->where('state', VerifactuRecordState::Unconfirmed->value)
+            ->whereNull('b2brouter_invoice_id')
+            ->update([
+                'state' => VerifactuRecordState::Failed->value,
+                'error_code' => self::IMPORT_ABANDONED,
+                'error_message' => 'Refused by B2Brouter; abandoned by an operator.',
+                'updated_at' => Carbon::now(),
+            ]);
+        if ($abandoned !== 1) {
+            $this->components->warn('The record was changed by another process meanwhile; it was not abandoned.');
+
+            return self::FAILURE;
+        }
+
+        $row->refresh();
+        PollVerifactuTaxReport::wakeSuccessorsOf($row);
+        $this->components->info(self::escape(sprintf(
+            'Record row %d is now failed (%s); the records waiting for it are polled again. The invoice is not registered with AEAT: issue it again, or handle it in B2Brouter.',
+            $row->id,
+            self::IMPORT_ABANDONED,
+        )));
 
         return self::SUCCESS;
     }

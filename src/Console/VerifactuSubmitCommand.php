@@ -237,6 +237,7 @@ final class VerifactuSubmitCommand extends Command
             ->get(['id']);
 
         $settled = true;
+        $stillUnconfirmed = false;
         foreach ($rows()->where('state', VerifactuRecordState::Unconfirmed->value)->whereNull('b2brouter_invoice_id')->get() as $row) {
             $name = sprintf('B2Brouter import of invoice %s of %s (row %d)', $row->number, $row->issue_date, $row->id);
             try {
@@ -244,6 +245,7 @@ final class VerifactuSubmitCommand extends Command
             } catch (TransportException|ConfigurationException|InvalidArgumentException $exception) {
                 $this->components->error(self::escape(sprintf('%s: %s', $name, $exception->getMessage())));
                 $settled = false;
+                $stillUnconfirmed = true;
 
                 continue;
             }
@@ -253,7 +255,11 @@ final class VerifactuSubmitCommand extends Command
             } else {
                 $this->components->warn(self::escape(sprintf('%s is still unconfirmed: %s', $name, (string) $retried->error_message)));
                 $settled = false;
+                $stillUnconfirmed = true;
             }
+        }
+        if ($stillUnconfirmed) {
+            $this->line('  An import that B2Brouter truly refuses and does not hold can be abandoned: php artisan einvoicing:verifactu-status NUMBER --date=Y-m-d --abandon');
         }
 
         foreach ($pending as $row) {

@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Spain:** `einvoicing:verifactu-status --abandon` marks the latest record of an invoice
+  `failed` (error code `import_abandoned`) when it is an `unconfirmed` B2Brouter import that
+  B2Brouter never confirmed, after a confirmation (`--force` skips it), and polls the records
+  waiting for it (`awaiting_predecessor`) at once. It replaces the operator SQL step of 1.3, which
+  the README keeps as a fallback. Any other record is refused, and no event fires.
+
 ## [1.3.0] - 2026-11-24
 
 Spain: VERI\*FACTU billing records from Laravel, on top of `intragile/php-einvoicing` 1.3.
