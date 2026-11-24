@@ -47,6 +47,8 @@ final class FakeAeatApi implements ClientInterface
         'aceptado_con_errores' => ['parcialmente-correcto.xml', 0],
         'incorrecto' => ['parcialmente-correcto.xml', 1],
         'duplicado_correcta' => ['duplicado-correcta.xml', 0],
+        // The Correcta duplicate line with EstadoRegistroDuplicado AceptadaConErrores.
+        'duplicado_aceptada_con_errores' => ['duplicado-correcta.xml', 0],
         'duplicado_anulada' => ['duplicado-anulada.xml', 0],
     ];
 
@@ -157,7 +159,8 @@ final class FakeAeatApi implements ClientInterface
 
     /**
      * One answer line: the kind names the fixture line it is built from ("correcto",
-     * "aceptado_con_errores", "incorrecto", "duplicado_correcta" or "duplicado_anulada").
+     * "aceptado_con_errores", "incorrecto", "duplicado_correcta", "duplicado_aceptada_con_errores"
+     * or "duplicado_anulada").
      *
      * @return array{InvoiceId, string, string, ?int}
      */
@@ -230,6 +233,9 @@ final class FakeAeatApi implements ClientInterface
             self::element($templateXpath, 'r:Operacion/sf:TipoOperacion', $line)->textContent = $operation;
             if ($code !== null) {
                 self::element($templateXpath, 'r:CodigoErrorRegistro', $line)->textContent = (string) $code;
+            }
+            if ($kind === 'duplicado_aceptada_con_errores') {
+                self::element($templateXpath, 'r:RegistroDuplicado/sf:EstadoRegistroDuplicado', $line)->textContent = 'AceptadaConErrores';
             }
             $imported = $document->importNode($line, true);
             $payload->appendChild($imported);

@@ -62,11 +62,13 @@ use Throwable;
  * (einvoicing.sending.backoff) has elapsed and whose attempts (einvoicing.sending.max_attempts)
  * are not used up. When the flow control allows a send, the records of the issuer with the oldest
  * due record are read from their stored XML, so the bytes written are the bytes sent, in chain
- * order and cut to submission.max_batch. Each is claimed with a guarded update, and only the
- * records this run claimed are sent, so concurrent runs never send a record twice. The attempt is
- * recorded on the throttle row before the request, so a concurrent run waits for its turn.
+ * order and cut to submission.max_batch; the flow control's wait is skipped only when that cut
+ * holds 1,000 records. Under a lock on the throttle row the flow control is checked again, each
+ * record is claimed with a guarded update and the attempt is recorded, so concurrent runs never
+ * send a record twice and a concurrent run waits for its turn.
  *
- * AEAT's answer is mapped in one transaction, and the events fire after it commits. If storing
+ * AEAT's answer is mapped in one transaction; the rest is scheduled after it commits, and then
+ * the events fire. If storing
  * the answer fails, the records become unconfirmed and are resent with the same bytes; AEAT then
  * answers with a duplicate, which accepts them without a CSV. A request without an answer leaves
  * them unconfirmed as well. A submission refused as a whole (a non-transient Client fault or an
@@ -165,8 +167,9 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         $state = $throttle->last_sent_at === null ? new ThrottleState(null, $settings->initialWait) : $throttle->state();
 
         $due = $this->dueRecords();
-        $decision = $flow->decide($state, count($due));
-        if (! $decision->sendNow) {
+        // A full submission skips the wait only when the request carries 1,000 records.
+        $sendable = min(count($due), $settings->maxBatch);
+        if (! $flow->decide($state, $sendable)->sendNow) {
             $this->scheduleRest();
 
             return;
@@ -208,30 +211,76 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             return;
         }
 
-        $claimed = $this->claim($batch, $due);
-        if ($claimed === []) {
+        $now = Carbon::now()->toDateTimeImmutable();
+        $taken = $this->claimUnderThrottle($batch, $due, $flow, $settings->initialWait, $sendable, $now);
+        if ($taken === null) {
             $this->scheduleRest();
 
             return;
         }
+        [$throttle, $state, $claimed] = $taken;
         $records = array_values(array_intersect_key($records, $claimed));
         $claimed = array_values($claimed);
 
-        $this->send($client, $context, $throttle, $flow, $state, $claimed, $records);
+        $this->send($client, $context, $throttle, $flow, $state, $claimed, $records, $now);
+    }
+
+    /**
+     * Under the lock of the throttle row, checks the flow control again, claims the batch and
+     * records the attempt, so two runs that both decided to send cannot both send. The row is
+     * written first, which takes the lock on every database (SQLite included) before it is read.
+     *
+     * @param  list<VerifactuRecord>  $batch
+     * @param  list<VerifactuRecord>  $due
+     * @return array{VerifactuThrottle, ThrottleState, non-empty-array<int, array{row: VerifactuRecord, state: VerifactuRecordState, attempts: int}>}|null
+     *                                                                                                                                                     null when the run must not send now
+     */
+    private function claimUnderThrottle(array $batch, array $due, FlowControl $flow, int $initialWait, int $sendable, DateTimeImmutable $now): ?array
+    {
+        return DB::transaction(function () use ($batch, $due, $flow, $initialWait, $sendable, $now): ?array {
+            VerifactuThrottle::query()->where('key', $this->throttleKey)->update(['updated_at' => Carbon::now()]);
+            $throttle = VerifactuThrottle::query()->where('key', $this->throttleKey)->lockForUpdate()->first();
+            if ($throttle === null || $throttle->blocked_at !== null) {
+                return null;
+            }
+            $state = $throttle->last_sent_at === null ? new ThrottleState(null, $initialWait) : $throttle->state();
+            if (! $flow->decide($state, $sendable)->sendNow) {
+                return null;
+            }
+
+            $claimed = $this->claim($batch, $due);
+            if ($claimed === []) {
+                return null;
+            }
+            // The attempt is recorded with the claim, so a concurrent run waits for the flow control.
+            $throttle->store($flow->afterFailure($state, $now));
+
+            return [$throttle, $state, $claimed];
+        });
     }
 
     /**
      * @param  list<array{row: VerifactuRecord, state: VerifactuRecordState, attempts: int}>  $claimed
      * @param  list<BillingRecord>  $records
      */
-    private function send(AeatClient $client, IssuerContext $context, VerifactuThrottle $throttle, FlowControl $flow, ThrottleState $state, array $claimed, array $records): void
+    private function send(AeatClient $client, IssuerContext $context, VerifactuThrottle $throttle, FlowControl $flow, ThrottleState $state, array $claimed, array $records, DateTimeImmutable $now): void
     {
-        $now = Carbon::now()->toDateTimeImmutable();
-        // Recorded before the request, so a concurrent run waits for the flow control.
-        $throttle->store($flow->afterFailure($state, $now));
-
         try {
             $submission = new Submission($context->header(), $records);
+        } catch (InvalidRecord $exception) {
+            $this->restore($claimed, 'invalid_record', $exception->getMessage());
+            $this->block($throttle, 'invalid_record', $exception->getMessage());
+
+            return;
+        } catch (Throwable $exception) {
+            // Nothing was sent: the records keep their state and their attempts.
+            $this->restore($claimed);
+            $this->scheduleRest();
+
+            throw $exception;
+        }
+
+        try {
             $response = $client->submit($submission);
         } catch (OutcomeUnknown) {
             $this->unconfirm($claimed, $now);
@@ -241,11 +290,6 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         } catch (RateLimited $exception) {
             $this->restore($claimed);
             $throttle->store(new ThrottleState($now, max($state->waitSeconds, $exception->retryAfterSeconds ?? $state->waitSeconds)));
-            $this->scheduleRest();
-
-            return;
-        } catch (TransportUnavailable) {
-            $this->restore($claimed);
             $this->scheduleRest();
 
             return;
@@ -292,10 +336,11 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             throw $exception;
         }
 
+        // Scheduled first, so a listener that throws cannot cancel the next run.
+        $this->scheduleRest();
         foreach ($events as $event) {
             event($event);
         }
-        $this->scheduleRest();
     }
 
     /**
@@ -314,16 +359,19 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         foreach ($claimed as $index => ['row' => $row, 'attempts' => $attempts]) {
             $outcome = $outcomes[$index];
             $resend = $attempts > 0;
-            $reached = VerifactuRecordState::fromOutcome($outcome, $row->kind === VerifactuRecordKind::Cancellation, $resend);
             $line = $response->lineFor($records[$index]);
-            $code = $line?->errorCode;
+            $reached = VerifactuRecordState::fromOutcome($outcome, $row->kind === VerifactuRecordKind::Cancellation, $resend, $line?->duplicateState);
+            // The code of a confirmed duplicate only says that AEAT already held the record.
+            $confirmedDuplicate = in_array($outcome, [RecordOutcome::AlreadyRegistered, RecordOutcome::AlreadyCancelled], true)
+                && ($reached === VerifactuRecordState::Accepted || $reached === VerifactuRecordState::AcceptedWithErrors);
+            $code = $confirmedDuplicate ? null : $line?->errorCode;
 
             $row->state = $reached;
             if ($outcome === RecordOutcome::Accepted || $outcome === RecordOutcome::AcceptedWithErrors) {
                 $row->csv = $response->csv;
             }
             $row->error_code = $code === null ? null : (string) $code;
-            $row->error_message = $line?->errorDescription;
+            $row->error_message = $code === null ? null : $line->errorDescription;
             $row->error_action = $code === null ? null : AeatErrors::classify($code)->action->name;
             if ($outcome === RecordOutcome::AlreadyRegistered && ! $resend) {
                 // AEAT holds another record for this invoice; only a lookup can tell.
@@ -552,7 +600,7 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         $now = Carbon::now()->getTimestamp();
         $throttleDelay = max(0, ($throttle->next_send_at?->getTimestamp() ?? $now) - $now);
         $generated = count(array_filter($pending, static fn (VerifactuRecord $row): bool => $row->state === VerifactuRecordState::Generated));
-        if ($generated >= FlowControl::MAX_RECORDS) {
+        if (min($generated, self::maxBatch()) >= FlowControl::MAX_RECORDS) {
             $delay = 0;
         } elseif ($generated > 0) {
             $delay = $throttleDelay;
@@ -621,6 +669,11 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
     private static function maxAttempts(): int
     {
         return max(1, (int) ceil(ConfigValue::number(config('einvoicing.sending.max_attempts') ?? self::DEFAULT_MAX_ATTEMPTS, 'einvoicing.sending.max_attempts')));
+    }
+
+    private static function maxBatch(): int
+    {
+        return ConfigValue::integer(config('einvoicing.verifactu.submission.max_batch') ?? FlowControl::MAX_RECORDS, 'einvoicing.verifactu.submission.max_batch', 1, FlowControl::MAX_RECORDS);
     }
 
     private static function initialWait(): int

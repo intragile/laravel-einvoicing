@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Enums;
 
+use IntrAgile\EInvoicing\Transport\Aeat\DuplicateState;
 use IntrAgile\EInvoicing\Transport\Aeat\RecordOutcome;
 use IntrAgile\EInvoicing\Transport\DeliveryState;
 
@@ -48,15 +49,22 @@ enum VerifactuRecordState: string
      *
      * AEAT matches a duplicate by the invoice id, not by the Huella, so AlreadyRegistered proves
      * that it holds this very record only when the answer is to a resend of bytes sent before. On
-     * a first send it leaves the record unconfirmed, to be settled with a lookup.
+     * a first send it leaves the record unconfirmed, to be settled with a lookup. On a resend, a
+     * duplicate AEAT holds as AceptadaConErrores is accepted with errors.
      *
      * @param  bool  $cancellation  whether the record is a RegistroAnulacion
      * @param  bool  $resend  whether the same bytes had been sent before this submission
+     * @param  DuplicateState|null  $duplicate  EstadoRegistroDuplicado of the answer line, if any
      */
-    public static function fromOutcome(RecordOutcome $outcome, bool $cancellation, bool $resend): self
+    public static function fromOutcome(RecordOutcome $outcome, bool $cancellation, bool $resend, ?DuplicateState $duplicate = null): self
     {
-        if ($outcome === RecordOutcome::AlreadyRegistered && ! $resend) {
-            return self::Unconfirmed;
+        if ($outcome === RecordOutcome::AlreadyRegistered) {
+            if (! $resend) {
+                return self::Unconfirmed;
+            }
+            if ($duplicate === DuplicateState::AceptadaConErrores) {
+                return self::AcceptedWithErrors;
+            }
         }
 
         return match ($outcome->deliveryState($cancellation)) {

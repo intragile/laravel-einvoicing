@@ -34,8 +34,10 @@ use RuntimeException;
  * long as the client is cached and are deleted by forget() and when this object is destroyed.
  * Clients are cached per credential set: the certificate and key paths with the modification time
  * and size of each file, the port and the environment. A certificate renewed in place therefore
- * gets a fresh client, and the files of the old one are deleted. Certificate files older than a
- * day left in a folder by a worker that was killed are removed before new ones are written.
+ * gets a fresh client, and the files of the old one are deleted. Each use of a cached client
+ * renews the modification time of its files, and writes them again if they are gone. Before new
+ * files are written, certificate files older than a day, left by a worker that was killed, are
+ * removed from every credential folder, and a folder left empty is removed.
  *
  * An AeatClient or B2BrouterVerifactu instance bound in the container is used instead. Bind this
  * class as a singleton, so a process keeps one cache. The server certificate is always verified,
@@ -185,7 +187,7 @@ final class VerifactuClients
         $version = self::version($credentials->certificatePath).'|'.($credentials->privateKeyPath === null ? '' : self::version($credentials->privateKeyPath));
 
         $cached = $this->entries[$slot] ?? null;
-        if ($cached !== null && $cached['version'] === $version) {
+        if ($cached !== null && $cached['version'] === $version && self::present($cached['certificate'])) {
             return $slot;
         }
         if ($cached !== null) {
@@ -217,23 +219,47 @@ final class VerifactuClients
     }
 
     /**
-     * A private folder for the certificate files of one credential set, cleared of files left by
-     * a killed worker.
+     * Whether both files of a cached certificate still exist; their modification time is renewed,
+     * so files in use never look left over to the clean-up of another process.
+     */
+    private static function present(MaterializedCertificate $certificate): bool
+    {
+        foreach ([$certificate->certificatePath, $certificate->privateKeyPath] as $path) {
+            clearstatcache(true, $path);
+            if (! is_file($path) || ! @touch($path)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * A private folder for the certificate files of one credential set. Certificate files older
+     * than a day, left by a worker that was killed, are removed from it and from the folders of
+     * other credential sets; a folder left empty by that is removed too.
      *
      * @throws TransportUnavailable when the folder cannot be created
      */
     private function directory(string $name): string
     {
-        $directory = ($this->app)()->storagePath(self::TLS_PATH.'/'.$name);
+        $root = ($this->app)()->storagePath(self::TLS_PATH);
+        $directory = $root.'/'.$name;
         if (! is_dir($directory) && ! @mkdir($directory, 0700, true) && ! is_dir($directory)) {
             throw new TransportUnavailable(sprintf('The folder %s for the AEAT client certificate cannot be created.', $directory));
         }
         @chmod($directory, 0700);
 
         $cutoff = time() - self::STALE_AFTER;
-        foreach (glob($directory.'/aeat-*.pem') ?: [] as $file) {
-            if (preg_match('~/aeat-[0-9a-f]+-(?:certificate|key)\.pem\z~', $file) === 1 && is_file($file) && (int) @filemtime($file) < $cutoff) {
-                @unlink($file);
+        foreach (glob($root.'/*', GLOB_ONLYDIR) ?: [] as $folder) {
+            foreach (glob($folder.'/aeat-*.pem') ?: [] as $file) {
+                clearstatcache(true, $file);
+                if (preg_match('~/aeat-[0-9a-f]+-(?:certificate|key)\.pem\z~', $file) === 1 && is_file($file) && (int) @filemtime($file) < $cutoff) {
+                    @unlink($file);
+                }
+            }
+            if ($folder !== $directory && preg_match('~/[0-9a-f]{40}\z~', $folder) === 1 && (scandir($folder) ?: ['x', 'y', 'z']) === ['.', '..']) {
+                @rmdir($folder);
             }
         }
 

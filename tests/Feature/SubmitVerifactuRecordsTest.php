@@ -54,6 +54,7 @@ use IntrAgile\EInvoicing\Syntax\Verifactu\RecordWriter;
 use IntrAgile\EInvoicing\Syntax\Verifactu\VerifactuFormat;
 use IntrAgile\EInvoicing\Transport\Aeat\AeatClient;
 use IntrAgile\EInvoicing\Transport\Aeat\AeatFormat;
+use IntrAgile\EInvoicing\Transport\Aeat\DuplicateState;
 use IntrAgile\EInvoicing\Transport\Aeat\FlowControl;
 use IntrAgile\EInvoicing\Transport\Aeat\RecordOutcome;
 use IntrAgile\EInvoicing\Transport\Aeat\SoapEnvelope;
@@ -152,22 +153,47 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->assertSame(VerifactuRecordState::Generated, $row->fresh()?->state);
         $this->assertScheduled(50);
 
-        // With a full submission pending, the wait is not kept; max_batch still cuts the request.
+        // 1,000 records pending, but max_batch cuts the request to 2: the wait is kept.
         config()->set('einvoicing.verifactu.submission.max_batch', 2);
         $store = $this->store(new RecordWriter);
         for ($n = 2; $n <= 1000; $n++) {
             $this->generate(sprintf('W-%d', $n), store: $store);
         }
-        $this->aeat->queue(fn (RequestInterface $request): ResponseInterface => FakeAeatApi::answer([
-            FakeAeatApi::line(VerifactuSamples::invoiceId('W-1', '01-01-2024')),
-            FakeAeatApi::line(VerifactuSamples::invoiceId('W-2', '01-01-2024')),
-        ]));
+        Queue::fake();
+
+        $this->submit();
+
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertScheduled(50);
+
+        // A request that carries 1,000 records does not wait.
+        config()->set('einvoicing.verifactu.submission.max_batch', 1000);
+        $this->aeat->queue(fn (RequestInterface $request): ResponseInterface => FakeAeatApi::answer(array_map(
+            static fn (string $number): array => FakeAeatApi::line(VerifactuSamples::invoiceId($number, '01-01-2024')),
+            $this->aeat->sentNumbers(0),
+        )));
 
         $this->submit();
 
         $this->assertSame(1, $this->aeat->requestCount());
-        $this->assertSame(['W-1', 'W-2'], $this->aeat->sentNumbers(0));
-        $this->assertSame(998, VerifactuRecord::query()->where('state', VerifactuRecordState::Generated)->count());
+        $this->assertCount(1000, $this->aeat->sentNumbers(0));
+        $this->assertSame(0, VerifactuRecord::query()->where('state', VerifactuRecordState::Generated)->count());
+    }
+
+    public function test_more_than_max_batch_pending_waits_between_batches(): void
+    {
+        config()->set('einvoicing.verifactu.submission.max_batch', 2);
+        $rows = array_map(fn (int $n): VerifactuRecord => $this->generate(sprintf('B-%d', $n)), [1, 2, 3]);
+        $this->aeat->queue(FakeAeatApi::answer($this->lines(array_slice($rows, 0, 2))));
+
+        $this->submit();
+
+        $this->assertSame(1, $this->aeat->requestCount());
+        $this->assertSame(['B-1', 'B-2'], $this->aeat->sentNumbers(0));
+        // The rest follows after AEAT's wait, not at once.
+        $this->assertScheduled(60);
+        $this->submit();
+        $this->assertSame(1, $this->aeat->requestCount());
     }
 
     public function test_issuer_scope_throttles_separately(): void
@@ -285,6 +311,43 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->assertSame(VerifactuRecordState::Accepted, $row->state);
         $this->assertNull($row->csv);
         $this->assertSame(2, $row->attempts);
+    }
+
+    public function test_duplicate_aceptada_con_errores_on_resend_is_accepted_with_errors(): void
+    {
+        Event::fake([VerifactuRecordAccepted::class]);
+        $row = $this->generate('D-4');
+        $this->aeat->queue(FakeAeatApi::noAnswer(...));
+        $this->submit();
+
+        $this->travel(60)->seconds();
+        $this->aeat->queue(FakeAeatApi::answer([FakeAeatApi::line($row->invoiceId(), 'duplicado_aceptada_con_errores')], csv: null));
+        $this->submit();
+
+        $row = $row->fresh();
+        $this->assertNotNull($row);
+        $this->assertSame(VerifactuRecordState::AcceptedWithErrors, $row->state);
+        Event::assertDispatched(VerifactuRecordAccepted::class, fn (VerifactuRecordAccepted $event): bool => $event->record->is($row) && $event->withErrors);
+    }
+
+    public function test_confirmed_resend_duplicate_clears_the_error(): void
+    {
+        $row = $this->generate('D-5');
+        $this->aeat->queue(FakeAeatApi::serverFault());
+        $this->submit();
+        // A failure answered earlier left its code on the record.
+        $row->forceFill(['error_code' => '4110', 'error_message' => 'earlier', 'error_action' => 'RetryLater'])->save();
+
+        $this->travel(60)->seconds();
+        $this->aeat->queue(FakeAeatApi::answer([FakeAeatApi::line($row->invoiceId(), 'duplicado_correcta')], csv: null));
+        $this->submit();
+
+        $row = $row->fresh();
+        $this->assertNotNull($row);
+        $this->assertSame(VerifactuRecordState::Accepted, $row->state);
+        $this->assertNull($row->error_code);
+        $this->assertNull($row->error_message);
+        $this->assertNull($row->error_action);
     }
 
     public function test_duplicate_correcta_on_first_send_is_unconfirmed_for_lookup(): void
@@ -568,12 +631,16 @@ final class SubmitVerifactuRecordsTest extends TestCase
         yield 'AlreadyRegistered alta, first send' => [RecordOutcome::AlreadyRegistered, false, false, VerifactuRecordState::Unconfirmed];
         yield 'AlreadyRegistered anulacion, first send' => [RecordOutcome::AlreadyRegistered, true, false, VerifactuRecordState::Unconfirmed];
         yield 'Accepted alta, first send' => [RecordOutcome::Accepted, false, false, VerifactuRecordState::Accepted];
+        // A resend that AEAT already holds as accepted with errors keeps that state.
+        yield 'AlreadyRegistered AceptadaConErrores, resend' => [RecordOutcome::AlreadyRegistered, false, true, VerifactuRecordState::AcceptedWithErrors, DuplicateState::AceptadaConErrores];
+        yield 'AlreadyRegistered Correcta, resend' => [RecordOutcome::AlreadyRegistered, false, true, VerifactuRecordState::Accepted, DuplicateState::Correcta];
+        yield 'AlreadyRegistered AceptadaConErrores, first send' => [RecordOutcome::AlreadyRegistered, false, false, VerifactuRecordState::Unconfirmed, DuplicateState::AceptadaConErrores];
     }
 
     #[DataProvider('outcomes')]
-    public function test_state_follows_record_outcome(RecordOutcome $outcome, bool $cancellation, bool $resend, VerifactuRecordState $expected): void
+    public function test_state_follows_record_outcome(RecordOutcome $outcome, bool $cancellation, bool $resend, VerifactuRecordState $expected, ?DuplicateState $duplicate = null): void
     {
-        $this->assertSame($expected, VerifactuRecordState::fromOutcome($outcome, $cancellation, $resend));
+        $this->assertSame($expected, VerifactuRecordState::fromOutcome($outcome, $cancellation, $resend, $duplicate));
     }
 
     public function test_unmatched_line_keeps_csv_and_is_logged(): void
@@ -727,6 +794,71 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->assertSame(['Q-4', 'Q-5'], $this->aeat->sentNumbers(0));
         $this->assertStates([VerifactuRecordState::Accepted, VerifactuRecordState::Accepted], $rows);
         $this->assertSame(1, $rows[0]->fresh()?->attempts);
+    }
+
+    public function test_a_run_that_decided_before_another_sent_rechecks_the_throttle(): void
+    {
+        $rows = [$this->generate('Q-6'), $this->generate('Q-7')];
+        $armed = true;
+        // The outer run has decided to send and read the rows; before it claims them, another run
+        // sends a submission and records it on the throttle.
+        VerifactuRecord::retrieved(function (VerifactuRecord $row) use (&$armed): void {
+            if ($armed && array_key_exists('xml', $row->getAttributes())) {
+                $armed = false;
+                $this->throttle()->store(new ThrottleState(Carbon::now()->toDateTimeImmutable(), 60));
+            }
+        });
+
+        $this->submit();
+
+        $this->assertFalse($armed);
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertStates([VerifactuRecordState::Generated, VerifactuRecordState::Generated], $rows);
+        $this->assertSame(0, $rows[0]->fresh()?->attempts);
+        $this->assertScheduled(60);
+    }
+
+    public function test_a_throwing_listener_does_not_cancel_the_next_run(): void
+    {
+        config()->set('einvoicing.verifactu.submission.max_batch', 1);
+        $rows = [$this->generate('E-1'), $this->generate('E-2')];
+        $this->aeat->queue(FakeAeatApi::answer($this->lines([$rows[0]])));
+        Event::listen(VerifactuRecordAccepted::class, static function (): void {
+            throw new RuntimeException('listener failed');
+        });
+
+        try {
+            $this->submit();
+            $this->fail('The listener exception was swallowed.');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('listener failed', $exception->getMessage());
+        }
+
+        $this->assertStates([VerifactuRecordState::Accepted, VerifactuRecordState::Generated], $rows);
+        $this->assertScheduled(60);
+    }
+
+    public function test_a_failure_before_the_request_keeps_state_and_attempts(): void
+    {
+        Event::fake([VerifactuSubmissionBlocked::class]);
+        $row = $this->generate('H-1');
+        $this->aeat->queue(FakeAeatApi::noAnswer(...));
+        $this->submit();
+        $this->assertSame(1, $row->fresh()?->attempts);
+
+        // The submission header cannot be built: NombreRazon is over 120 characters.
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.name', str_repeat('N', 121));
+        $this->app->forgetInstance(VerifactuIssuerResolver::class);
+        $this->travel(60)->seconds();
+        $this->submit();
+
+        $row = $row->fresh();
+        $this->assertNotNull($row);
+        $this->assertSame(1, $this->aeat->requestCount());
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $row->state);
+        $this->assertSame(1, $row->attempts);
+        $this->assertSame('invalid_record', $row->error_code);
+        Event::assertDispatched(VerifactuSubmissionBlocked::class, fn (VerifactuSubmissionBlocked $event): bool => $event->code === 'invalid_record');
     }
 
     public function test_job_payload_and_exceptions_carry_no_secret(): void

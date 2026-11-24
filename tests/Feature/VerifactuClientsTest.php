@@ -154,6 +154,72 @@ final class VerifactuClientsTest extends TestCase
         $this->assertFileExists($other);
     }
 
+    public function test_a_second_process_does_not_break_the_files_of_a_long_running_one(): void
+    {
+        $first = new VerifactuClients($this->app);
+        $first->aeatHttpClient($this->context());
+        $files = $this->materializedFiles();
+        $this->assertCount(2, $files);
+
+        // A client in use renews its files on every use, so they never look left over.
+        $this->backdate($files);
+        $first->aeatHttpClient($this->context());
+        $second = new VerifactuClients($this->app);
+        $second->aeat($this->context());
+        foreach ($files as $file) {
+            $this->assertFileExists($file);
+        }
+        $this->assertCount(4, $this->materializedFiles());
+
+        // Files of an idle client that the other process removed are written again on next use.
+        $this->backdate($files);
+        $third = new VerifactuClients($this->app);
+        $third->aeat($this->context());
+        foreach ($files as $file) {
+            $this->assertFileDoesNotExist($file);
+        }
+        $first->aeatHttpClient($this->context());
+        $this->assertCount(6, $this->materializedFiles());
+        $first->forget();
+        $this->assertCount(4, $this->materializedFiles());
+        $second->forget();
+        $third->forget();
+        $this->assertSame([], $this->materializedFiles());
+    }
+
+    public function test_left_over_files_of_other_credentials_are_removed_with_their_empty_folder(): void
+    {
+        $root = $this->storage.'/einvoicing/verifactu/tls';
+        $abandoned = $root.'/'.sha1('abandoned');
+        $shared = $root.'/'.sha1('shared');
+        $foreign = $root.'/not-ours';
+        foreach ([$abandoned, $shared, $foreign] as $folder) {
+            mkdir($folder, 0700, true);
+        }
+        $old = [
+            $abandoned.'/aeat-0123456789abcdef01234567-certificate.pem',
+            $abandoned.'/aeat-0123456789abcdef01234567-key.pem',
+            $shared.'/aeat-0123456789abcdef01234567-key.pem',
+            $foreign.'/aeat-0123456789abcdef01234567-key.pem',
+        ];
+        $kept = [$shared.'/aeat-fedcba9876543210fedcba98-key.pem', $shared.'/notes.pem'];
+        foreach ([...$old, ...$kept] as $file) {
+            file_put_contents($file, 'left over');
+        }
+        $this->backdate([...$old, $shared.'/notes.pem']);
+
+        $this->app->make(VerifactuClients::class)->aeatHttpClient($this->context());
+
+        $this->assertDirectoryDoesNotExist($abandoned);
+        $this->assertFileDoesNotExist($old[2]);
+        $this->assertFileDoesNotExist($old[3]);
+        foreach ($kept as $file) {
+            $this->assertFileExists($file);
+        }
+        // A folder the package did not name is emptied of its files, never removed.
+        $this->assertDirectoryExists($foreign);
+    }
+
     public function test_an_unwritable_tls_folder_is_a_transient_failure(): void
     {
         mkdir($this->storage.'/einvoicing/verifactu', 0700, true);
@@ -280,6 +346,17 @@ final class VerifactuClientsTest extends TestCase
     private function materializedFiles(): array
     {
         return glob($this->storage.'/einvoicing/verifactu/tls/*/aeat-*.pem') ?: [];
+    }
+
+    /**
+     * @param  list<string>  $files
+     */
+    private function backdate(array $files): void
+    {
+        foreach ($files as $file) {
+            touch($file, time() - 2 * 86400);
+        }
+        clearstatcache();
     }
 
     private function httpClient(): HttpClient
