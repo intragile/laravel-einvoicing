@@ -1352,14 +1352,15 @@ composer test        # PHPUnit
 composer analyse     # PHPStan, max level
 composer format      # Pint
 EINVOICING_PEPPOL_FROM=/path/to/peppol/sch vendor/bin/phpunit --group peppol-rules
-php artisan einvoicing:verifactu-install-schemas   # or: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
+vendor/bin/einvoicing-rules install spain --dir=build/verifactu
 vendor/bin/phpunit --group verifactu-official --fail-on-skipped
-EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency
+EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency,verifactu-databases --fail-on-skipped
 ```
 
-**`EINVOICING_TEST_DB_URL` points the chain concurrency test at a MySQL or PostgreSQL database,
-which it wipes (it drops and re-creates every table).** Give it a throwaway database, never one
-that holds data; without the variable the test runs on a temporary SQLite file.
+**Any test run with `EINVOICING_TEST_DB_URL` set wipes that database:** the tests that read it
+(the chain concurrency test and the doctor's database queries, groups `verifactu-concurrency` and
+`verifactu-databases`) drop and re-create every table of that MySQL or PostgreSQL database. Give it
+a throwaway database, never one that holds data; without the variable they run on SQLite.
 
 ## License
 

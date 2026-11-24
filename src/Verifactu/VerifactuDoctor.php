@@ -270,6 +270,28 @@ final class VerifactuDoctor
     }
 
     /**
+     * Whether any value of einvoicing.verifactu.system is set.
+     */
+    private function systemDeclared(): bool
+    {
+        $filled = static function (mixed $value) use (&$filled): bool {
+            if (is_array($value)) {
+                foreach ($value as $item) {
+                    if ($filled($item)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            return $value !== null && (! is_string($value) || trim($value) !== '');
+        };
+
+        return $filled($this->config('einvoicing.verifactu.system'));
+    }
+
+    /**
      * @return list<string>
      */
     private function issuerKeys(): array
@@ -300,8 +322,14 @@ final class VerifactuDoctor
         try {
             $system = $settings->system();
         } catch (ConfigurationException $exception) {
-            return $required
-                ? ['verifactu: system', self::FAIL, $exception->getMessage()]
+            if ($required) {
+                return ['verifactu: system', self::FAIL, $exception->getMessage()];
+            }
+
+            // Unused while every issuer uses B2Brouter, but a block that is filled in is meant to
+            // be used, so its errors are shown.
+            return $this->systemDeclared()
+                ? ['verifactu: system', self::WARN, $exception->getMessage().' (not used while every issuer uses the B2Brouter driver)']
                 : ['verifactu: system', self::INFO, 'not declared; not needed while every issuer uses the B2Brouter driver, whose records name B2Brouter as the billing software'];
         }
 

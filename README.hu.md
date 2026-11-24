@@ -1106,7 +1106,7 @@ megkeressük (`einvoicing:verifactu-submit --retry-unconfirmed`).
 Minden regisztrált rekordot **keresztellenőrzünk** a saját motorunkkal: az XML-t a séma szerint, a
 szövegéből újraszámolt `Huella`-t, a kapcsolódását az előző tárolt rekordhoz, szemantikailag a
 számla saját rekordunkkal való összevetését, és a B2Brouter QR-kódjában lévő URL-t. `strict`
-módban a sikertelen ellenőrzés hibásnak jelöli a sort (az láncban marad, mert az AEAT-nál
+módban a sikertelen ellenőrzés hibásnak jelöli a sort (a láncban marad, mert az AEAT-nál
 megvan); `report` módban csak jelezzük. A `VerifactuCrossCheckFailed` mindkét esetben lefut. Két
 eltérés **ismert eltérés**, sosem hiba: a mentességi jogcím a B2Brouter-fiók alapértelmezését
 követi (`OperacionExenta` E1 minden mentes tételre), és a különbözeti helyesbítő számla (R1, I)
@@ -1408,15 +1408,16 @@ composer test        # PHPUnit
 composer analyse     # PHPStan, max szint
 composer format      # Pint
 EINVOICING_PEPPOL_FROM=/path/to/peppol/sch vendor/bin/phpunit --group peppol-rules
-php artisan einvoicing:verifactu-install-schemas   # vagy: vendor/bin/einvoicing-rules install spain --dir=build/verifactu
+vendor/bin/einvoicing-rules install spain --dir=build/verifactu
 vendor/bin/phpunit --group verifactu-official --fail-on-skipped
-EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency
+EINVOICING_TEST_DB_URL=mysql://root:secret@127.0.0.1:3306/einvoicing_test vendor/bin/phpunit --group verifactu-concurrency,verifactu-databases --fail-on-skipped
 ```
 
-**Az `EINVOICING_TEST_DB_URL` egy MySQL vagy PostgreSQL adatbázisra irányítja a lánc
-párhuzamossági tesztjét, amely azt az adatbázist kiüríti (minden táblát eldob és újra létrehoz).**
-Eldobható adatbázist adj meg, soha olyat, amelyben adat van; a változó nélkül a teszt ideiglenes
-SQLite fájlon fut.
+**Minden tesztfuttatás, amelyben az `EINVOICING_TEST_DB_URL` be van állítva, kiüríti azt az
+adatbázist:** az ezt olvasó tesztek (a lánc párhuzamossági tesztje és a doctor adatbázis-lekérdezései,
+`verifactu-concurrency` és `verifactu-databases` csoport) a MySQL vagy PostgreSQL adatbázis minden
+tábláját eldobják és újra létrehozzák. Eldobható adatbázist adj meg, soha olyat, amelyben adat van;
+a változó nélkül SQLite-on futnak.
 
 ## Licenc
 

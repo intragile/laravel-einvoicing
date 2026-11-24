@@ -175,7 +175,7 @@ final class DoctorVerifactuTest extends TestCase
     public function test_system_is_not_needed_when_every_issuer_uses_b2brouter(): void
     {
         $this->configureComplete(schemas: false);
-        config()->set('einvoicing.verifactu.system.name', null);
+        config()->set('einvoicing.verifactu.system', ['foreign_id' => ['type' => null, 'id' => null, 'country' => null], 'name' => '']);
         config()->set('einvoicing.verifactu.issuers.'.self::ISSUER.'.driver', 'b2brouter');
 
         $rows = $this->doctorRows();
@@ -185,6 +185,20 @@ final class DoctorVerifactuTest extends TestCase
 
         config()->set('einvoicing.verifactu.issuers.'.self::ISSUER.'.driver', 'aeat');
         $this->assertRowIn($this->doctorRows(), 'verifactu: system', 'fail', 'einvoicing.verifactu.system.name');
+    }
+
+    public function test_invalid_system_is_shown_when_every_issuer_uses_b2brouter(): void
+    {
+        $this->configureComplete(schemas: false);
+        config()->set('einvoicing.verifactu.issuers.'.self::ISSUER.'.driver', 'b2brouter');
+        // Filled in, but incomplete: its errors are shown although B2Brouter does not use it.
+        config()->set('einvoicing.verifactu.system.name', null);
+
+        $row = $this->row($this->doctorRows(), 'verifactu: system');
+
+        $this->assertSame('warn', $row[1]);
+        $this->assertStringContainsString('einvoicing.verifactu.system.name', $row[2]);
+        $this->assertStringNotContainsString('not needed while', $row[2]);
     }
 
     public function test_invalid_issuer_keys_fail_each(): void

@@ -12,6 +12,7 @@ use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
+use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuChain;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuRecord;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuThrottle;
@@ -70,6 +71,11 @@ final class DatabaseChainStore implements ChainStore
         $this->connectionName = $db instanceof Connection ? $db->getName() : null;
     }
 
+    /**
+     * @throws ConfigurationException when the throttle of the chain cannot be derived, such as
+     *                                VerifactuManager's store without a declared computer system;
+     *                                nothing is written then
+     */
     public function append(ChainKey $key, Closure $build): BillingRecord
     {
         return $this->appendRecord($key, IssuerDriver::Aeat, ($this->defaultThrottle)($key), $build, [])[0];
@@ -82,6 +88,11 @@ final class DatabaseChainStore implements ChainStore
         return $row === null ? null : self::readChain($row, $key)[2];
     }
 
+    /**
+     * @throws ConfigurationException when the throttle of the chain cannot be derived, such as
+     *                                VerifactuManager's store without a declared computer system;
+     *                                nothing is written then
+     */
     public function seed(ChainKey $key, InvoiceId $last, string $fingerprint): ChainHead
     {
         self::assertIssuer($key, $last);

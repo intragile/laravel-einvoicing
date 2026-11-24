@@ -92,6 +92,29 @@ final class VerifactuManagerTest extends TestCase
     }
 
     #[Group('verifactu-official')]
+    public function test_store_without_a_declared_system_refuses_own_chains_and_writes_nothing(): void
+    {
+        config()->set('einvoicing.verifactu.system', []);
+        $store = $this->app->make(VerifactuManager::class)->store();
+        $key = new ChainKey(Nif::parse(self::ISSUER), '383', VerifactuEnvironment::Test);
+
+        try {
+            $store->append($key, static fn (): never => throw new LogicException('The record must not be built.'));
+            $this->fail('append() needs the declared system.');
+        } catch (ConfigurationException $exception) {
+            $this->assertStringContainsString('einvoicing.verifactu.system', $exception->getMessage());
+        }
+
+        try {
+            $store->seed($key, new InvoiceId(Nif::parse(self::ISSUER), 'F-1', new DateTimeImmutable('2026-11-20')), str_repeat('A', 64));
+            $this->fail('seed() needs the declared system.');
+        } catch (ConfigurationException $exception) {
+            $this->assertStringContainsString('einvoicing.verifactu.system', $exception->getMessage());
+        }
+
+        $this->assertSame(0, VerifactuChain::query()->count());
+    }
+
     public function test_register_maps_chains_stores_and_returns_qr(): void
     {
         Event::fake([VerifactuRecordGenerated::class]);

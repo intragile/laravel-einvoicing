@@ -201,8 +201,9 @@ final class B2BrouterVerifactuLiveTest extends TestCase
         });
 
         $output = implode("\n", $this->output);
-        $this->assertStringNotContainsString((string) getenv(self::KEY_ENV), $output);
-        $this->assertStringNotContainsString((string) getenv(self::ACCOUNT_ENV), $output);
+        // assertFalse, not assertStringNotContainsString: a failure must not print the value.
+        $this->assertFalse(str_contains($output, (string) getenv(self::KEY_ENV)), 'The output contains the API key.');
+        $this->assertFalse(str_contains($output, (string) getenv(self::ACCOUNT_ENV)), 'The output contains the account id.');
     }
 
     /**
