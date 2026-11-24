@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Tests;
 
+use Illuminate\Foundation\Bootstrap\HandleExceptions;
 use IntrAgile\EInvoicing\Laravel\EInvoicingServiceProvider;
+use IntrAgile\EInvoicing\Laravel\Tests\Support\GuardFirstPartyDeprecations;
 use Orchestra\Testbench\TestCase as Orchestra;
 
 abstract class TestCase extends Orchestra
@@ -15,9 +17,31 @@ abstract class TestCase extends Orchestra
     /** @var list<string> */
     private array $tempDirs = [];
 
+    /**
+     * Bootstrappers that install Laravel's error handler in a test application. The guard test
+     * fails when none of them runs any more, for example after a Testbench rename.
+     */
+    public const ERROR_HANDLER_BOOTSTRAPPERS = [
+        'Orchestra\Testbench\Bootstrap\HandleExceptions',
+        HandleExceptions::class,
+    ];
+
     protected function getPackageProviders($app): array
     {
         return [EInvoicingServiceProvider::class];
+    }
+
+    /**
+     * Runs before the application is bootstrapped; used to make a deprecation caused by src/
+     * fail the test (see FirstPartyDeprecations).
+     */
+    protected function resolveApplicationExceptionHandler($app)
+    {
+        parent::resolveApplicationExceptionHandler($app);
+
+        foreach (self::ERROR_HANDLER_BOOTSTRAPPERS as $bootstrapper) {
+            $app->extend($bootstrapper, static fn (object $inner): object => new GuardFirstPartyDeprecations($inner));
+        }
     }
 
     protected function tearDown(): void

@@ -5,7 +5,8 @@
          colors="true"
          cacheDirectory=".phpunit.cache"
          failOnWarning="true"
-         failOnRisky="true">
+         failOnRisky="true"
+         failOnDeprecation="true">
     <testsuites>
         <testsuite name="Unit"><directory>tests/Unit</directory></testsuite>
         <testsuite name="Feature"><directory>tests/Feature</directory></testsuite>
@@ -14,7 +15,12 @@
     <groups>
         <exclude><group>peppol-rules</group><group>recommand-live</group><group>b2brouter-france-live</group><group>ksef-live</group><group>b2brouter-spain-live</group></exclude>
     </groups>
-    <source>
+    <!-- failOnDeprecation turns a deprecation raised by src/, or by a library that src/ calls,
+         into a failure. Deprecations raised between third-party packages are left out
+         (ignoreIndirectDeprecations), because they are not ours to fix. Inside a bootstrapped
+         test application Laravel's error handler takes over from PHPUnit's; there
+         tests/Support/FirstPartyDeprecations applies the same rule. -->
+    <source ignoreIndirectDeprecations="true">
         <include><directory>src</directory></include>
     </source>
     <php>
