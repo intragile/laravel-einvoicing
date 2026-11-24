@@ -13,7 +13,9 @@ use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordGenerated;
+use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordRejected;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\Jobs\PollVerifactuTaxReport;
 use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuChain;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuRecord;
@@ -37,9 +39,14 @@ use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
 use IntrAgile\EInvoicing\Spain\Verifactu\RecordMapper;
 use IntrAgile\EInvoicing\Spain\Verifactu\RegistrationDraft;
 use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuIssuerResolver;
+use IntrAgile\EInvoicing\Syntax\Ubl\UblWriter;
 use IntrAgile\EInvoicing\Syntax\Verifactu\RecordWriter;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleKey;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleScope;
+use IntrAgile\EInvoicing\Transport\Exception\DocumentRejected;
+use IntrAgile\EInvoicing\Transport\Exception\OutcomeUnknown;
+use IntrAgile\EInvoicing\Transport\Exception\TransportException;
+use IntrAgile\EInvoicing\Transport\Exception\UnexpectedResponse;
 use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
 use IntrAgile\EInvoicing\Validation\Spain\VerifactuSchemas;
 use InvalidArgumentException;
@@ -55,6 +62,10 @@ use LogicException;
  * and stored with that XML, its QR URL and the literal generation timestamp. The returned row is
  * in state generated; VerifactuRecordGenerated fires and the submission job is queued once the
  * surrounding database transaction commits, and neither happens when it rolls back.
+ *
+ * For an issuer on the B2Brouter driver, register() imports the invoice into B2Brouter, which
+ * generates, chains and submits the record; PollVerifactuTaxReport attaches that record to its
+ * B2Brouter chain once AEAT registered it. Cancellations and corrections are managed in B2Brouter.
  *
  * The chain key and the throttle key come from the resolved issuer's environment, which must be
  * einvoicing.verifactu.environment. The chain key is always derived from the computer system the
@@ -140,6 +151,10 @@ final class VerifactuManager
     /**
      * Generates, chains and stores the registration record (RegistroAlta) of an invoice.
      *
+     * For an issuer on the B2Brouter driver, the invoice is imported into B2Brouter instead, which
+     * generates and submits the record; the returned row is pending, without a QR URL, until
+     * PollVerifactuTaxReport attaches B2Brouter's record (see registerWithB2Brouter()).
+     *
      * @param  string|null  $reference  the application's own reference, stored on the row
      *
      * @throws ConfigurationException when a setting is invalid, the schemas are not installed, the
@@ -149,7 +164,12 @@ final class VerifactuManager
      * @throws UnknownIssuer when the resolver has no data for the invoice's issuer
      * @throws InvalidArgumentException when the invoice carries a correction operation, or its
      *                                  IDFactura already has a registration record in the chain
-     * @throws LogicException for an issuer on the B2Brouter driver, until that path is available
+     *                                  (on the B2Brouter driver: was imported, or its import is
+     *                                  unconfirmed)
+     * @throws OutcomeUnknown on the B2Brouter driver, when the import ended without an answer; the
+     *                        row is stored unconfirmed
+     * @throws TransportException on the B2Brouter driver, when B2Brouter refused the import or the
+     *                            request; nothing is stored
      * @throws InvalidRecord when the written record fails the schema
      * @throws ChainConflict when the chain is closed or the head moved during the write
      */
@@ -172,7 +192,7 @@ final class VerifactuManager
         }
 
         if ($context->driver === IssuerDriver::B2Brouter) {
-            return $this->registerWithB2Brouter($draft, $context, $reference);
+            return $this->registerWithB2Brouter($invoice, $draft, $context, $reference);
         }
 
         return $this->appendAeat($settings, $schemas, $context, $draft, $reference, function (ChainKey $key) use ($draft): void {
@@ -408,11 +428,159 @@ final class VerifactuManager
     }
 
     /**
-     * @throws LogicException always: the B2Brouter path is not available in this build
+     * Imports the invoice into B2Brouter, which generates, chains and submits its record, and
+     * stores a pending row whose tax report PollVerifactuTaxReport then polls.
+     *
+     * Nothing is stored when the import fails before or with an answer: the invoice cannot be
+     * written as UBL, the client is not configured, or B2Brouter refused it. An import without an
+     * answer (OutcomeUnknown) may have gone through, so the row is stored unconfirmed, without a
+     * B2Brouter invoice id, and the exception is rethrown; retryB2BrouterImport() settles it.
+     *
+     * @throws InvalidArgumentException when the invoice was imported already, or its import is unconfirmed
+     * @throws ConfigurationException when no B2Brouter transport is configured
+     * @throws OutcomeUnknown when the import ended without an answer; the row is stored unconfirmed
+     * @throws TransportException when B2Brouter refused the import (DocumentRejected, for a taken
+     *                            number too) or the request; nothing is stored
      */
-    private function registerWithB2Brouter(RegistrationDraft $draft, IssuerContext $context, ?string $reference): VerifactuRecord
+    private function registerWithB2Brouter(Invoice $invoice, RegistrationDraft $draft, IssuerContext $context, ?string $reference): VerifactuRecord
     {
-        throw new LogicException(sprintf('Registering invoice %s of issuer %s through the B2Brouter driver is not available.', $draft->id->number, $context->nif->value));
+        $this->assertNotImported($draft->id, $context);
+        $ubl = (new UblWriter)->write($invoice);
+        $client = $this->clients()->b2brouter();
+
+        $columns = [
+            'kind' => VerifactuRecordKind::Registration,
+            'issuer_nif' => $draft->id->issuer->value,
+            'number' => $draft->id->number,
+            'issue_date' => $draft->id->issueDate->format('Y-m-d'),
+            'environment' => $context->environment,
+            'driver' => IssuerDriver::B2Brouter,
+            'reference' => $reference,
+            'source' => $ubl,
+            'source_extension' => SourceInvoice::extensionOf($invoice),
+            'attempts' => 1,
+            'submitted_at' => Carbon::now(),
+        ];
+
+        try {
+            $issued = $client->issue($ubl);
+        } catch (OutcomeUnknown $exception) {
+            VerifactuRecord::query()->forceCreate([
+                ...$columns,
+                'state' => VerifactuRecordState::Unconfirmed,
+                'error_message' => $exception->getMessage(),
+            ]);
+
+            throw $exception;
+        }
+
+        $row = VerifactuRecord::query()->forceCreate([
+            ...$columns,
+            'state' => VerifactuRecordState::Pending,
+            'b2brouter_invoice_id' => $issued->invoiceId,
+            'b2brouter_report_id' => $issued->latestTaxReportId(),
+        ]);
+        PollVerifactuTaxReport::schedule($row->id);
+
+        return $row;
+    }
+
+    /**
+     * Settles a B2Brouter record whose import ended without an answer (state unconfirmed, no
+     * B2Brouter invoice id), without importing the invoice twice.
+     *
+     * The invoice is looked up by its number first. When B2Brouter holds it, its ids are stored,
+     * the row becomes pending and its tax report is polled. When B2Brouter holds none, the stored
+     * source is imported once more. When the lookup cannot decide, the row stays unconfirmed with
+     * the reason in error_message and nothing is imported.
+     *
+     * @throws InvalidArgumentException when the row is not an unconfirmed B2Brouter import
+     * @throws ConfigurationException when no B2Brouter transport is configured
+     * @throws OutcomeUnknown when the new import ended without an answer; the row stays unconfirmed
+     * @throws DocumentRejected when B2Brouter refused the new import; the row is failed
+     * @throws TransportException when a request failed otherwise; the row is unchanged
+     */
+    public function retryB2BrouterImport(VerifactuRecord $row): VerifactuRecord
+    {
+        if ($row->driver !== IssuerDriver::B2Brouter || $row->state !== VerifactuRecordState::Unconfirmed || $row->b2brouter_invoice_id !== null) {
+            throw new InvalidArgumentException(sprintf('The VERI*FACTU record row %d is not a B2Brouter import whose outcome is unknown.', $row->id));
+        }
+        $client = $this->clients()->b2brouter();
+
+        try {
+            $issued = $client->findByNumber($row->number);
+        } catch (UnexpectedResponse $exception) {
+            $row->forceFill(['error_message' => $exception->getMessage()])->save();
+
+            return $row;
+        }
+
+        if ($issued === null) {
+            try {
+                $issued = $client->issue((string) $row->source);
+            } catch (OutcomeUnknown $exception) {
+                $row->forceFill(['error_message' => $exception->getMessage(), 'attempts' => $row->attempts + 1, 'submitted_at' => Carbon::now()])->save();
+
+                throw $exception;
+            } catch (DocumentRejected $exception) {
+                $row->forceFill(['state' => VerifactuRecordState::Failed, 'error_code' => 'rejected', 'error_message' => $exception->getMessage()])->save();
+                VerifactuRecordRejected::dispatch($row, 'rejected', $exception->getMessage());
+
+                throw $exception;
+            }
+            $row->forceFill(['attempts' => $row->attempts + 1, 'submitted_at' => Carbon::now()]);
+        }
+
+        $row->forceFill([
+            'state' => VerifactuRecordState::Pending,
+            'b2brouter_invoice_id' => $issued->invoiceId,
+            'b2brouter_report_id' => $issued->latestTaxReportId(),
+            'error_message' => null,
+        ])->save();
+        PollVerifactuTaxReport::schedule($row->id);
+
+        return $row;
+    }
+
+    /**
+     * Refuses a second import of an invoice: B2Brouter holds it already, or an import of it ended
+     * without an answer and may have gone through.
+     *
+     * @throws InvalidArgumentException
+     */
+    private function assertNotImported(InvoiceId $invoice, IssuerContext $context): void
+    {
+        $existing = self::invoiceRows($invoice, $context->environment->value)
+            ->where('driver', IssuerDriver::B2Brouter->value)
+            ->where(static fn (Builder $query) => $query
+                ->whereNotNull('b2brouter_invoice_id')
+                ->orWhere('state', VerifactuRecordState::Unconfirmed->value))
+            ->orderByDesc('id')
+            ->first();
+
+        if ($existing === null) {
+            return;
+        }
+        $name = sprintf('Invoice %s of %s', $invoice->number, $invoice->dateText());
+        if ($existing->b2brouter_invoice_id !== null) {
+            throw new InvalidArgumentException(sprintf(
+                '%s was imported into B2Brouter already (B2Brouter invoice %s, record row %d); B2Brouter does not import it twice.',
+                $name,
+                $existing->b2brouter_invoice_id,
+                $existing->id,
+            ));
+        }
+
+        throw new InvalidArgumentException(sprintf(
+            '%s has a B2Brouter import whose outcome is unknown (record row %d), so it may have been imported. Settle it with VerifactuManager::retryB2BrouterImport(), which looks it up before importing again.',
+            $name,
+            $existing->id,
+        ));
+    }
+
+    private function clients(): VerifactuClients
+    {
+        return ($this->app)()->make(VerifactuClients::class);
     }
 
     /**

@@ -23,7 +23,9 @@ use UnexpectedValueException;
  *
  * xml holds the record exactly as written (or as B2Brouter returned it), and generated_at the
  * literal FechaHoraHusoGenRegistro text that entered the hash; neither is ever re-derived.
- * chain_id and sequence stay null while a B2Brouter record waits for its registration.
+ * chain_id and sequence stay null while a B2Brouter record waits for its registration. For a
+ * B2Brouter record, source holds the UBL imported into B2Brouter and source_extension the serialized
+ * SpanishInvoice extension of that invoice, which UBL cannot carry (see SourceInvoice).
  *
  * @property int $id
  * @property int|null $chain_id
@@ -40,6 +42,7 @@ use UnexpectedValueException;
  * @property string|null $generated_at
  * @property string|null $xml
  * @property string|null $source
+ * @property string|null $source_extension
  * @property string|null $qr_url
  * @property VerifactuRecordState $state
  * @property string|null $csv
@@ -63,7 +66,7 @@ class VerifactuRecord extends Model
     protected $guarded = ['id'];
 
     /** @var list<string> */
-    protected $hidden = ['xml', 'source'];
+    protected $hidden = ['xml', 'source', 'source_extension'];
 
     protected $attributes = [
         'attempts' => 0,

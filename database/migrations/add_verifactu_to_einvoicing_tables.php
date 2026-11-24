@@ -71,6 +71,8 @@ return new class extends Migration
                 $table->string('generated_at', 32)->nullable();
                 $table->longText('xml')->nullable();
                 $table->longText('source')->nullable();
+                // The serialized SpanishInvoice extension of a B2Brouter source invoice, which UBL cannot carry.
+                $table->longText('source_extension')->nullable();
                 $table->text('qr_url')->nullable();
                 $table->string('state', 24)->index('einv_vf_records_state_index');
                 $table->string('csv', 16)->nullable();

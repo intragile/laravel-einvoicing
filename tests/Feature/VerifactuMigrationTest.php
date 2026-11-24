@@ -43,7 +43,7 @@ final class VerifactuMigrationTest extends TestCase
         $this->assertTablesPresent(true);
         $this->assertTrue(Schema::hasColumns('einvoicing_verifactu_records', [
             'chain_id', 'sequence', 'kind', 'issuer_nif', 'number', 'issue_date', 'environment', 'driver', 'reference',
-            'previous_hash', 'hash', 'generated_at', 'xml', 'source', 'qr_url', 'state', 'csv', 'error_code',
+            'previous_hash', 'hash', 'generated_at', 'xml', 'source', 'source_extension', 'qr_url', 'state', 'csv', 'error_code',
             'error_message', 'error_action', 'attempts', 'b2brouter_invoice_id', 'b2brouter_report_id', 'cross_check',
             'submitted_at', 'created_at', 'updated_at',
         ]));
