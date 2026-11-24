@@ -102,7 +102,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
     /** Seconds the worker may run the job. */
     public ?int $timeout = null;
 
-    /** The error_code of a record that waits for an older record of its chain. */
+    /** The error_code of a record that waits for the pending predecessor it names. */
     public const AWAITING_PREDECESSOR = 'awaiting_predecessor';
 
     /** The longest delay, in seconds, that Amazon SQS accepts for a message. */
@@ -320,9 +320,9 @@ final class PollVerifactuTaxReport implements ShouldQueue
     }
 
     /**
-     * Parks a registered record behind an older pending record of its issuer: it stays pending and
-     * keeps its polls until an older record settles. When none is pending any more by the time the
-     * mark is written, the record is polled again at once.
+     * Parks a registered record behind the pending predecessor it names: it stays pending and keeps
+     * its polls until a record of its issuer settles. When the predecessor is no longer pending by
+     * the time the mark is written, the record is polled again at once.
      */
     private function await(VerifactuRecord $row, TaxReport $report, BillingRecord $record, VerifactuRecord $predecessor): void
     {
@@ -434,7 +434,8 @@ final class PollVerifactuTaxReport implements ShouldQueue
     }
 
     /**
-     * Polls again the records of the row's issuer and environment that wait for an older record.
+     * Polls again the records of the row's issuer and environment that wait for their predecessor;
+     * each checks again whether the predecessor it names is still pending.
      */
     private static function wakeSuccessors(VerifactuRecord $row): void
     {
