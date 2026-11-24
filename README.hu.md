@@ -1411,7 +1411,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 
 | Terület | Hogyan | Állapot |
 |---|---|---|
-| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal (a CI PHP 8.3, 8.4 és 8.5 × Laravel 12 és 13 kombinációkat futtat) | Minden tesztfuttatáskor |
+| Állapotgép, küldési szabályok, újrapróbálás, foglalás lejárata, státuszlekérdezés, bejövő feldolgozás, webhookok, parancsok | Offline feature tesztek `FakeTransport`-tal és stub transportokkal (a CI PHP 8.3, 8.4, 8.5 és 8.6 × Laravel 12 és 13 kombinációkat futtat) | Minden tesztfuttatáskor |
 | Peppol-validáció a manageren keresztül | Opcionális `peppol-rules` csoport: helyi másolatból telepíti a hivatalos szabályokat, és validáló transporton átküldi a Peppol alappéldát | Kiadás előtt |
 | Recommand driver | A core offline tesztjei a Recommand publikált API-leírásából írt fixture-ökkel; a core `recommand-live` éles csoportja; a híd `RecommandSmokeTest` éles futtatása, amely számlát küld az `EInvoicing::send()`-del | **Élesben tesztelve a Peppol teszthálózaton** (2026-11-15: core- és hídfuttatás) |
 | B2Brouter és e-invoice.be driver | A core offline szerződéstesztjei a szolgáltatók nyilvános API-leírásából írt fixture-ökkel, a core `b2brouter-live` és `einvoicebe-live` éles csoportjai; a manager, a konfiguráció, a doctor és a webhook-útválasztás tesztjei itt | **Élesben tesztelve a szolgáltatói sandbox ellen (szimulált hálózat)** (2026-11-15, core) |

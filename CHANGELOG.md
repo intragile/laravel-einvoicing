@@ -70,6 +70,8 @@ Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-
 - Requires `intragile/php-einvoicing` ^1.3. `chillerlan/php-qrcode` ^5 is a development
   dependency (the cross-check tests read QR codes with it). Branch alias `dev-main` →
   `1.3.x-dev`.
+- **CI:** the `tests` job also runs on PHP 8.6 × Laravel 12 and 13; the `next-versions` rows
+  move to the PHP 8.7 nightly (Laravel 13) and to PHP 8.6 (Laravel `dev-master`).
 
 ### Fixed
 
