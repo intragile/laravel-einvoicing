@@ -22,7 +22,8 @@ use InvalidArgumentException;
  * Resolves issuers from einvoicing.verifactu.issuers.
  *
  * An issuer's own "driver" and "aeat" settings override the global ones key by key; the
- * environment is global. The configuration is read on every call, so a change made at run time
+ * environment is global. An issuer on the B2Brouter driver keeps the AEAT credentials still
+ * configured for it, so the records left on its AEAT chain after a driver switch can be sent. The configuration is read on every call, so a change made at run time
  * is seen, and it is held inside a closure so that the AEAT password stays out of var_export(),
  * print_r() and var_dump() output of the resolver.
  */
@@ -69,7 +70,7 @@ final class ConfigIssuerResolver implements VerifactuIssuerResolver
                 $name,
                 $driver,
                 $environment,
-                $driver === IssuerDriver::Aeat ? $this->credentials($entry, $prefix) : null,
+                $driver === IssuerDriver::Aeat ? $this->credentials($entry, $prefix) : $this->leftoverCredentials($entry, $prefix),
                 $this->representative($entry, $prefix),
             );
         } catch (InvalidArgumentException|InvalidRecord $exception) {
@@ -104,6 +105,22 @@ final class ConfigIssuerResolver implements VerifactuIssuerResolver
     private function setting(string $key): mixed
     {
         return ($this->config)()->get('einvoicing.verifactu.'.$key);
+    }
+
+    /**
+     * The AEAT credentials of an issuer on the B2Brouter driver, while they are still configured:
+     * the records left on its AEAT chain are sent with them. Null when none are configured or
+     * they are invalid, since the B2Brouter driver does not need them.
+     *
+     * @param  array<array-key, mixed>  $entry
+     */
+    private function leftoverCredentials(array $entry, string $prefix): ?AeatCredentials
+    {
+        try {
+            return $this->credentials($entry, $prefix);
+        } catch (ConfigurationException|InvalidArgumentException) {
+            return null;
+        }
     }
 
     /**

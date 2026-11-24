@@ -13,6 +13,7 @@ use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Spain\Verifactu\AeatCredentials;
 use IntrAgile\EInvoicing\Spain\Verifactu\IssuerContext;
+use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
 use IntrAgile\EInvoicing\Transport\Aeat\AeatClient;
 use IntrAgile\EInvoicing\Transport\Aeat\AeatConfig;
 use IntrAgile\EInvoicing\Transport\Aeat\ClientCertificate;
@@ -78,7 +79,9 @@ final class VerifactuClients
     }
 
     /**
-     * The AEAT client of an issuer that submits directly to AEAT.
+     * The AEAT client for the records of an issuer's AEAT chain: those of an issuer that submits
+     * directly to AEAT, and those left on the AEAT chain of an issuer moved to B2Brouter, which
+     * are sent with its AEAT credentials while they are configured (see forAeatChain()).
      *
      * @throws ConfigurationException when the issuer has no usable AEAT credentials, its
      *                                certificate cannot be loaded, a setting is invalid or the
@@ -92,6 +95,7 @@ final class VerifactuClients
             return $app->make(AeatClient::class);
         }
 
+        $issuer = self::forAeatChain($issuer);
         $config = $this->config($issuer, $this->manager()->schemas());
         $slot = $this->entry($issuer, $config);
 
@@ -138,6 +142,29 @@ final class VerifactuClients
         }
 
         return new B2BrouterVerifactu($config, $einvoicing->httpClient(), new VerifactuPolling(self::POLL_ATTEMPTS, self::POLL_WAIT_MS));
+    }
+
+    /**
+     * The issuer context the records of its AEAT chain are sent and looked up with: the context
+     * itself on the AEAT driver; for an issuer moved to the B2Brouter driver, a copy on the AEAT
+     * driver with the AEAT credentials still configured for it.
+     *
+     * @throws ConfigurationException when an issuer on the B2Brouter driver has no AEAT credentials
+     */
+    public static function forAeatChain(IssuerContext $issuer): IssuerContext
+    {
+        if ($issuer->driver === IssuerDriver::Aeat) {
+            return $issuer;
+        }
+        if ($issuer->credentials === null) {
+            throw new ConfigurationException(sprintf(
+                'Issuer %s uses the B2Brouter driver and has no AEAT credentials any more, so the records left on its AEAT chain cannot be sent or looked up. Configure einvoicing.verifactu.aeat.certificate (or einvoicing.verifactu.issuers.%s.aeat.certificate) until that chain has drained.',
+                $issuer->nif->value,
+                $issuer->nif->value,
+            ));
+        }
+
+        return new IssuerContext($issuer->nif, $issuer->name, IssuerDriver::Aeat, $issuer->environment, $issuer->credentials, $issuer->representative);
     }
 
     /**

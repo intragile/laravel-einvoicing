@@ -62,7 +62,8 @@ use Throwable;
  * (einvoicing.sending.backoff) has elapsed and whose attempts (einvoicing.sending.max_attempts)
  * are not used up. When the flow control allows a send, the records of the issuer with the oldest
  * due record are read from their stored XML, so the bytes written are the bytes sent, in chain
- * order and cut to submission.max_batch; the flow control's wait is skipped only when that cut
+ * order and cut to submission.max_batch, and before a second record of the same invoice and kind
+ * (AEAT answers by IDFactura and operation); the flow control's wait is skipped only when that cut
  * holds 1,000 records. Under a lock on the throttle row the flow control is checked again, each
  * record is claimed with a guarded update and the attempt is recorded, so concurrent runs never
  * send a record twice and a concurrent run waits for its turn.
@@ -75,6 +76,11 @@ use Throwable;
  * authentication fault) registered nothing: its records keep their state and the code, and the
  * throttle row is blocked until an operator clears it, as it is when the issuer cannot be
  * resolved or used. Rate limiting and failures before the request leave the records as they were.
+ *
+ * The records left on the AEAT chain of an issuer moved to the B2Brouter driver are sent with the
+ * AEAT credentials still configured for it. Without them, that issuer's records are held: they
+ * keep their state, carry error_code aeat_credentials, and the run goes on with the other issuers
+ * of the key, which is not blocked.
  *
  * The job is never retried by the queue and never released: whatever is left is scheduled again as
  * a new delayed job, and the unique lock is freed when a run starts, so a run can schedule its
@@ -106,8 +112,14 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
 
     private const DEFAULT_BACKOFF = [30, 120, 600, 1800];
 
+    /** The error_code of a record whose issuer cannot send it to AEAT now (see hold()). */
+    public const HELD_CODE = 'aeat_credentials';
+
     /** Queue drivers that run a job in the current process and ignore its delay. */
     private const SYNCHRONOUS_DRIVERS = ['sync', 'deferred', 'background'];
+
+    /** @var array<string, true> the issuers whose records this run holds, by NIF */
+    private array $held = [];
 
     public function __construct(public readonly string $throttleKey)
     {
@@ -175,40 +187,59 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             return;
         }
 
-        $batch = $this->nextBatch($due, $settings->maxBatch);
-        if ($batch === []) {
-            $this->scheduleRest();
+        while (true) {
+            $batch = $this->nextBatch($due, $settings->maxBatch);
+            if ($batch === []) {
+                $this->scheduleRest();
 
-            return;
-        }
-        try {
-            $records = array_map(static fn (VerifactuRecord $row): BillingRecord => (new RecordReader)->read((string) $row->xml), $batch);
-        } catch (InvalidRecord|UnsupportedDocument|UnsafeXml $exception) {
-            $this->block($throttle, 'invalid_record', 'A stored VERI*FACTU record cannot be read: '.$exception->getMessage());
+                return;
+            }
+            try {
+                $records = array_map(static fn (VerifactuRecord $row): BillingRecord => (new RecordReader)->read((string) $row->xml), $batch);
+            } catch (InvalidRecord|UnsupportedDocument|UnsafeXml $exception) {
+                $this->block($throttle, 'invalid_record', 'A stored VERI*FACTU record cannot be read: '.$exception->getMessage());
 
-            return;
-        }
-        $records = array_slice(FlowControl::batches($records)[0], 0, $settings->maxBatch);
-        $batch = array_slice($batch, 0, count($records));
+                return;
+            }
+            $records = array_slice(FlowControl::batches($records)[0], 0, $settings->maxBatch);
+            $batch = array_slice($batch, 0, count($records));
 
-        $issuer = $batch[0]->issuer_nif;
-        try {
-            $context = $resolver->resolve(Nif::parse($issuer));
-            $this->assertEnvironment($context, $settings->environment, $batch[0]);
-            $client = $clients->aeat($context);
-        } catch (UnknownIssuer $exception) {
-            $this->block($throttle, 'unknown_issuer', $exception->getMessage());
+            $issuer = $batch[0]->issuer_nif;
+            try {
+                $context = $resolver->resolve(Nif::parse($issuer));
+                $this->assertEnvironment($context, $settings->environment, $batch[0]);
+                try {
+                    $context = VerifactuClients::forAeatChain($context);
+                } catch (ConfigurationException $exception) {
+                    // An issuer moved to B2Brouter without its AEAT credentials: its records wait,
+                    // and the key, which may serve other issuers, stays open.
+                    $due = $this->hold($issuer, $due, $exception->getMessage());
+                    $sendable = min(count($due), $settings->maxBatch);
+                    if ($due === [] || ! $flow->decide($state, $sendable)->sendNow) {
+                        $this->scheduleRest();
 
-            return;
-        } catch (ConfigurationException|InvalidArgumentException $exception) {
-            $this->block($throttle, 'configuration', $exception->getMessage());
+                        return;
+                    }
 
-            return;
-        } catch (TransportUnavailable) {
-            $throttle->store($flow->afterFailure($state, Carbon::now()->toDateTimeImmutable()));
-            $this->scheduleRest();
+                    continue;
+                }
+                $client = $clients->aeat($context);
+            } catch (UnknownIssuer $exception) {
+                $this->block($throttle, 'unknown_issuer', $exception->getMessage());
 
-            return;
+                return;
+            } catch (ConfigurationException|InvalidArgumentException $exception) {
+                $this->block($throttle, 'configuration', $exception->getMessage());
+
+                return;
+            } catch (TransportUnavailable) {
+                $throttle->store($flow->afterFailure($state, Carbon::now()->toDateTimeImmutable()));
+                $this->scheduleRest();
+
+                return;
+            }
+
+            break;
         }
 
         $now = Carbon::now()->toDateTimeImmutable();
@@ -344,7 +375,8 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
     }
 
     /**
-     * Stores AEAT's answer for each record and the wait it asked for.
+     * Stores AEAT's answer for each record and the wait it asked for, under the lock of the
+     * throttle row.
      *
      * @param  list<array{row: VerifactuRecord, state: VerifactuRecordState, attempts: int}>  $claimed
      * @param  list<BillingRecord>  $records
@@ -352,6 +384,11 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
      */
     private function record(Submission $submission, SubmissionResponse $response, array $claimed, array $records, VerifactuThrottle $throttle, FlowControl $flow, ThrottleState $state, DateTimeImmutable $now): array
     {
+        // The throttle row is locked first, as claimUnderThrottle() does, so this transaction and
+        // a concurrent claim take their locks in the same order and cannot deadlock.
+        VerifactuThrottle::query()->whereKey($throttle->id)->update(['updated_at' => Carbon::now()]);
+        VerifactuThrottle::query()->whereKey($throttle->id)->lockForUpdate()->first();
+
         $outcomes = $response->outcomes($submission);
         $maxAttempts = self::maxAttempts();
         $events = [];
@@ -453,8 +490,8 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
 
     /**
      * The records of the next submission, with their XML: the issuer of the oldest due record
-     * first, then chain order, at most max_batch records. Rows another run has taken meanwhile
-     * are left out.
+     * first, then chain order, at most max_batch records, ending before a second record of the
+     * same invoice and kind. Rows another run has taken meanwhile are left out.
      *
      * @param  list<VerifactuRecord>  $due
      * @return list<VerifactuRecord>
@@ -485,7 +522,21 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             ->get()
             ->all();
 
-        return array_values($rows);
+        // AEAT answers each line by IDFactura and operation, so a second record of the same
+        // invoice and kind (a correction written before the first record left) waits for the
+        // next submission.
+        $batch = [];
+        $seen = [];
+        foreach ($rows as $row) {
+            $key = implode("\0", [$row->number, substr($row->issue_date, 0, 10), $row->kind->value]);
+            if (isset($seen[$key])) {
+                break;
+            }
+            $seen[$key] = true;
+            $batch[] = $row;
+        }
+
+        return $batch;
     }
 
     /**
@@ -568,6 +619,41 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
     }
 
     /**
+     * Leaves the due records of an issuer that cannot send for this run: they keep their state and
+     * attempts and carry the reason, and nothing is scheduled for them alone. The next run of the
+     * key, or einvoicing:verifactu-submit, tries them again.
+     *
+     * @param  list<VerifactuRecord>  $due
+     * @return list<VerifactuRecord> the due records of the other issuers
+     */
+    private function hold(string $issuer, array $due, string $message): array
+    {
+        $this->held[$issuer] = true;
+        $ids = [];
+        $rest = [];
+        foreach ($due as $row) {
+            if ($row->issuer_nif === $issuer) {
+                $ids[] = $row->id;
+            } else {
+                $rest[] = $row;
+            }
+        }
+
+        VerifactuRecord::query()
+            ->whereIn('id', $ids)
+            ->whereIn('state', self::CLAIMABLE)
+            ->update(['error_code' => self::HELD_CODE, 'error_message' => $message, 'updated_at' => Carbon::now()]);
+        Log::warning('VERI*FACTU records of an issuer are held: they cannot be sent to AEAT.', [
+            'throttle_key' => $this->throttleKey,
+            'issuer' => $issuer,
+            'records' => count($ids),
+            'reason' => $message,
+        ]);
+
+        return $rest;
+    }
+
+    /**
      * Blocks the throttle key until an operator clears it, and reports it.
      */
     private function block(VerifactuThrottle $throttle, string $code, string $message): void
@@ -592,7 +678,8 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         if ($throttle === null || $throttle->blocked_at !== null || $this->runsSynchronously()) {
             return;
         }
-        $pending = $this->pendingRecords();
+        // Records of an issuer held by this run are not a reason to run again.
+        $pending = array_values(array_filter($this->pendingRecords(), fn (VerifactuRecord $row): bool => ! isset($this->held[$row->issuer_nif])));
         if ($pending === []) {
             return;
         }
@@ -661,8 +748,15 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
     /** The AEAT request timeout plus a margin for reading and storing the records. */
     private static function jobTimeout(): int
     {
-        $timeout = config('einvoicing.verifactu.aeat.timeout');
+        return self::jobTimeoutFor(config('einvoicing.verifactu.aeat.timeout'));
+    }
 
+    /**
+     * Seconds a run may take for an einvoicing.verifactu.aeat.timeout value: the request timeout
+     * (30 s when unset or invalid) plus a margin for reading and storing the records.
+     */
+    public static function jobTimeoutFor(mixed $timeout): int
+    {
         return (int) ceil(is_numeric($timeout) && $timeout > 0 ? (float) $timeout : 30.0) + self::MARGIN;
     }
 

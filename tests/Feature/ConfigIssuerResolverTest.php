@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
-use Illuminate\Config\Repository;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Laravel\Verifactu\ConfigIssuerResolver;
@@ -66,9 +65,22 @@ final class ConfigIssuerResolverTest extends TestCase
 
         $routed = $resolver->resolve(Nif::parse('00000000T'));
         $this->assertSame(IssuerDriver::B2Brouter, $routed->driver);
-        $this->assertNull($routed->credentials);
+        // The AEAT credentials still configured, for the records left on its AEAT chain.
+        $this->assertSame('/certs/issuer.p12', $routed->credentials?->certificatePath);
         $this->assertSame(VerifactuEnvironment::Test, $routed->environment);
         $this->assertCount(2, $resolver->issuers());
+    }
+
+    public function test_b2brouter_issuer_needs_no_aeat_credentials(): void
+    {
+        config()->set('einvoicing.verifactu.aeat', ['certificate' => null, 'password' => null, 'port' => 'nonsense']);
+        config()->set('einvoicing.verifactu.issuers', [self::ISSUER => ['name' => 'Example Issuer S.L.', 'driver' => 'b2brouter']]);
+        $resolver = new ConfigIssuerResolver($this->app->make('config'));
+
+        $context = $resolver->resolve(Nif::parse(self::ISSUER));
+
+        $this->assertSame(IssuerDriver::B2Brouter, $context->driver);
+        $this->assertNull($context->credentials);
     }
 
     public function test_aeat_issuer_without_a_certificate_is_a_configuration_error(): void
@@ -156,8 +168,10 @@ final class ConfigIssuerResolverTest extends TestCase
     {
         $manager = $this->app->make(VerifactuManager::class);
         $resolver = $manager->resolver();
-        $resolver->resolve(Nif::parse(self::ISSUER));
-        $objects = [$manager, $manager->settings(), $resolver, $resolver->resolve(Nif::parse(self::ISSUER))];
+        $context = $resolver->resolve(Nif::parse(self::ISSUER));
+        // The password is there, behind its accessor, so the checks below are not vacuous.
+        $this->assertSame('pw-'.self::SECRET_MARK, $context->credentials?->password());
+        $objects = [$manager, $manager->settings(), $resolver, $context, $context->credentials];
 
         foreach ($objects as $object) {
             $this->assertStringNotContainsString(self::SECRET_MARK, var_export($object, true));
@@ -166,6 +180,5 @@ final class ConfigIssuerResolverTest extends TestCase
             var_dump($object);
             $this->assertStringNotContainsString(self::SECRET_MARK, (string) ob_get_clean());
         }
-        $this->assertInstanceOf(Repository::class, new Repository([]));
     }
 }

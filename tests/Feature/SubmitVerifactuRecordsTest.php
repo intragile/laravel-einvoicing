@@ -36,6 +36,7 @@ use IntrAgile\EInvoicing\Laravel\Verifactu\DatabaseChainStore;
 use IntrAgile\EInvoicing\Spain\CertificateKind;
 use IntrAgile\EInvoicing\Spain\Nif;
 use IntrAgile\EInvoicing\Spain\Verifactu\AeatCredentials;
+use IntrAgile\EInvoicing\Spain\Verifactu\AltaOperation;
 use IntrAgile\EInvoicing\Spain\Verifactu\CancellationDraft;
 use IntrAgile\EInvoicing\Spain\Verifactu\Chainer;
 use IntrAgile\EInvoicing\Spain\Verifactu\ChainHead;
@@ -194,6 +195,96 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->assertScheduled(60);
         $this->submit();
         $this->assertSame(1, $this->aeat->requestCount());
+    }
+
+    public function test_a_record_and_its_correction_go_in_separate_submissions(): void
+    {
+        // Registered, then corrected before the first submission left: AEAT answers by IDFactura
+        // and operation, so the two records of one invoice cannot share a request.
+        $first = $this->generate('C-1');
+        $other = $this->generate('C-2');
+        $correction = $this->generate('C-1', operation: AltaOperation::Correction);
+        $this->aeat->queue(FakeAeatApi::answer($this->lines([$first, $other])));
+
+        $this->submit();
+
+        $this->assertSame(1, $this->aeat->requestCount());
+        $this->assertSame(['C-1', 'C-2'], $this->aeat->sentNumbers(0));
+        $this->assertStates([VerifactuRecordState::Accepted, VerifactuRecordState::Accepted, VerifactuRecordState::Generated], [$first, $other, $correction]);
+        $this->assertScheduled(60);
+
+        $this->travel(60)->seconds();
+        $this->aeat->queue(FakeAeatApi::answer([FakeAeatApi::line($correction->invoiceId(), 'aceptado_con_errores', code: 1142)]));
+        $this->submit();
+
+        $this->assertSame(2, $this->aeat->requestCount());
+        $this->assertSame(['C-1'], $this->aeat->sentNumbers(1));
+        $this->assertSame($correction->fresh()?->hash, self::huella($this->aeat->sentRecords(1)[0]));
+        $this->assertStates([VerifactuRecordState::Accepted, VerifactuRecordState::Accepted, VerifactuRecordState::AcceptedWithErrors], [$first, $other, $correction]);
+        $this->assertNull($first->fresh()?->error_code);
+        $this->assertSame('1142', $correction->fresh()?->error_code);
+        $this->assertSame(1, $first->fresh()?->attempts);
+        $this->assertSame(1, $correction->fresh()?->attempts);
+    }
+
+    public function test_an_issuer_moved_to_b2brouter_still_sends_the_records_left_on_its_aeat_chain(): void
+    {
+        Event::fake([VerifactuSubmissionBlocked::class]);
+        $row = $this->generate('S-1');
+        // The issuer moves to B2Brouter before its AEAT chain drained; its AEAT credentials stay.
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.driver', 'b2brouter');
+        $this->aeat->queue(FakeAeatApi::answer($this->lines([$row])));
+
+        $this->submit();
+
+        $this->assertSame(1, $this->aeat->requestCount());
+        $this->assertSame(VerifactuSamples::ISSUER_NIF, $this->aeat->sentIssuer(0));
+        $this->assertSame(VerifactuRecordState::Accepted, $row->fresh()?->state);
+        $this->assertNull($this->throttle()->blocked_at);
+        Event::assertNotDispatched(VerifactuSubmissionBlocked::class);
+    }
+
+    public function test_an_issuer_moved_to_b2brouter_without_aeat_credentials_does_not_block_the_shared_key(): void
+    {
+        Event::fake([VerifactuSubmissionBlocked::class]);
+        $moved = $this->generate('S-2');
+        $this->travel(1)->seconds();
+        $other = $this->generate('T-1', self::OTHER_ISSUER);
+        // The moved issuer has no AEAT credentials any more; the other issuer has its own.
+        config()->set('einvoicing.verifactu.aeat.certificate', null);
+        config()->set('einvoicing.verifactu.issuers', [
+            VerifactuSamples::ISSUER_NIF => ['name' => 'Test Issuer S.L.', 'driver' => 'b2brouter'],
+            self::OTHER_ISSUER => ['name' => 'Other Issuer S.L.', 'aeat' => ['certificate' => '/nonexistent/other.p12']],
+        ]);
+        $this->aeat->queue(FakeAeatApi::answer($this->lines([$other])));
+
+        $this->submit();
+
+        // The other issuer's record goes out in the same run, on the shared key.
+        $this->assertSame(1, $this->aeat->requestCount());
+        $this->assertSame(self::OTHER_ISSUER, $this->aeat->sentIssuer(0));
+        $this->assertSame(VerifactuRecordState::Accepted, $other->fresh()?->state);
+        $this->assertNull($this->throttle()->blocked_at);
+        Event::assertNotDispatched(VerifactuSubmissionBlocked::class);
+        $moved = $moved->fresh();
+        $this->assertNotNull($moved);
+        $this->assertSame(VerifactuRecordState::Generated, $moved->state);
+        $this->assertSame(0, $moved->attempts);
+        $this->assertSame('aeat_credentials', $moved->error_code);
+        $this->assertStringContainsString('B2Brouter', (string) $moved->error_message);
+        // Nothing is rescheduled for the moved issuer alone, so no run spins on it.
+        Queue::assertNotPushed(SubmitVerifactuRecords::class);
+
+        // With its credentials back, the next run sends it.
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.aeat.certificate', '/nonexistent/issuer.p12');
+        $this->travel(60)->seconds();
+        $this->aeat->queue(FakeAeatApi::answer($this->lines([$moved])));
+        $this->submit();
+
+        $this->assertSame(2, $this->aeat->requestCount());
+        $this->assertSame(VerifactuSamples::ISSUER_NIF, $this->aeat->sentIssuer(1));
+        $this->assertSame(VerifactuRecordState::Accepted, $moved->fresh()?->state);
+        $this->assertNull($moved->fresh()?->error_code);
     }
 
     public function test_issuer_scope_throttles_separately(): void
@@ -741,7 +832,11 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->aeat->queue(FakeAeatApi::answer(array_map(fn (VerifactuRecord $row): array => FakeAeatApi::line($row->invoiceId(), 'duplicado_correcta'), $rows), csv: null));
         $this->submit();
 
-        $this->assertSame($this->aeat->sentRecords(0)[1]->C14N(), $this->aeat->sentRecords(1)[1]->C14N());
+        // Both records are resent with the bytes of the first request.
+        $this->assertCount(2, $this->aeat->sentRecords(1));
+        foreach ([0, 1] as $index) {
+            $this->assertSame($this->aeat->sentRecords(0)[$index]->C14N(), $this->aeat->sentRecords(1)[$index]->C14N(), "record {$index}");
+        }
         foreach ($rows as $row) {
             $row = $row->fresh();
             $this->assertNotNull($row);
@@ -816,6 +911,75 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->assertStates([VerifactuRecordState::Generated, VerifactuRecordState::Generated], $rows);
         $this->assertSame(0, $rows[0]->fresh()?->attempts);
         $this->assertScheduled(60);
+    }
+
+    public function test_a_run_does_not_claim_records_another_run_moved_to_sending(): void
+    {
+        $rows = [$this->generate('Q-8'), $this->generate('Q-9')];
+        $ids = array_map(static fn (VerifactuRecord $row): int => $row->id, $rows);
+        $armed = true;
+        // The throttle allows a send. The outer run has read the rows (with their XML) as
+        // generated; before it claims them, another run claims them without stamping the throttle.
+        VerifactuRecord::retrieved(static function (VerifactuRecord $row) use (&$armed, $ids): void {
+            if ($armed && array_key_exists('xml', $row->getAttributes())) {
+                $armed = false;
+                VerifactuRecord::query()->whereIn('id', $ids)->toBase()->update(['state' => VerifactuRecordState::Sending->value]);
+            }
+        });
+
+        $this->submit();
+
+        $this->assertFalse($armed);
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertStates([VerifactuRecordState::Sending, VerifactuRecordState::Sending], $rows);
+        $this->assertSame([0, 0], array_map(static fn (VerifactuRecord $row): ?int => $row->fresh()?->attempts, $rows));
+        $this->assertNull($this->throttle()->last_sent_at);
+    }
+
+    public function test_a_full_submission_does_not_claim_records_another_run_moved_to_sending(): void
+    {
+        $store = $this->store(new RecordWriter);
+        for ($n = 1; $n <= 1000; $n++) {
+            $this->generate(sprintf('R-%d', $n), store: $store);
+        }
+        // Another run sends at most the configured batch; this one would send all 1,000 at once.
+        $this->throttle()->store(new ThrottleState(Carbon::now()->subSeconds(10)->toDateTimeImmutable(), 60));
+        $armed = true;
+        VerifactuRecord::retrieved(static function (VerifactuRecord $row) use (&$armed): void {
+            if ($armed && array_key_exists('xml', $row->getAttributes())) {
+                $armed = false;
+                VerifactuRecord::query()->toBase()->update(['state' => VerifactuRecordState::Sending->value]);
+            }
+        });
+
+        $this->submit();
+
+        $this->assertFalse($armed);
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertSame(1000, VerifactuRecord::query()->where('state', VerifactuRecordState::Sending)->where('attempts', 0)->count());
+    }
+
+    public function test_storing_the_answer_locks_the_throttle_row_before_the_records(): void
+    {
+        $rows = [$this->generate('O-1'), $this->generate('O-2')];
+        $writes = [];
+        $this->aeat->queue(function () use ($rows, &$writes): ResponseInterface {
+            // From the request on, the order of the writes: the claim locked the throttle row
+            // first, so storing the answer must too, or the two can deadlock.
+            DB::listen(static function ($query) use (&$writes): void {
+                if (preg_match('/^\s*update\s+"?(\w+)"?/i', $query->sql, $match) === 1) {
+                    $writes[] = $match[1];
+                }
+            });
+
+            return FakeAeatApi::answer($this->lines($rows));
+        });
+
+        $this->submit();
+
+        $this->assertStates([VerifactuRecordState::Accepted, VerifactuRecordState::Accepted], $rows);
+        $this->assertNotSame([], $writes);
+        $this->assertSame(VerifactuThrottle::TABLE, $writes[0], implode(', ', $writes));
     }
 
     public function test_a_throwing_listener_does_not_cancel_the_next_run(): void
@@ -998,14 +1162,14 @@ final class SubmitVerifactuRecordsTest extends TestCase
         );
     }
 
-    private function generate(string $number, string $issuer = VerifactuSamples::ISSUER_NIF, bool $cancel = false, ?DatabaseChainStore $store = null, ThrottleScope $scope = ThrottleScope::Installation): VerifactuRecord
+    private function generate(string $number, string $issuer = VerifactuSamples::ISSUER_NIF, bool $cancel = false, ?DatabaseChainStore $store = null, ThrottleScope $scope = ThrottleScope::Installation, AltaOperation $operation = AltaOperation::Initial): VerifactuRecord
     {
         $store ??= $this->store(scope: $scope);
         $key = ChainKey::for(Nif::parse($issuer), VerifactuSamples::system(), VerifactuEnvironment::Test);
         $chainer = new Chainer(VerifactuSamples::system());
         $draft = $cancel
             ? CancellationDraft::of(VerifactuSamples::invoiceId($number, '01-01-2024', $issuer))
-            : VerifactuSamples::vectorDraft($number, '01-01-2024', $issuer);
+            : VerifactuSamples::vectorDraft($number, '01-01-2024', $issuer, $operation);
         $throttle = ThrottleKey::for(VerifactuSamples::system(), VerifactuEnvironment::Test, $scope, $scope === ThrottleScope::Issuer ? Nif::parse($issuer) : null);
 
         return $store->appendRow($key, IssuerDriver::Aeat, $throttle, static fn (?ChainHead $head) => $chainer->append($draft, $head, Carbon::now()->toDateTimeImmutable())[0]);

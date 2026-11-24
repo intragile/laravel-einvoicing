@@ -131,6 +131,35 @@ final class VerifactuSettingsTest extends TestCase
         }
     }
 
+    public function test_stuck_after_minutes_outlasts_a_submission_run(): void
+    {
+        // A run may take the AEAT timeout plus a minute; a record in sending is not stuck before.
+        config()->set('einvoicing.verifactu.aeat.timeout', 300);
+        config()->set('einvoicing.verifactu.stuck_after_minutes', 6);
+        try {
+            $this->settings();
+            $this->fail('A threshold within the job timeout must be refused.');
+        } catch (ConfigurationException $exception) {
+            $this->assertStringContainsString('einvoicing.verifactu.stuck_after_minutes', $exception->getMessage());
+            $this->assertStringContainsString('from 7', $exception->getMessage());
+        }
+
+        config()->set('einvoicing.verifactu.stuck_after_minutes', 7);
+        $this->assertSame(7, $this->settings()->stuckAfterMinutes);
+
+        // The default keeps its 60 minutes unless the job may run longer.
+        config()->set('einvoicing.verifactu.stuck_after_minutes', null);
+        $this->assertSame(60, $this->settings()->stuckAfterMinutes);
+        config()->set('einvoicing.verifactu.aeat.timeout', 3600);
+        $this->assertSame(62, $this->settings()->stuckAfterMinutes);
+
+        // With the default AEAT timeout of 30 s the job may run 90 s: 3 minutes at least.
+        config()->set('einvoicing.verifactu.aeat.timeout', null);
+        config()->set('einvoicing.verifactu.stuck_after_minutes', 2);
+        $this->expectException(ConfigurationException::class);
+        $this->settings();
+    }
+
     public function test_invalid_environment_and_driver_are_refused(): void
     {
         config()->set('einvoicing.verifactu.environment', 'staging');

@@ -10,6 +10,7 @@ use IntrAgile\EInvoicing\Spain\Nif;
 use IntrAgile\EInvoicing\Spain\OperationQualification;
 use IntrAgile\EInvoicing\Spain\RegimeKey;
 use IntrAgile\EInvoicing\Spain\TaxType;
+use IntrAgile\EInvoicing\Spain\Verifactu\AltaOperation;
 use IntrAgile\EInvoicing\Spain\Verifactu\Amount;
 use IntrAgile\EInvoicing\Spain\Verifactu\ComputerSystem;
 use IntrAgile\EInvoicing\Spain\Verifactu\InvoiceId;
@@ -60,12 +61,12 @@ final class VerifactuSamples
         return new InvoiceId(Nif::parse($issuer), $number, $issueDate);
     }
 
-    public static function vectorDraft(string $number, string $date, string $issuer = self::ISSUER_NIF): RegistrationDraft
+    public static function vectorDraft(string $number, string $date, string $issuer = self::ISSUER_NIF, AltaOperation $operation = AltaOperation::Initial): RegistrationDraft
     {
-        return self::draft(self::invoiceId($number, $date, $issuer));
+        return self::draft(self::invoiceId($number, $date, $issuer), $operation);
     }
 
-    public static function draft(InvoiceId $id): RegistrationDraft
+    public static function draft(InvoiceId $id, AltaOperation $operation = AltaOperation::Initial): RegistrationDraft
     {
         return new RegistrationDraft(
             id: $id,
@@ -90,6 +91,7 @@ final class VerifactuSamples
             externalReference: null,
             agreementNumber: null,
             systemAgreementId: null,
+            operation: $operation,
         );
     }
 

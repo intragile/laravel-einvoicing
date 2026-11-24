@@ -14,6 +14,7 @@ use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuClients;
 use IntrAgile\EInvoicing\Spain\Nif;
 use IntrAgile\EInvoicing\Spain\Verifactu\IssuerContext;
+use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
 use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuIssuerResolver;
 use IntrAgile\EInvoicing\Transport\Aeat\AeatClient;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
@@ -102,6 +103,33 @@ final class VerifactuClientsTest extends TestCase
         $seal = $clients->aeat($this->context());
         $this->assertNotSame($renewed, $seal);
         $this->assertCount(4, $this->materializedFiles());
+    }
+
+    public function test_issuer_moved_to_b2brouter_still_gets_an_aeat_client_for_its_aeat_chain(): void
+    {
+        $clients = $this->app->make(VerifactuClients::class);
+        $aeat = $clients->aeat($this->context());
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.driver', 'b2brouter');
+        $switched = $this->context();
+        $this->assertSame(IssuerDriver::B2Brouter, $switched->driver);
+
+        // The same credentials: the cached client of the AEAT chain.
+        $this->assertSame($aeat, $clients->aeat($switched));
+        $this->assertSame(IssuerDriver::Aeat, VerifactuClients::forAeatChain($switched)->driver);
+        $this->assertSame($switched->credentials, VerifactuClients::forAeatChain($switched)->credentials);
+    }
+
+    public function test_issuer_moved_to_b2brouter_without_aeat_credentials_gets_no_aeat_client(): void
+    {
+        config()->set('einvoicing.verifactu.aeat.certificate', null);
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.driver', 'b2brouter');
+
+        $thrown = $this->capture(fn () => $this->app->make(VerifactuClients::class)->aeat($this->context()));
+
+        $this->assertInstanceOf(ConfigurationException::class, $thrown);
+        $this->assertStringContainsString('B2Brouter', $thrown->getMessage());
+        $this->assertStringContainsString('einvoicing.verifactu.aeat.certificate', $thrown->getMessage());
+        $this->assertStringNotContainsString(self::SECRET_MARK, $thrown->getMessage());
     }
 
     public function test_materialized_files_are_disposed(): void

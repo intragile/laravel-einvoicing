@@ -9,6 +9,7 @@ use Exception;
 use Illuminate\Contracts\Config\Repository;
 use IntrAgile\EInvoicing\CodeList\CountryCode;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
+use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigValue;
 use IntrAgile\EInvoicing\Spain\ForeignIdType;
@@ -67,6 +68,9 @@ final readonly class VerifactuSettings
         $submission = is_array($verifactu['submission'] ?? null) ? $verifactu['submission'] : [];
         $b2brouter = is_array($verifactu['b2brouter'] ?? null) ? $verifactu['b2brouter'] : [];
         $system = is_array($verifactu['system'] ?? null) ? $verifactu['system'] : [];
+        $aeat = is_array($verifactu['aeat'] ?? null) ? $verifactu['aeat'] : [];
+        // A record in sending is stuck only once a submission run can no longer be holding it.
+        $stuckMinimum = (int) ceil(SubmitVerifactuRecords::jobTimeoutFor($aeat['timeout'] ?? null) / 60) + 1;
 
         return new self(
             self::environmentFrom($verifactu['environment'] ?? null),
@@ -77,7 +81,7 @@ final readonly class VerifactuSettings
             ConfigValue::integer($submission['max_batch'] ?? 1000, 'einvoicing.verifactu.submission.max_batch', 1, 1000),
             ConfigValue::integer($submission['initial_wait'] ?? 60, 'einvoicing.verifactu.submission.initial_wait', 0, 3600),
             self::crossCheck($verifactu['cross_check'] ?? null),
-            ConfigValue::integer($verifactu['stuck_after_minutes'] ?? 60, 'einvoicing.verifactu.stuck_after_minutes', 1, 525_600),
+            ConfigValue::integer($verifactu['stuck_after_minutes'] ?? max(60, $stuckMinimum), 'einvoicing.verifactu.stuck_after_minutes', $stuckMinimum, 525_600),
             self::text($b2brouter['transport'] ?? null, 'einvoicing.verifactu.b2brouter.transport'),
             ConfigValue::integer($b2brouter['poll_attempts'] ?? 10, 'einvoicing.verifactu.b2brouter.poll_attempts', 1, 1000),
             ConfigValue::integer($b2brouter['poll_delay'] ?? 30, 'einvoicing.verifactu.b2brouter.poll_delay', 0, 3600),
