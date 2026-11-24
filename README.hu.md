@@ -1147,8 +1147,10 @@ Ha egy import a `--retry-unconfirmed` után is `unconfirmed` marad:
 
    Pontosan egy sornak kell változnia. Ezután futtasd még egyszer az `php artisan
    einvoicing:verifactu-submit --retry-unconfirmed` parancsot, hogy az erre az importra váró
-   rekordokat (`pending`, `awaiting_predecessor`) újra lekérdezzük, és nélküle fűzzük láncba. Maga a
-   számla így nincs regisztrálva az AEAT-nál: állítsd ki újra, vagy kezeld a B2Brouterben.
+   rekordokat (`pending`, `awaiting_predecessor`) újra lekérdezzük: ha a lánc fejéhez kapcsolódnak
+   (például üres láncnál), láncba kerülnek; különben hibásak lesznek (`chain_conflict`), és
+   operátori beavatkozást igényelnek. Maga a számla így nincs regisztrálva az AEAT-nál: állítsd ki
+   újra, vagy kezeld a B2Brouterben.
 
 Minden regisztrált rekordot **keresztellenőrzünk** a saját motorunkkal: az XML-t a séma szerint, a
 szövegéből újraszámolt `Huella`-t, a kapcsolódását az előző tárolt rekordhoz, szemantikailag a

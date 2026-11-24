@@ -1100,8 +1100,9 @@ When an import stays `unconfirmed` after `--retry-unconfirmed`:
 
    Exactly one row must change. Then run `php artisan einvoicing:verifactu-submit
    --retry-unconfirmed` once more, so the records that waited for this import (`pending` with
-   `awaiting_predecessor`) are polled again and attached without it. The invoice itself is then not
-   registered with AEAT: issue it again, or handle it in B2Brouter.
+   `awaiting_predecessor`) are polled again: they attach if they link to the chain head (an empty
+   chain, for instance); otherwise they are failed (`chain_conflict`) and need an operator. The
+   invoice itself is then not registered with AEAT: issue it again, or handle it in B2Brouter.
 
 Every registered record is **cross-checked** against our own engine: the XML against the schema,
 the `Huella` recomputed from its text, its link to the previous stored record, a semantic

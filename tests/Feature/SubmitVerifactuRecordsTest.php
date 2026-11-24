@@ -299,9 +299,20 @@ final class SubmitVerifactuRecordsTest extends TestCase
         }
         $this->throttle()->store(new ThrottleState(Carbon::now()->subSeconds(10)->toDateTimeImmutable(), 60));
         $this->aeat->queue(FakeAeatApi::answer([]));
+        DB::enableQueryLog();
 
         $this->submit();
 
+        // Only the run's own batch reads whole rows; the check whether the next batch is full
+        // reads none of the XML or source columns.
+        $batchReads = array_values(array_filter(
+            array_column(DB::getQueryLog(), 'query'),
+            static fn (string $sql): bool => str_contains($sql, 'einvoicing_verifactu_records') && str_contains($sql, 'limit 1000'),
+        ));
+        $this->assertCount(2, $batchReads);
+        $this->assertStringContainsString('select *', $batchReads[0]);
+        $this->assertStringNotContainsString('*', $batchReads[1]);
+        $this->assertStringNotContainsString('xml', $batchReads[1]);
         $this->assertSame(0, $this->aeat->requestCount(), 'a batch of fewer than 1,000 records went out during the wait');
         $this->assertSame(0, VerifactuRecord::query()->where('state', '!=', VerifactuRecordState::Generated->value)->count());
         // The next cut batch is not full either: the run waits for AEAT's wait, it does not spin.

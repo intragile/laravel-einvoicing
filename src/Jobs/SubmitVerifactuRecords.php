@@ -513,9 +513,10 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
      * same invoice and kind. Rows another run has taken meanwhile are left out.
      *
      * @param  list<VerifactuRecord>  $due
+     * @param  list<string>  $columns  the columns to read; the cut needs only number, issue_date and kind
      * @return list<VerifactuRecord>
      */
-    private function nextBatch(array $due, int $maxBatch): array
+    private function nextBatch(array $due, int $maxBatch, array $columns = ['*']): array
     {
         $oldest = [];
         foreach ($due as $row) {
@@ -538,7 +539,7 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             ->orderBy('chain_id')
             ->orderBy('sequence')
             ->limit(min($maxBatch, FlowControl::MAX_RECORDS))
-            ->get()
+            ->get($columns)
             ->all();
 
         // AEAT answers each line by IDFactura and operation, so a second record of the same
@@ -735,7 +736,7 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
     {
         $due = array_values(array_filter($this->dueRecords(), fn (VerifactuRecord $row): bool => ! isset($this->held[$row->issuer_nif])));
 
-        return $due !== [] && count($this->nextBatch($due, self::maxBatch())) >= FlowControl::MAX_RECORDS;
+        return $due !== [] && count($this->nextBatch($due, self::maxBatch(), ['id', 'number', 'issue_date', 'kind'])) >= FlowControl::MAX_RECORDS;
     }
 
     /**
