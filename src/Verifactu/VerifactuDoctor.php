@@ -177,12 +177,14 @@ final class VerifactuDoctor
      * Makes a TLS handshake to $host:$port presenting the certificate, verifying the server
      * against $bundle (null: the system store), and closes the connection without sending data.
      *
-     * The certificate is written to a new private folder below the bridge's TLS folder for the
-     * handshake only; the files and the folder are deleted afterwards.
+     * The certificate is written to a new private folder (0700) below the bridge's TLS folder for
+     * the handshake only; the files and the folder are deleted afterwards.
      *
+     * @param  (Closure(string): void)|null  $inspect  called with that folder once the files are
+     *                                                 written, just before the handshake
      * @return string|null null when the handshake succeeded, else why it failed
      */
-    public function probeTls(ClientCertificate $certificate, string $host, int $port, ?string $bundle, float $timeout = self::TLS_TIMEOUT): ?string
+    public function probeTls(ClientCertificate $certificate, string $host, int $port, ?string $bundle, float $timeout = self::TLS_TIMEOUT, ?Closure $inspect = null): ?string
     {
         $directory = ($this->app)()->storagePath(VerifactuClients::TLS_PATH).'/doctor-'.bin2hex(random_bytes(8));
         if (! @mkdir($directory, 0700, true) && ! is_dir($directory)) {
@@ -194,6 +196,9 @@ final class VerifactuDoctor
             // Held in a variable: the files exist only as long as the instance does.
             $materialized = $certificate->materialize($directory);
             try {
+                if ($inspect !== null) {
+                    $inspect($directory);
+                }
                 $context = stream_context_create(['ssl' => [
                     ...$materialized->streamContextOptions($bundle),
                     'peer_name' => $host,
@@ -554,7 +559,7 @@ final class VerifactuDoctor
                 continue;
             }
             $checked++;
-            $last = VerifactuRecord::query()->where('chain_id', $chain->id)->where('sequence', $chain->sequence)->first();
+            $last = VerifactuRecord::query()->where('chain_id', $chain->id)->where('sequence', $chain->sequence)->first(['id', 'number', 'hash']);
             if ($last === null) {
                 $mismatched[] = sprintf('%s: no record at sequence %d', self::chainName($chain), $chain->sequence);
             } elseif ($last->hash !== $chain->head_hash || $last->number !== $chain->head_number) {
@@ -625,7 +630,7 @@ final class VerifactuDoctor
             ->whereNull('chain_id');
 
         $blocked = [];
-        foreach ($b2brouter()->where('state', VerifactuRecordState::Failed->value)->whereIn('error_code', self::UNATTACHED_CODES)->orderBy('id')->get() as $row) {
+        foreach ($b2brouter()->where('state', VerifactuRecordState::Failed->value)->whereIn('error_code', self::UNATTACHED_CODES)->orderBy('id')->get(['id', 'issuer_nif', 'number', 'issue_date', 'error_code', 'updated_at']) as $row) {
             // A chain of the issuer that changed since (moved on, re-seeded or closed) is no longer blocked by it.
             $movedOn = VerifactuChain::query()
                 ->where('issuer_nif', $row->issuer_nif)
@@ -654,7 +659,7 @@ final class VerifactuDoctor
             ->where(static fn ($query) => $query->whereNull('error_code')->orWhere('error_code', '!=', PollVerifactuTaxReport::AWAITING_PREDECESSOR))
             ->where('updated_at', '<', Carbon::now()->subSeconds($quiet))
             ->orderBy('id')
-            ->get();
+            ->get(['id', 'issuer_nif', 'number']);
         foreach ($predecessors->groupBy('issuer_nif') as $issuer => $rows) {
             $waiting = $b2brouter()
                 ->where('issuer_nif', $issuer)
@@ -686,24 +691,26 @@ final class VerifactuDoctor
      */
     private function checkCrossChecks(VerifactuEnvironment $environment): void
     {
+        // A JSON path comparison with a boolean: json_extract on SQLite and MySQL, jsonb on PostgreSQL.
         $failed = VerifactuRecord::query()
             ->where('environment', $environment->value)
             ->where('driver', IssuerDriver::B2Brouter->value)
             ->whereNotNull('chain_id')
-            ->whereNotNull('cross_check')
-            ->orderBy('id')
-            ->get(['id', 'number', 'cross_check'])
-            ->filter(static fn (VerifactuRecord $row): bool => ($row->cross_check['passed'] ?? true) === false)
-            ->values();
-
-        if ($failed->isNotEmpty()) {
-            $this->row('cross-check', self::WARN, sprintf(
-                '%d B2Brouter %s failed the cross-check against the invoice (%s); see the cross_check column',
-                $failed->count(),
-                $failed->count() === 1 ? 'record' : 'records',
-                self::listed(array_values($failed->map(static fn (VerifactuRecord $row): string => sprintf('row %d, %s', $row->id, $row->number))->all())),
-            ));
+            ->where('cross_check->passed', false);
+        $total = (clone $failed)->count();
+        if ($total === 0) {
+            return;
         }
+
+        $listed = $failed->orderBy('id')->limit(self::LIST_LIMIT)->get(['id', 'number']);
+        $more = $total - $listed->count();
+        $this->row('cross-check', self::WARN, sprintf(
+            '%d B2Brouter %s failed the cross-check against the invoice (%s%s); see the cross_check column',
+            $total,
+            $total === 1 ? 'record' : 'records',
+            $listed->map(static fn (VerifactuRecord $row): string => sprintf('row %d, %s', $row->id, $row->number))->implode(', '),
+            $more > 0 ? sprintf(' and %d more', $more) : '',
+        ));
     }
 
     private function checkSubmission(): void

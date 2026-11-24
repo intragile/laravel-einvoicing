@@ -6,6 +6,7 @@ namespace IntrAgile\EInvoicing\Laravel\Tests\Feature;
 
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\ConfigurationUrlParser;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schema;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
@@ -26,6 +27,7 @@ use IntrAgile\EInvoicing\Spain\VerifactuEnvironment;
 use IntrAgile\EInvoicing\Transport\Aeat\CaBundle;
 use IntrAgile\EInvoicing\Transport\Aeat\ClientCertificate;
 use IntrAgile\EInvoicing\Validation\DocumentValidator;
+use InvalidArgumentException;
 use LogicException;
 use PHPUnit\Framework\Attributes\Group;
 use RuntimeException;
@@ -58,6 +60,22 @@ final class DoctorVerifactuTest extends TestCase
     protected function defineEnvironment($app): void
     {
         $app['config']->set('queue.default', 'sync');
+
+        // The verifactu-databases group runs the doctor's queries on a throwaway server database.
+        $url = getenv('EINVOICING_TEST_DB_URL');
+        if (is_string($url) && $url !== '') {
+            $config = (new ConfigurationUrlParser)->parseConfiguration(['url' => $url]);
+            $config['driver'] = match ($config['driver'] ?? null) {
+                'mysql', 'mariadb' => 'mysql',
+                'pgsql', 'postgres', 'postgresql' => 'pgsql',
+                default => throw new InvalidArgumentException('EINVOICING_TEST_DB_URL must be a mysql:// or pgsql:// URL.'),
+            };
+            $config += $config['driver'] === 'mysql'
+                ? ['charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci', 'prefix' => '']
+                : ['charset' => 'utf8', 'prefix' => '', 'search_path' => 'public', 'sslmode' => 'prefer'];
+            $app['config']->set('database.default', 'doctor');
+            $app['config']->set('database.connections.doctor', $config);
+        }
     }
 
     protected function setUp(): void
@@ -367,6 +385,37 @@ final class DoctorVerifactuTest extends TestCase
         $this->assertRowIn($this->doctorRows(), 'verifactu: b2brouter chains', 'ok');
     }
 
+    #[Group('verifactu-databases')]
+    public function test_failed_cross_checks_are_counted_in_sql_and_listed_up_to_the_limit(): void
+    {
+        $this->configureComplete(schemas: false);
+        $chain = $this->chain(self::ISSUER, '1-999999', IssuerDriver::B2Brouter, 9, self::HASH_B);
+        $failed = [];
+        foreach (range(1, 9) as $sequence) {
+            $row = $this->record(self::ISSUER, $chain->id, $sequence, "B-{$sequence}", null, IssuerDriver::B2Brouter, VerifactuRecordState::Registered);
+            $passed = $sequence === 1 || $sequence === 9;
+            $row->forceFill(['cross_check' => ['passed' => $passed, 'summary' => $passed ? 'passed' : 'failed', 'failures' => [], 'known_divergences' => []]])->save();
+            if (! $passed) {
+                $failed[] = $row;
+            }
+        }
+        // An unattached failure is reported by the chain rows, not here; a row without a check is skipped.
+        $this->pending('B-10', age: 0, attributes: ['state' => VerifactuRecordState::Failed, 'cross_check' => ['passed' => false]]);
+        $this->record(self::ISSUER, $chain->id, 10, 'B-11', null, IssuerDriver::B2Brouter, VerifactuRecordState::Registered);
+
+        $row = $this->row($this->doctorRows(), 'verifactu: cross-check');
+        $this->assertSame('warn', $row[1]);
+        $this->assertStringStartsWith('7 B2Brouter records failed', $row[2]);
+        foreach (array_slice($failed, 0, 5) as $listed) {
+            $this->assertStringContainsString("row {$listed->id}, {$listed->number}", $row[2]);
+        }
+        $this->assertStringNotContainsString("row {$failed[5]->id},", $row[2]);
+        $this->assertStringContainsString('and 2 more', $row[2]);
+
+        VerifactuRecord::query()->whereKey(array_map(static fn (VerifactuRecord $row): int => $row->id, $failed))->delete();
+        $this->assertNotContains('verifactu: cross-check', array_column($this->doctorRows(), 0));
+    }
+
     public function test_blocked_submission_fails(): void
     {
         $this->configureComplete(schemas: false);
@@ -445,7 +494,26 @@ final class DoctorVerifactuTest extends TestCase
         $certificate = ClientCertificate::fromPem($client['certificate'], $client['privateKey']);
         $doctor = new VerifactuDoctor($this->app);
 
-        $this->assertNull($doctor->probeTls($certificate, '127.0.0.1', $port, $caFile));
+        $seen = [];
+        $inspect = function (string $folder) use (&$seen): void {
+            clearstatcache();
+            $this->assertSame(0700, fileperms($folder) & 0777);
+            $files = glob($folder.'/aeat-*.pem') ?: [];
+            $this->assertCount(2, $files);
+            foreach ($files as $file) {
+                $this->assertSame(0600, fileperms($file) & 0777);
+            }
+            $seen[] = $folder;
+        };
+        // A permissive umask must not widen the folder.
+        $umask = umask(0);
+        try {
+            $this->assertNull($doctor->probeTls($certificate, '127.0.0.1', $port, $caFile, inspect: $inspect));
+        } finally {
+            umask($umask);
+        }
+        $this->assertCount(1, $seen);
+        $this->assertDirectoryDoesNotExist($seen[0]);
 
         // A bundle without the server's root fails the handshake.
         $other = $this->write('other.pem', AeatCertificates::selfSigned('Unrelated Test Root CA'));
