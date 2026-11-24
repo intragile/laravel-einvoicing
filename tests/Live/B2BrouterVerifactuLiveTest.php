@@ -43,6 +43,8 @@ use Throwable;
  * without them. Only a "test_" key on https://api.b2brouter.net is accepted; any other key or host
  * fails the test before the first request, and no base-URL variable is read. AEAT is never called.
  * The installed AEAT schemas and chillerlan/php-qrcode with ext-gd or ext-imagick are required.
+ * Step 5 may rest on the parameter fallback only for a QR image that decoder cannot read (some
+ * B2Brouter PNGs), and at least one QR image of the run must really be decoded.
  *
  * The queue runs synchronously, so register() returns after the record settled. Each poll run
  * reads the tax report up to 60 times 3 s apart, once per record (poll_attempts 1): a record that
@@ -153,11 +155,16 @@ final class B2BrouterVerifactuLiveTest extends TestCase
 
             $rows = [$first, $second, $exempt, $credit];
             $chain = VerifactuChain::query()->sole();
+            $decoded = 0;
             foreach ($rows as $index => $row) {
                 // The first record links to a record B2Brouter registered before this run, which
                 // seeds the chain as trusted input: there is no previous report to check it against.
-                $this->assertSettled($row, seedsTheChain: $index === 0 && $chain->seeded);
+                if ($this->assertSettled($row, seedsTheChain: $index === 0 && $chain->seeded)) {
+                    $decoded++;
+                }
             }
+            $this->report(sprintf('QR images decoded: %d of %d; the others were checked by their URL parameters.', $decoded, count($rows)));
+            $this->assertGreaterThan(0, $decoded, 'None of the QR images of this run could be decoded.');
 
             $this->assertSame([], $this->failures($first), 'F1');
             $this->assertSame([], $this->divergences($first), 'F1');
@@ -237,8 +244,9 @@ final class B2BrouterVerifactuLiveTest extends TestCase
 
     /**
      * @param  bool  $seedsTheChain  the record seeded the chain, so step 3 had no previous report
+     * @return bool whether step 5 was decided by the decoded QR image
      */
-    private function assertSettled(VerifactuRecord $row, bool $seedsTheChain): void
+    private function assertSettled(VerifactuRecord $row, bool $seedsTheChain): bool
     {
         $label = (string) $row->number;
         $this->assertSame(VerifactuRecordState::Registered, $row->state, $label.': '.($row->error_message ?? ''));
@@ -253,8 +261,14 @@ final class B2BrouterVerifactuLiveTest extends TestCase
             $status = $step === 'Chain' && $seedsTheChain ? CheckStatus::Skipped : CheckStatus::Passed;
             $this->assertStringContainsString(sprintf('Step %d %s: %s', $number, $step, $status->value), $summary, $label);
         }
-        // Step 5 must be decided by the decoded QR, not by the parameter fallback.
-        $this->assertStringNotContainsString('QR fallback', $summary, $label);
+        // Step 5 may rest on the parameter fallback only when the decoder reported the image
+        // unreadable; a readable image must be decided by the decoded QR.
+        if (! str_contains($summary, 'QR fallback')) {
+            return true;
+        }
+        $this->assertStringContainsString('QR fallback: the QR image could not be decoded', $summary, $label);
+
+        return false;
     }
 
     /**

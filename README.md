@@ -1113,7 +1113,9 @@ divergences**, never failures: the exemption article follows the B2Brouter accou
 (`OperacionExenta` E1 for any exempt line), and a credit note by difference (R1, I) carries
 positive amounts, where AEAT expects the signed difference. Reading the QR image needs
 `chillerlan/php-qrcode` with `ext-gd` or `ext-imagick`; without it the URL is compared by its
-parameters.
+parameters. The parameters are also compared, with a note, when the decoder cannot read an image:
+on 2026-11-24, 2 of 28 B2Brouter sandbox QR images did not decode. Every QR parameter is still
+checked; only the image decoding is unverified for those images.
 
 Records attach in the order the records themselves state: a record whose predecessor is still
 pending or unconfirmed (an import whose outcome is unknown) waits for it, and is polled again once

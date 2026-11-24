@@ -1161,7 +1161,10 @@ eltérés **ismert eltérés**, sosem hiba: a mentességi jogcím a B2Brouter-fi
 követi (`OperacionExenta` E1 minden mentes tételre), és a különbözeti helyesbítő számla (R1, I)
 pozitív összegeket tartalmaz, ahol az AEAT az előjeles különbséget várja. A QR-kép olvasásához a
 `chillerlan/php-qrcode` csomag kell `ext-gd` vagy `ext-imagick` kiterjesztéssel; nélküle az URL-t a
-paraméterei alapján vetjük össze.
+paraméterei alapján vetjük össze. Akkor is a paramétereket hasonlítjuk össze (megjegyzéssel), ha a
+dekóder nem tud elolvasni egy képet: 2026. november 24-én 28 B2Brouter sandbox QR-képből 2 nem volt
+dekódolható. Minden QR-paramétert így is ellenőrzünk; csak a képek dekódolása ellenőrizetlen
+ezeknél a képeknél.
 
 A rekordok abban a sorrendben kerülnek a láncba, ahogy maguk a rekordok megnevezik az elődjüket:
 amelyiknek az elődje még függőben (`pending`) vagy megerősítetlen (`unconfirmed`, ismeretlen
