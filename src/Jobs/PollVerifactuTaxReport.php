@@ -6,6 +6,7 @@ namespace IntrAgile\EInvoicing\Laravel\Jobs;
 
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Support\Carbon;
@@ -67,10 +68,12 @@ use UnexpectedValueException;
  *
  * Records attach in chain order, as the records themselves state it. A registered record that does
  * not link to the chain head (or would seed an empty chain) while the invoice its RegistroAnterior
- * names is a pending B2Brouter row of the same issuer and environment waits: it stays pending with
- * error_code awaiting_predecessor, without using up its polls, and is polled again once a record of
- * the issuer settles (attached, rejected or failed). Row ids play no part. A record whose named
- * predecessor is not pending is attempted against the head (seeding an empty chain from its link);
+ * names is an open B2Brouter row of the same issuer and environment (pending, or an import whose
+ * outcome is unknown) waits: it stays pending with error_code awaiting_predecessor, without using
+ * up its polls, and is polled again once a record of the issuer settles (attached, rejected or
+ * failed here, or adopted or imported again by VerifactuManager::retryB2BrouterImport()). Row ids
+ * play no part. A record whose named predecessor is not open is attempted against the head
+ * (seeding an empty chain from its link);
  * if it does not link it is failed and left out of the chain, which then stays blocked until an
  * operator acts.
  *
@@ -102,7 +105,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
     /** Seconds the worker may run the job. */
     public ?int $timeout = null;
 
-    /** The error_code of a record that waits for the pending predecessor it names. */
+    /** The error_code of a record that waits for the open predecessor it names. */
     public const AWAITING_PREDECESSOR = 'awaiting_predecessor';
 
     /** The longest delay, in seconds, that Amazon SQS accepts for a message. */
@@ -247,7 +250,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
             return;
         }
 
-        self::wakeSuccessors($row);
+        self::wakeSuccessorsOf($row);
         VerifactuRecordRejected::dispatch($row, $code, $message);
     }
 
@@ -310,7 +313,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
         }
 
         // Successors are woken before the events, so a failing listener cannot stall them.
-        self::wakeSuccessors($row);
+        self::wakeSuccessorsOf($row);
         if (! $strictFailure) {
             VerifactuRecordRegistered::dispatch($row);
         }
@@ -320,8 +323,8 @@ final class PollVerifactuTaxReport implements ShouldQueue
     }
 
     /**
-     * Parks a registered record behind the pending predecessor it names: it stays pending and keeps
-     * its polls until a record of its issuer settles. When the predecessor is no longer pending by
+     * Parks a registered record behind the open predecessor it names: it stays pending and keeps
+     * its polls until a record of its issuer settles. When the predecessor is no longer open by
      * the time the mark is written, the record is polled again at once.
      */
     private function await(VerifactuRecord $row, TaxReport $report, BillingRecord $record, VerifactuRecord $predecessor): void
@@ -355,7 +358,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
             return;
         }
 
-        self::wakeSuccessors($row);
+        self::wakeSuccessorsOf($row);
         VerifactuCrossCheckFailed::dispatch($row, $result);
     }
 
@@ -409,9 +412,10 @@ final class PollVerifactuTaxReport implements ShouldQueue
     }
 
     /**
-     * The pending, unattached B2Brouter row of the record's issuer and environment for the invoice
-     * the record names in RegistroAnterior, or null when the record names none or no such row is
-     * pending.
+     * The open, unattached B2Brouter row of the record's issuer and environment for the invoice the
+     * record names in RegistroAnterior: a pending row, or an import whose outcome is unknown
+     * (unconfirmed, without a B2Brouter invoice id), which B2Brouter took after all if a record
+     * names it. Null when the record names none or no such row is open.
      */
     private static function namedPredecessor(VerifactuRecord $row, BillingRecord $record): ?VerifactuRecord
     {
@@ -424,7 +428,11 @@ final class PollVerifactuTaxReport implements ShouldQueue
             ->where('issuer_nif', $row->issuer_nif)
             ->where('environment', $row->environment->value)
             ->where('driver', IssuerDriver::B2Brouter->value)
-            ->where('state', VerifactuRecordState::Pending->value)
+            ->where(static fn (Builder $query) => $query
+                ->where('state', VerifactuRecordState::Pending->value)
+                ->orWhere(static fn (Builder $unknown) => $unknown
+                    ->where('state', VerifactuRecordState::Unconfirmed->value)
+                    ->whereNull('b2brouter_invoice_id')))
             ->whereNull('chain_id')
             ->where('number', $previous->number)
             ->where('issue_date', $previous->issueDate->format('Y-m-d'))
@@ -435,9 +443,11 @@ final class PollVerifactuTaxReport implements ShouldQueue
 
     /**
      * Polls again the records of the row's issuer and environment that wait for their predecessor;
-     * each checks again whether the predecessor it names is still pending.
+     * each checks again whether the predecessor it names is still open. Called whenever a B2Brouter
+     * row settles: attached, rejected or failed here, and adopted or imported again by
+     * VerifactuManager::retryB2BrouterImport().
      */
-    private static function wakeSuccessors(VerifactuRecord $row): void
+    public static function wakeSuccessorsOf(VerifactuRecord $row): void
     {
         $waiting = VerifactuRecord::query()
             ->where('issuer_nif', $row->issuer_nif)

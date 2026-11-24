@@ -9,6 +9,7 @@ use DateTimeImmutable;
 use GuzzleHttp\Psr7\Response;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use IntrAgile\EInvoicing\CodeList\CountryCode;
@@ -156,6 +157,25 @@ final class VerifactuB2BrouterTest extends TestCase
         $this->assertStringContainsString('24433033', $exception->getMessage());
         $this->assertCount(1, $this->api->imported());
         $this->assertSame(1, VerifactuRecord::query()->count());
+    }
+
+    public function test_register_refuses_inside_a_database_transaction(): void
+    {
+        Queue::fake();
+        $this->api->invoice('24433033', SpanishInvoices::NUMBER, '1064493')->onImport('24433033');
+
+        // A rollback would lose the row of an import B2Brouter keeps, so nothing is imported.
+        $exception = $this->catch(fn () => DB::transaction(fn () => $this->manager()->register(SpanishInvoices::domestic())));
+
+        $this->assertInstanceOf(LogicException::class, $exception);
+        $this->assertStringContainsString('transaction', $exception->getMessage());
+        $this->assertSame([], $this->api->imported());
+        $this->assertSame(0, VerifactuRecord::query()->count());
+        Queue::assertNotPushed(PollVerifactuTaxReport::class);
+
+        // Outside a transaction the same call imports.
+        $this->assertSame(VerifactuRecordState::Pending, $this->manager()->register(SpanishInvoices::domestic())->state);
+        $this->assertCount(1, $this->api->imported());
     }
 
     public function test_issue_outcome_unknown_keeps_row_unconfirmed_without_invoice_id(): void
@@ -752,6 +772,96 @@ final class VerifactuB2BrouterTest extends TestCase
         $this->assertSame(2, $x->sequence);
     }
 
+    public function test_record_waits_on_an_unconfirmed_predecessor_it_names(): void
+    {
+        // A's import ended without an answer, but B2Brouter took it: B, imported next, names A.
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+
+        $this->runPoll($b->id);
+
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Pending, $b->state);
+        $this->assertNull($b->chain_id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->error_code);
+        $this->assertStringContainsString((string) $a->id, (string) $b->error_message);
+        $this->assertSame(0, VerifactuChain::query()->count());
+        $this->assertNull($a->refresh()->chain_id);
+        $this->assertSame(1, $this->pollsOf($b));
+    }
+
+    public function test_successor_is_woken_when_the_unconfirmed_predecessor_is_adopted(): void
+    {
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+        $this->assertSame(1, $this->pollsOf($b));
+        $this->api->invoice('24433001', 'PROBE-ES-0001', '1064490')
+            ->report('1064490', VerifactuSamples::b2brouterFixture('record-1064490.xml'));
+
+        $retried = $this->manager()->retryB2BrouterImport($a);
+
+        $this->assertSame(VerifactuRecordState::Pending, $retried->state);
+        $this->assertSame(2, $this->pollsOf($b));
+        // A is pending now: B checks again and keeps waiting, then follows A into the chain.
+        $this->runPoll($b->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+        $this->runPoll($a->id);
+        $this->assertSame(1, $a->refresh()->sequence);
+        $this->runPoll($b->id);
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $b->state, (string) json_encode($b->cross_check));
+        $this->assertSame(2, $b->sequence);
+    }
+
+    public function test_refused_retry_keeps_the_import_unconfirmed_and_its_successor_waiting(): void
+    {
+        Event::fake([VerifactuRecordRejected::class]);
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+        // The lookup finds nothing, and B2Brouter refuses the new import: the number is taken.
+        $this->api->onImport(new Response(422, ['Content-Type' => 'application/json'], json_encode([
+            'error' => ['code' => 'parameter_taken', 'param' => 'number', 'message' => 'has already been taken'],
+        ], JSON_THROW_ON_ERROR)));
+
+        $exception = $this->catch(fn () => $this->manager()->retryB2BrouterImport($a));
+
+        $this->assertInstanceOf(DocumentRejected::class, $exception);
+        $a->refresh();
+        // B2Brouter may hold the invoice after all (B names it), so the import is not failed.
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $a->state);
+        $this->assertNull($a->b2brouter_invoice_id);
+        $this->assertNull($a->error_code);
+        $this->assertSame($exception->getMessage(), $a->error_message);
+        Event::assertNotDispatched(VerifactuRecordRejected::class);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+        $this->assertSame(1, $this->pollsOf($b));
+
+        // A later retry finds the invoice and adopts it, which wakes B.
+        $this->api->invoice('24433001', 'PROBE-ES-0001', '1064490')
+            ->report('1064490', VerifactuSamples::b2brouterFixture('record-1064490.xml'));
+        $this->assertSame(VerifactuRecordState::Pending, $this->manager()->retryB2BrouterImport($a->refresh())->state);
+        $this->assertSame(2, $this->pollsOf($b));
+    }
+
+    public function test_successors_are_woken_through_the_shared_hook(): void
+    {
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+
+        PollVerifactuTaxReport::wakeSuccessorsOf($a);
+
+        $this->assertSame(2, $this->pollsOf($b));
+        $this->assertSame(0, $this->pollsOf($a));
+    }
+
     public function test_record_does_not_wait_on_a_pending_row_it_does_not_name(): void
     {
         Queue::fake();
@@ -1031,6 +1141,18 @@ final class VerifactuB2BrouterTest extends TestCase
             ->onImport($invoiceId);
 
         return $this->manager()->register($invoice);
+    }
+
+    /**
+     * Registers the invoice through an import that ends without an answer, and returns the
+     * unconfirmed row. The queue must be faked.
+     */
+    private function unconfirmedImport(Invoice $invoice): VerifactuRecord
+    {
+        $this->api->onImport(new Response(503));
+        $this->assertInstanceOf(OutcomeUnknown::class, $this->catch(fn () => $this->manager()->register($invoice)));
+
+        return VerifactuRecord::query()->where('number', $invoice->number)->sole();
     }
 
     /** The polls of the row queued so far. */

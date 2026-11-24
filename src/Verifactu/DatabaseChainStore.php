@@ -271,6 +271,10 @@ final class DatabaseChainStore implements ChainStore
      * committed first, the row exists before any write transaction starts, and those only take
      * the row lock. An empty row left by a write that then fails is taken over by the next one
      * (see openChain()). SQLite needs none of this (see lockChain()).
+     *
+     * Inside a transaction of the caller, both transactions are savepoints of it: the chain row
+     * is committed, and the row lock of the write released, only when the caller's transaction
+     * commits, so other writers of the chain wait until then.
      */
     private function prepareChain(ChainKey $key, IssuerDriver $driver, ?ThrottleKey $throttle): void
     {

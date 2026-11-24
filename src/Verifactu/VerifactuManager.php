@@ -7,6 +7,8 @@ namespace IntrAgile\EInvoicing\Laravel\Verifactu;
 use Closure;
 use DateTimeImmutable;
 use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Database\DatabaseTransactionRecord;
+use Illuminate\Database\DatabaseTransactionsManager;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Carbon;
@@ -15,7 +17,6 @@ use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordGenerated;
-use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordRejected;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollVerifactuTaxReport;
 use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
@@ -65,7 +66,11 @@ use LogicException;
  * synchronously under the chain lock: the record is chained to the stored head, written once,
  * and stored with that XML, its QR URL and the literal generation timestamp. The returned row is
  * in state generated; VerifactuRecordGenerated fires and the submission job is queued once the
- * surrounding database transaction commits, and neither happens when it rolls back.
+ * surrounding database transaction commits, and neither happens when it rolls back. Inside such a
+ * transaction the chain row stays locked until it commits, so other writers of the chain wait.
+ *
+ * For an issuer on the B2Brouter driver, register() refuses to run inside an open database
+ * transaction: B2Brouter keeps an import that a rollback would leave without its row.
  *
  * For an issuer on the B2Brouter driver, register() imports the invoice into B2Brouter, which
  * generates, chains and submits the record; PollVerifactuTaxReport attaches that record to its
@@ -178,6 +183,8 @@ final class VerifactuManager
      *                        row is stored unconfirmed
      * @throws TransportException on the B2Brouter driver, when B2Brouter refused the import or the
      *                            request; nothing is stored
+     * @throws LogicException on the B2Brouter driver, inside an open database transaction; nothing
+     *                        is imported (call register() after the transaction commits)
      * @throws InvalidRecord when the written record fails the schema
      * @throws ChainConflict when the chain is closed or the head moved during the write
      */
@@ -187,8 +194,8 @@ final class VerifactuManager
         $schemas = $this->schemasFor($settings);
         $draft = (new RecordMapper)->map($invoice);
         $context = $this->contextFor($draft->id->issuer, $settings);
-        // Runs outside the chain lock: a driver switch racing this call is still refused by the
-        // store, which takes no record into a chain of the other driver.
+        // Checked outside the chain lock, and the chains of the two drivers have different keys,
+        // so a write racing a driver switch is not refused: switch only while no write runs.
         $this->assertNoOpenChainOfOtherDriver($context);
 
         if ($draft->operation !== AltaOperation::Initial) {
@@ -395,8 +402,9 @@ final class VerifactuManager
     }
 
     /**
-     * Refuses to write while the issuer has an open chain of the other driver in the environment.
-     * A chain row that never held a record or a seed is no chain.
+     * Refuses to write while the issuer has an open chain of the other driver in the environment,
+     * and, on the AEAT driver, while B2Brouter imports of the issuer are not attached to a chain
+     * yet (pending, or unconfirmed). A chain row that never held a record or a seed is no chain.
      *
      * @throws ConfigurationException naming the command that closes the other chain
      */
@@ -423,6 +431,32 @@ final class VerifactuManager
                 $open->driver->value,
             ));
         }
+        if ($context->driver === IssuerDriver::B2Brouter) {
+            return;
+        }
+
+        // B2Brouter imports not attached yet start or extend a B2Brouter chain once registered.
+        $import = VerifactuRecord::query()
+            ->where('issuer_nif', $context->nif->value)
+            ->where('environment', $context->environment->value)
+            ->where('driver', IssuerDriver::B2Brouter->value)
+            ->whereNull('chain_id')
+            ->whereIn('state', [VerifactuRecordState::Pending->value, VerifactuRecordState::Unconfirmed->value])
+            ->orderBy('id')
+            ->first();
+        if ($import !== null) {
+            throw new ConfigurationException(sprintf(
+                'Issuer %s uses the %s driver, but its B2Brouter import of invoice %s (record row %d) in the %s environment is still %s. Settle it first: php artisan einvoicing:verifactu-submit --retry-unconfirmed --issuer=%s, then close the B2Brouter chain: php artisan einvoicing:verifactu-close-chain --issuer=%s --driver=b2brouter',
+                $context->nif->value,
+                $context->driver->value,
+                $import->number,
+                $import->id,
+                $context->environment->value,
+                $import->state->value,
+                $context->nif->value,
+                $context->nif->value,
+            ));
+        }
     }
 
     /**
@@ -443,11 +477,13 @@ final class VerifactuManager
      * Imports the invoice into B2Brouter, which generates, chains and submits its record, and
      * stores a pending row whose tax report PollVerifactuTaxReport then polls.
      *
+     * The import is refused inside an open database transaction (see assertOutsideTransaction()).
      * Nothing is stored when the import fails before or with an answer: the invoice cannot be
      * written as UBL, the client is not configured, or B2Brouter refused it. An import without an
      * answer (OutcomeUnknown) may have gone through, so the row is stored unconfirmed, without a
      * B2Brouter invoice id, and the exception is rethrown; retryB2BrouterImport() settles it.
      *
+     * @throws LogicException inside an open database transaction; nothing is imported
      * @throws InvalidArgumentException when the invoice was imported already, or its import is unconfirmed
      * @throws ConfigurationException when no B2Brouter transport is configured
      * @throws OutcomeUnknown when the import ended without an answer; the row is stored unconfirmed
@@ -456,6 +492,7 @@ final class VerifactuManager
      */
     private function registerWithB2Brouter(Invoice $invoice, RegistrationDraft $draft, IssuerContext $context, ?string $reference): VerifactuRecord
     {
+        $this->assertOutsideTransaction($draft->id);
         $this->assertNotImported($draft->id, $context);
         $ubl = (new UblWriter)->write($invoice);
         $client = $this->clients()->b2brouter();
@@ -498,6 +535,33 @@ final class VerifactuManager
     }
 
     /**
+     * Refuses a B2Brouter import inside an open database transaction of the records' connection:
+     * B2Brouter keeps an import whatever happens to the transaction, so a rollback would lose the
+     * only row that knows of it, and a second register() would import the invoice again.
+     *
+     * The transaction a test case wraps around each test (RefreshDatabase) does not count.
+     *
+     * @throws LogicException
+     */
+    private function assertOutsideTransaction(InvoiceId $invoice): void
+    {
+        $connection = (new VerifactuRecord)->getConnection();
+        $transactions = ($this->app)()->bound('db.transactions') ? ($this->app)()->make('db.transactions') : null;
+        $open = $transactions instanceof DatabaseTransactionsManager
+            ? $transactions->callbackApplicableTransactions()->contains(static fn (DatabaseTransactionRecord $transaction): bool => $transaction->connection === $connection->getName())
+            : $connection->transactionLevel() > 0;
+        if (! $open) {
+            return;
+        }
+
+        throw new LogicException(sprintf(
+            'Invoice %s of issuer %s cannot be imported into B2Brouter inside an open database transaction: B2Brouter keeps the import even if the transaction rolls back, and the record row would be lost. Call register() after the transaction commits.',
+            $invoice->number,
+            $invoice->issuer->value,
+        ));
+    }
+
+    /**
      * Settles a B2Brouter record whose import ended without an answer (state unconfirmed, no
      * B2Brouter invoice id), without importing the invoice twice.
      *
@@ -508,14 +572,19 @@ final class VerifactuManager
      *   current tax report names the same IDFactura (issuer, number, issue date); its ids are
      *   stored, the row becomes pending and its tax report is polled. Without a tax report yet, or
      *   with another IDFactura, the row stays unconfirmed with the reason in error_message;
-     * - B2Brouter holds none: the stored source is imported once more;
+     * - B2Brouter holds none: the stored source is imported once more. When B2Brouter refuses that
+     *   import, the row stays unconfirmed with the reason: a refusal such as a taken number may
+     *   mean that B2Brouter holds the invoice after all;
      * - the lookup cannot decide: the row stays unconfirmed with the reason, nothing is imported.
+     *
+     * Once the row is pending, the B2Brouter records waiting for it as their predecessor are polled
+     * again (PollVerifactuTaxReport::wakeSuccessorsOf()).
      *
      * @throws InvalidArgumentException when the row is not an unconfirmed B2Brouter import, or
      *                                  another retry claimed it first
      * @throws ConfigurationException when no B2Brouter transport is configured
      * @throws OutcomeUnknown when the new import ended without an answer; the row stays unconfirmed
-     * @throws DocumentRejected when B2Brouter refused the new import; the row is failed
+     * @throws DocumentRejected when B2Brouter refused the new import; the row stays unconfirmed
      * @throws TransportException when a request failed otherwise; the row stays unconfirmed
      */
     public function retryB2BrouterImport(VerifactuRecord $row): VerifactuRecord
@@ -560,8 +629,9 @@ final class VerifactuManager
 
                 throw $exception;
             } catch (DocumentRejected $exception) {
-                $row->forceFill(['state' => VerifactuRecordState::Failed, 'error_code' => 'rejected', 'error_message' => $exception->getMessage()])->save();
-                VerifactuRecordRejected::dispatch($row, 'rejected', $exception->getMessage());
+                // The lookup found nothing, yet a refusal (a taken number above all) may mean that
+                // B2Brouter holds the invoice after all, so the outcome stays unknown.
+                $row->forceFill(['error_message' => $exception->getMessage(), 'submitted_at' => Carbon::now()])->save();
 
                 throw $exception;
             }
@@ -575,6 +645,8 @@ final class VerifactuManager
             'error_message' => null,
         ])->save();
         PollVerifactuTaxReport::schedule($row->id);
+        // Records that name this invoice as their predecessor check again whether to wait.
+        PollVerifactuTaxReport::wakeSuccessorsOf($row);
 
         return $row;
     }

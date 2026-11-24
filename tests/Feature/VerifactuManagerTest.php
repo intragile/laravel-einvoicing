@@ -188,7 +188,9 @@ final class VerifactuManagerTest extends TestCase
         }
 
         $this->assertSame(0, VerifactuRecord::query()->count());
-        $this->assertNull(VerifactuChain::query()->first()?->head_hash);
+        // No chain moved on: a chain row left by the write holds no record and no head.
+        $this->assertSame(0, (int) VerifactuChain::query()->sum('sequence'));
+        $this->assertSame(0, VerifactuChain::query()->whereNotNull('head_hash')->count());
         $this->assertSame(0, DB::table('jobs')->count());
         $this->assertSame(0, $fired);
 
@@ -496,6 +498,37 @@ final class VerifactuManagerTest extends TestCase
 
         // A closed chain of the other driver is the documented cut-over.
         $chain->forceFill(['closed_at' => Carbon::now()])->save();
+        $this->assertSame(1, $this->manager()->register(SpanishInvoices::domestic())->sequence);
+    }
+
+    public function test_driver_switch_is_refused_while_b2brouter_imports_are_unattached(): void
+    {
+        // The issuer moved back to AEAT before B2Brouter registered its first imports: no
+        // B2Brouter chain exists yet, but the imports will start one.
+        foreach ([[VerifactuRecordState::Pending, '24433001'], [VerifactuRecordState::Unconfirmed, null]] as [$state, $invoiceId]) {
+            $import = VerifactuRecord::query()->forceCreate([
+                'kind' => 'alta',
+                'issuer_nif' => SpanishInvoices::SELLER_NIF,
+                'number' => 'B-1',
+                'issue_date' => '2026-11-23',
+                'environment' => VerifactuEnvironment::Test,
+                'driver' => IssuerDriver::B2Brouter,
+                'state' => $state,
+                'b2brouter_invoice_id' => $invoiceId,
+                'attempts' => 1,
+            ]);
+
+            $exception = $this->catch(fn () => $this->manager()->register(SpanishInvoices::domestic()));
+
+            $this->assertInstanceOf(ConfigurationException::class, $exception, $state->value);
+            $this->assertStringContainsString('row '.$import->id, $exception->getMessage());
+            $this->assertStringContainsString('einvoicing:verifactu-submit --retry-unconfirmed', $exception->getMessage());
+            $this->assertSame(0, VerifactuChain::query()->count());
+
+            // Settled (here: rejected by AEAT), the import no longer holds the issuer back.
+            $import->forceFill(['state' => VerifactuRecordState::Failed])->save();
+        }
+
         $this->assertSame(1, $this->manager()->register(SpanishInvoices::domestic())->sequence);
     }
 
