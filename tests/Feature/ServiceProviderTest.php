@@ -72,7 +72,7 @@ final class ServiceProviderTest extends TestCase
 
         // Routes and commands are registered, yet nothing is built and no database is opened.
         self::assertNotNull(Route::getRoutes()->getByName('einvoicing.webhook'));
-        foreach (['einvoicing:doctor', 'einvoicing:install-rules', 'einvoicing:poll-inbound', 'einvoicing:resolve'] as $command) {
+        foreach (['einvoicing:doctor', 'einvoicing:install-rules', 'einvoicing:poll-inbound', 'einvoicing:resolve', 'einvoicing:verifactu-submit', 'einvoicing:verifactu-status', 'einvoicing:verifactu-verify-chain', 'einvoicing:verifactu-seed-chain', 'einvoicing:verifactu-close-chain'] as $command) {
             self::assertContains($command, $commands);
         }
         self::assertSame([], $manager->__debugInfo()['built']);

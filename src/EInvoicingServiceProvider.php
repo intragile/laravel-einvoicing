@@ -13,7 +13,12 @@ use IntrAgile\EInvoicing\Laravel\Console\KsefCertificateCommand;
 use IntrAgile\EInvoicing\Laravel\Console\KsefDeadlinesCommand;
 use IntrAgile\EInvoicing\Laravel\Console\PollInboundCommand;
 use IntrAgile\EInvoicing\Laravel\Console\ResolveCommand;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuCloseChainCommand;
 use IntrAgile\EInvoicing\Laravel\Console\VerifactuInstallSchemasCommand;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuSeedChainCommand;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuStatusCommand;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuSubmitCommand;
+use IntrAgile\EInvoicing\Laravel\Console\VerifactuVerifyChainCommand;
 use IntrAgile\EInvoicing\Laravel\France\FranceManager;
 use IntrAgile\EInvoicing\Laravel\Ksef\DatabaseKsefCursorStore;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
@@ -75,7 +80,20 @@ final class EInvoicingServiceProvider extends ServiceProvider
         }
 
         if ($this->app->runningInConsole()) {
-            $this->commands([DoctorCommand::class, InstallRulesCommand::class, KsefCertificateCommand::class, KsefDeadlinesCommand::class, PollInboundCommand::class, ResolveCommand::class, VerifactuInstallSchemasCommand::class]);
+            $this->commands([
+                DoctorCommand::class,
+                InstallRulesCommand::class,
+                KsefCertificateCommand::class,
+                KsefDeadlinesCommand::class,
+                PollInboundCommand::class,
+                ResolveCommand::class,
+                VerifactuInstallSchemasCommand::class,
+                VerifactuSubmitCommand::class,
+                VerifactuStatusCommand::class,
+                VerifactuVerifyChainCommand::class,
+                VerifactuSeedChainCommand::class,
+                VerifactuCloseChainCommand::class,
+            ]);
             $this->publishes([self::CONFIG => $this->app->configPath('einvoicing.php')], 'einvoicing-config');
             $now = time();
             $this->publishes([

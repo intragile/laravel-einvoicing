@@ -666,7 +666,11 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         return (int) ceil(is_numeric($timeout) && $timeout > 0 ? (float) $timeout : 30.0) + self::MARGIN;
     }
 
-    private static function maxAttempts(): int
+    /**
+     * The attempts after which an unconfirmed record is no longer resent automatically
+     * (einvoicing.sending.max_attempts).
+     */
+    public static function maxAttempts(): int
     {
         return max(1, (int) ceil(ConfigValue::number(config('einvoicing.sending.max_attempts') ?? self::DEFAULT_MAX_ATTEMPTS, 'einvoicing.sending.max_attempts')));
     }
