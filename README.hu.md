@@ -1126,6 +1126,30 @@ megkeressük (`einvoicing:verifactu-submit --retry-unconfirmed` vagy
 foglalt számra hivatkozva), a sor az indokkal `unconfirmed` marad, mert lehet, hogy a B2Brouternél
 mégis megvan a számla.
 
+Ha egy import a `--retry-unconfirmed` után is `unconfirmed` marad:
+
+1. Keresd meg a számlát a B2Brouterben a száma és a kiállítás dátuma alapján (a parancs mindkettőt
+   kiírja a sor azonosítójával együtt).
+2. Ha a B2Brouternél megvan, vagy az ok ott javítható (például egy piszkozat foglalja a számot),
+   javítsd, és futtasd újra a `php artisan einvoicing:verifactu-submit --retry-unconfirmed`
+   parancsot: a sort először szám szerint keressük, így a B2Brouternél már meglévő számlát
+   átvesszük, sosem importáljuk kétszer.
+3. Ha a B2Brouter valóban elutasítja a számlát, és nincs meg nála, egyetlen parancs sem jelöli a
+   sort hibásnak. Jelöld hibásnak közvetlenül az adatbázisban (a kapcsolatod esetleges
+   táblaelőtagjával, a `42` helyére a sor azonosítóját írva):
+
+   ```sql
+   UPDATE einvoicing_verifactu_records
+      SET state = 'failed', error_code = 'import_abandoned',
+          error_message = 'Refused by B2Brouter; abandoned by an operator.', updated_at = CURRENT_TIMESTAMP
+    WHERE id = 42 AND driver = 'b2brouter' AND state = 'unconfirmed' AND b2brouter_invoice_id IS NULL;
+   ```
+
+   Pontosan egy sornak kell változnia. Ezután futtasd még egyszer az `php artisan
+   einvoicing:verifactu-submit --retry-unconfirmed` parancsot, hogy az erre az importra váró
+   rekordokat (`pending`, `awaiting_predecessor`) újra lekérdezzük, és nélküle fűzzük láncba. Maga a
+   számla így nincs regisztrálva az AEAT-nál: állítsd ki újra, vagy kezeld a B2Brouterben.
+
 Minden regisztrált rekordot **keresztellenőrzünk** a saját motorunkkal: az XML-t a séma szerint, a
 szövegéből újraszámolt `Huella`-t, a kapcsolódását az előző tárolt rekordhoz, szemantikailag a
 számla saját rekordunkkal való összevetését, és a B2Brouter QR-kódjában lévő URL-t. `strict`

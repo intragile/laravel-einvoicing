@@ -287,6 +287,126 @@ final class SubmitVerifactuRecordsTest extends TestCase
         $this->assertNull($moved->fresh()?->error_code);
     }
 
+    public function test_a_batch_cut_below_1000_records_keeps_the_wait(): void
+    {
+        // 1,000 records are due, but a correction at position 2 cuts the request to one record:
+        // only a request that carries 1,000 records may skip AEAT's wait.
+        $store = $this->store(new RecordWriter);
+        $this->generate('D-1', store: $store);
+        $this->generate('D-1', store: $store, operation: AltaOperation::Correction);
+        for ($n = 3; $n <= 1000; $n++) {
+            $this->generate(sprintf('R-%d', $n), store: $store);
+        }
+        $this->throttle()->store(new ThrottleState(Carbon::now()->subSeconds(10)->toDateTimeImmutable(), 60));
+        $this->aeat->queue(FakeAeatApi::answer([]));
+
+        $this->submit();
+
+        $this->assertSame(0, $this->aeat->requestCount(), 'a batch of fewer than 1,000 records went out during the wait');
+        $this->assertSame(0, VerifactuRecord::query()->where('state', '!=', VerifactuRecordState::Generated->value)->count());
+        // The next cut batch is not full either: the run waits for AEAT's wait, it does not spin.
+        $this->assertScheduled(50);
+        Queue::assertPushed(SubmitVerifactuRecords::class, 1);
+    }
+
+    public function test_a_full_batch_shrunk_by_a_concurrent_claim_keeps_the_wait(): void
+    {
+        $store = $this->store(new RecordWriter);
+        for ($n = 1; $n <= 1000; $n++) {
+            $this->generate(sprintf('R-%d', $n), store: $store);
+        }
+        $this->throttle()->store(new ThrottleState(Carbon::now()->subSeconds(10)->toDateTimeImmutable(), 60));
+        $this->aeat->queue(FakeAeatApi::answer([]));
+        // Another run takes the last record after this run cut its batch of 1,000.
+        $client = $this->aeat->client($this->schemas);
+        $this->app->offsetUnset(AeatClient::class);
+        $this->app->bind(AeatClient::class, static function () use ($client): AeatClient {
+            VerifactuRecord::query()->where('number', 'R-1000')->update(['state' => VerifactuRecordState::Sending->value]);
+
+            return $client;
+        });
+
+        $this->submit();
+
+        $this->assertSame(0, $this->aeat->requestCount(), 'a batch of 999 records went out during the wait');
+        $this->assertSame(999, VerifactuRecord::query()->where('state', VerifactuRecordState::Generated->value)->count());
+    }
+
+    public function test_a_batch_cut_by_issuer_below_1000_records_keeps_the_wait(): void
+    {
+        $store = $this->store(new RecordWriter);
+        $this->generate('A-1', store: $store);
+        $this->travel(1)->seconds();
+        for ($n = 2; $n <= 1000; $n++) {
+            $this->generate(sprintf('B-%d', $n), self::OTHER_ISSUER, store: $store);
+        }
+        $this->throttle()->store(new ThrottleState(Carbon::now()->subSeconds(10)->toDateTimeImmutable(), 60));
+
+        $this->submit();
+
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertScheduled(50);
+    }
+
+    public function test_a_leftover_issuer_whose_aeat_client_cannot_be_built_is_held_not_the_key(): void
+    {
+        Event::fake([VerifactuSubmissionBlocked::class]);
+        // The real client factory: the moved issuer's certificate file is gone.
+        $this->app->forgetInstance(AeatClient::class);
+        $this->app->offsetUnset(AeatClient::class);
+        $moved = $this->generate('S-3');
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.driver', 'b2brouter');
+
+        $this->submit();
+
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertNull($this->throttle()->blocked_at);
+        Event::assertNotDispatched(VerifactuSubmissionBlocked::class);
+        $moved = $moved->fresh();
+        $this->assertSame(VerifactuRecordState::Generated, $moved?->state);
+        $this->assertSame(SubmitVerifactuRecords::HELD_CODE, $moved?->error_code);
+        $this->assertStringContainsString('cannot be read', (string) $moved?->error_message);
+        $this->assertStringNotContainsString('pw-'.self::SECRET_MARK, (string) $moved?->error_message);
+    }
+
+    public function test_a_leftover_issuer_with_a_wrong_certificate_password_is_held_not_the_key(): void
+    {
+        Event::fake([VerifactuSubmissionBlocked::class]);
+        $this->app->forgetInstance(AeatClient::class);
+        $this->app->offsetUnset(AeatClient::class);
+        $this->useRealCertificate('wrong-'.self::SECRET_MARK);
+        $moved = $this->generate('S-5');
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.driver', 'b2brouter');
+
+        $this->submit();
+
+        $this->assertSame(0, $this->aeat->requestCount());
+        $this->assertNull($this->throttle()->blocked_at);
+        Event::assertNotDispatched(VerifactuSubmissionBlocked::class);
+        $moved = $moved->fresh();
+        $this->assertSame(VerifactuRecordState::Generated, $moved?->state);
+        $this->assertSame(SubmitVerifactuRecords::HELD_CODE, $moved?->error_code);
+        $this->assertStringNotContainsString(self::SECRET_MARK, (string) $moved?->error_message);
+    }
+
+    public function test_holding_records_again_keeps_their_updated_at(): void
+    {
+        $moved = $this->generate('S-4');
+        config()->set('einvoicing.verifactu.aeat.certificate', null);
+        config()->set('einvoicing.verifactu.issuers.'.VerifactuSamples::ISSUER_NIF.'.driver', 'b2brouter');
+        $created = $moved->fresh()?->updated_at?->getTimestamp();
+
+        $this->travel(5)->minutes();
+        $this->submit();
+        $this->travel(5)->minutes();
+        $this->submit();
+
+        $moved = $moved->fresh();
+        $this->assertSame(SubmitVerifactuRecords::HELD_CODE, $moved?->error_code);
+        // The stuck-record check keeps measuring from when the record stopped moving.
+        $this->assertSame($created, $moved?->updated_at?->getTimestamp());
+    }
+
     public function test_issuer_scope_throttles_separately(): void
     {
         config()->set('einvoicing.verifactu.submission.throttle_scope', 'issuer');

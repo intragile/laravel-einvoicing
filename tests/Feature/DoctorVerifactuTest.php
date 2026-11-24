@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schema;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollVerifactuTaxReport;
+use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuChain;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuRecord;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuThrottle;
@@ -142,6 +143,7 @@ final class DoctorVerifactuTest extends TestCase
             'verifactu: driver switch',
             'verifactu: chain heads',
             'verifactu: stuck records',
+            'verifactu: held records',
             'verifactu: b2brouter chains',
             'verifactu: submission',
         ], array_column($rows, 0));
@@ -433,6 +435,28 @@ final class DoctorVerifactuTest extends TestCase
         $this->assertStringContainsString('outcome is unknown', $row[2]);
         $this->assertStringContainsString('1 record waits', $row[2]);
         $this->assertStringContainsString('php artisan einvoicing:verifactu-submit --retry-unconfirmed', $row[2]);
+    }
+
+    #[Group('verifactu-databases')]
+    public function test_held_records_are_reported(): void
+    {
+        $this->configureComplete(schemas: false);
+        $chain = $this->chain(self::ISSUER, '383', IssuerDriver::Aeat, 2, self::HASH_B);
+        $this->record(self::ISSUER, $chain->id, 1, 'F-1', null, state: VerifactuRecordState::Generated, age: 1);
+        VerifactuRecord::query()->where('number', 'F-1')->toBase()->update([
+            'error_code' => SubmitVerifactuRecords::HELD_CODE,
+            'error_message' => 'Issuer '.self::ISSUER.' uses the B2Brouter driver and has no AEAT credentials any more.',
+        ]);
+
+        $row = $this->row($this->doctorRows(), 'verifactu: held records');
+        $this->assertSame('warn', $row[1]);
+        $this->assertStringContainsString(self::ISSUER, $row[2]);
+        $this->assertStringContainsString('1 record', $row[2]);
+        $this->assertStringContainsString('no AEAT credentials', $row[2]);
+        $this->assertStringContainsString('einvoicing:verifactu-submit', $row[2]);
+
+        VerifactuRecord::query()->where('number', 'F-1')->toBase()->update(['error_code' => null]);
+        $this->assertRowIn($this->doctorRows(), 'verifactu: held records', 'ok');
     }
 
     #[Group('verifactu-databases')]

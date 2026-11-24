@@ -179,9 +179,10 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         $state = $throttle->last_sent_at === null ? new ThrottleState(null, $settings->initialWait) : $throttle->state();
 
         $due = $this->dueRecords();
-        // A full submission skips the wait only when the request carries 1,000 records.
-        $sendable = min(count($due), $settings->maxBatch);
-        if (! $flow->decide($state, $sendable)->sendNow) {
+        // A full submission skips the wait only when the request carries 1,000 records. No batch
+        // can be larger than this bound, so a run that may not send it stops here; the batch
+        // itself is decided once it is cut.
+        if (! $flow->decide($state, min(count($due), $settings->maxBatch, FlowControl::MAX_RECORDS))->sendNow) {
             $this->scheduleRest();
 
             return;
@@ -208,22 +209,28 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             try {
                 $context = $resolver->resolve(Nif::parse($issuer));
                 $this->assertEnvironment($context, $settings->environment, $batch[0]);
+                $resolvedContext = $context;
                 try {
                     $context = VerifactuClients::forAeatChain($context);
                 } catch (ConfigurationException $exception) {
                     // An issuer moved to B2Brouter without its AEAT credentials: its records wait,
                     // and the key, which may serve other issuers, stays open.
                     $due = $this->hold($issuer, $due, $exception->getMessage());
-                    $sendable = min(count($due), $settings->maxBatch);
-                    if ($due === [] || ! $flow->decide($state, $sendable)->sendNow) {
-                        $this->scheduleRest();
-
-                        return;
-                    }
 
                     continue;
                 }
-                $client = $clients->aeat($context);
+                try {
+                    $client = $clients->aeat($context);
+                } catch (ConfigurationException $exception) {
+                    if ($context === $resolvedContext) {
+                        throw $exception;
+                    }
+                    // The leftover AEAT credentials of an issuer moved to B2Brouter are broken
+                    // (a missing certificate file, a wrong password): only that issuer waits.
+                    $due = $this->hold($issuer, $due, $exception->getMessage());
+
+                    continue;
+                }
             } catch (UnknownIssuer $exception) {
                 $this->block($throttle, 'unknown_issuer', $exception->getMessage());
 
@@ -242,8 +249,15 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             break;
         }
 
+        // The batch is final: only a request of 1,000 records skips the wait.
+        if (! $flow->decide($state, count($batch))->sendNow) {
+            $this->scheduleRest();
+
+            return;
+        }
+
         $now = Carbon::now()->toDateTimeImmutable();
-        $taken = $this->claimUnderThrottle($batch, $due, $flow, $settings->initialWait, $sendable, $now);
+        $taken = $this->claimUnderThrottle($batch, $due, $flow, $settings->initialWait, $now);
         if ($taken === null) {
             $this->scheduleRest();
 
@@ -266,28 +280,33 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
      * @return array{VerifactuThrottle, ThrottleState, non-empty-array<int, array{row: VerifactuRecord, state: VerifactuRecordState, attempts: int}>}|null
      *                                                                                                                                                     null when the run must not send now
      */
-    private function claimUnderThrottle(array $batch, array $due, FlowControl $flow, int $initialWait, int $sendable, DateTimeImmutable $now): ?array
+    private function claimUnderThrottle(array $batch, array $due, FlowControl $flow, int $initialWait, DateTimeImmutable $now): ?array
     {
-        return DB::transaction(function () use ($batch, $due, $flow, $initialWait, $sendable, $now): ?array {
+        DB::beginTransaction();
+        try {
             VerifactuThrottle::query()->where('key', $this->throttleKey)->update(['updated_at' => Carbon::now()]);
             $throttle = VerifactuThrottle::query()->where('key', $this->throttleKey)->lockForUpdate()->first();
-            if ($throttle === null || $throttle->blocked_at !== null) {
-                return null;
-            }
-            $state = $throttle->last_sent_at === null ? new ThrottleState(null, $initialWait) : $throttle->state();
-            if (! $flow->decide($state, $sendable)->sendNow) {
-                return null;
-            }
+            $state = $throttle === null ? null : ($throttle->last_sent_at === null ? new ThrottleState(null, $initialWait) : $throttle->state());
+            $claimed = $throttle === null || $throttle->blocked_at !== null || $state === null || ! $flow->decide($state, count($batch))->sendNow
+                ? []
+                : $this->claim($batch, $due);
+            // Rows another run took meanwhile shrink the batch: the smaller request is decided
+            // again, and when it must wait, the claim is undone.
+            if ($throttle === null || $state === null || $claimed === [] || ! $flow->decide($state, count($claimed))->sendNow) {
+                DB::rollBack();
 
-            $claimed = $this->claim($batch, $due);
-            if ($claimed === []) {
                 return null;
             }
             // The attempt is recorded with the claim, so a concurrent run waits for the flow control.
             $throttle->store($flow->afterFailure($state, $now));
+            DB::commit();
+        } catch (Throwable $exception) {
+            DB::rollBack();
 
-            return [$throttle, $state, $claimed];
-        });
+            throw $exception;
+        }
+
+        return [$throttle, $state, $claimed];
     }
 
     /**
@@ -639,10 +658,18 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
             }
         }
 
+        // Written through the query builder without updated_at, and only where the reason changed:
+        // a held record keeps the time it last moved, which the stuck-record check measures.
         VerifactuRecord::query()
             ->whereIn('id', $ids)
             ->whereIn('state', self::CLAIMABLE)
-            ->update(['error_code' => self::HELD_CODE, 'error_message' => $message, 'updated_at' => Carbon::now()]);
+            ->where(static fn ($query) => $query
+                ->whereNull('error_code')
+                ->orWhere('error_code', '!=', self::HELD_CODE)
+                ->orWhereNull('error_message')
+                ->orWhere('error_message', '!=', $message))
+            ->toBase()
+            ->update(['error_code' => self::HELD_CODE, 'error_message' => $message]);
         Log::warning('VERI*FACTU records of an issuer are held: they cannot be sent to AEAT.', [
             'throttle_key' => $this->throttleKey,
             'issuer' => $issuer,
@@ -687,7 +714,7 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         $now = Carbon::now()->getTimestamp();
         $throttleDelay = max(0, ($throttle->next_send_at?->getTimestamp() ?? $now) - $now);
         $generated = count(array_filter($pending, static fn (VerifactuRecord $row): bool => $row->state === VerifactuRecordState::Generated));
-        if (min($generated, self::maxBatch()) >= FlowControl::MAX_RECORDS) {
+        if (min($generated, self::maxBatch()) >= FlowControl::MAX_RECORDS && $this->nextBatchIsFull()) {
             $delay = 0;
         } elseif ($generated > 0) {
             $delay = $throttleDelay;
@@ -697,6 +724,18 @@ final class SubmitVerifactuRecords implements ShouldBeUniqueUntilProcessing, Sho
         }
 
         self::schedule($this->throttleKey, $delay);
+    }
+
+    /**
+     * Whether the next run would send a full submission of 1,000 records, after the cuts it makes
+     * by issuer and by repeated invoice; only such a run skips the wait, so only then is it
+     * scheduled at once.
+     */
+    private function nextBatchIsFull(): bool
+    {
+        $due = array_values(array_filter($this->dueRecords(), fn (VerifactuRecord $row): bool => ! isset($this->held[$row->issuer_nif])));
+
+        return $due !== [] && count($this->nextBatch($due, self::maxBatch())) >= FlowControl::MAX_RECORDS;
     }
 
     /**

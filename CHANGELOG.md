@@ -44,7 +44,8 @@ Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-
   `SistemaInformatico` needs to be declared.
 - **Spain:** driver cut-over is drain → switch → close: the records left on the AEAT chain of an
   issuer moved to B2Brouter are still sent with its AEAT credentials while they stay configured;
-  without them that issuer's records are held and the shared throttle key is not blocked.
+  without them, or when they cannot be loaded, that issuer's records are held (`error_code`
+  `aeat_credentials`, reported by the doctor) and the shared throttle key is not blocked.
 - **Spain:** events `VerifactuRecordGenerated`, `VerifactuRecordAccepted`,
   `VerifactuRecordRejected`, `VerifactuRecordUnconfirmed`, `VerifactuRecordRegistered`,
   `VerifactuCrossCheckFailed` and `VerifactuSubmissionBlocked`.
@@ -54,7 +55,7 @@ Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-
   `einvoicing:verifactu-seed-chain` and `einvoicing:verifactu-close-chain`.
 - **Spain:** `verifactu` rows in `einvoicing:doctor` (schemas, system, issuers, certificates, the
   FNMT root in the CA bundle, the B2Brouter key, tables, driver switches, chain heads, seeded,
-  stuck and blocked records, failed cross-checks, blocked submissions; `--live` adds a TLS
+  stuck, held and blocked records, failed cross-checks, blocked submissions; `--live` adds a TLS
   handshake with AEAT, never a submission), and the VERI\*FACTU jobs in the `retry_after` check.
 - **Spain:** the live group `b2brouter-spain-live` registers two chained invoices, an exempt one
   and a credit note by difference through the B2Brouter sandbox and cross-checks each record.

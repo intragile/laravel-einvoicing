@@ -849,6 +849,34 @@ final class VerifactuB2BrouterTest extends TestCase
         $this->assertSame(2, $this->pollsOf($b));
     }
 
+    public function test_documented_abandon_step_releases_the_waiting_successor(): void
+    {
+        Queue::fake();
+        $a = $this->unconfirmedImport(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'));
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $this->runPoll($b->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+
+        // The operator procedure in the README, word for word apart from the row id.
+        $changed = DB::update(
+            "UPDATE einvoicing_verifactu_records
+                SET state = 'failed', error_code = 'import_abandoned',
+                    error_message = 'Refused by B2Brouter; abandoned by an operator.', updated_at = CURRENT_TIMESTAMP
+              WHERE id = ? AND driver = 'b2brouter' AND state = 'unconfirmed' AND b2brouter_invoice_id IS NULL",
+            [$a->id],
+        );
+        $this->assertSame(1, $changed);
+        $this->assertSame(VerifactuRecordState::Failed, $a->refresh()->state);
+
+        $this->artisan('einvoicing:verifactu-submit', ['--retry-unconfirmed' => true])->assertExitCode(0);
+        $this->assertSame(2, $this->pollsOf($b));
+        $this->runPoll($b->id);
+
+        $b->refresh();
+        $this->assertNotSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->error_code);
+        $this->assertNotNull($b->chain_id, (string) json_encode([$b->state, $b->error_code, $b->error_message]));
+    }
+
     public function test_successors_are_woken_through_the_shared_hook(): void
     {
         Queue::fake();

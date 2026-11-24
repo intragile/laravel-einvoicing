@@ -1079,6 +1079,30 @@ looked up by number before it is ever imported again (`einvoicing:verifactu-subm
 new import (a taken number, for instance), the row stays `unconfirmed` with the reason, since
 B2Brouter may hold the invoice after all.
 
+When an import stays `unconfirmed` after `--retry-unconfirmed`:
+
+1. Look the invoice up in B2Brouter by its number and issue date (the command prints both, with the
+   row id).
+2. If B2Brouter holds it, or the reason can be fixed there (a number taken by a draft, for
+   instance), fix it and run `php artisan einvoicing:verifactu-submit --retry-unconfirmed` again:
+   the row is looked up by number first, so an invoice B2Brouter already holds is adopted, never
+   imported twice.
+3. If B2Brouter truly refuses the invoice and does not hold it, no command marks the row failed.
+   Mark it failed in the database yourself (add your connection's table prefix, if any, and put
+   the row id in place of `42`):
+
+   ```sql
+   UPDATE einvoicing_verifactu_records
+      SET state = 'failed', error_code = 'import_abandoned',
+          error_message = 'Refused by B2Brouter; abandoned by an operator.', updated_at = CURRENT_TIMESTAMP
+    WHERE id = 42 AND driver = 'b2brouter' AND state = 'unconfirmed' AND b2brouter_invoice_id IS NULL;
+   ```
+
+   Exactly one row must change. Then run `php artisan einvoicing:verifactu-submit
+   --retry-unconfirmed` once more, so the records that waited for this import (`pending` with
+   `awaiting_predecessor`) are polled again and attached without it. The invoice itself is then not
+   registered with AEAT: issue it again, or handle it in B2Brouter.
+
 Every registered record is **cross-checked** against our own engine: the XML against the schema,
 the `Huella` recomputed from its text, its link to the previous stored record, a semantic
 comparison with our own record of the same invoice, and the URL in B2Brouter's QR code. In `strict`

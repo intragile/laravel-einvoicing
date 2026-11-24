@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Schema;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollVerifactuTaxReport;
+use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuChain;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuRecord;
 use IntrAgile\EInvoicing\Laravel\Models\VerifactuThrottle;
@@ -161,6 +162,7 @@ final class VerifactuDoctor
             $this->checkDriverSwitch($environment);
             $this->checkChainHeads($environment);
             $this->checkStuckRecords($environment, $settings->stuckAfterMinutes);
+            $this->checkHeldRecords($environment);
             $this->checkB2BrouterChains($environment, $settings);
             $this->checkCrossChecks($environment);
             $this->checkSubmission();
@@ -651,6 +653,40 @@ final class VerifactuDoctor
         $parts === []
             ? $this->row('stuck records', self::OK, sprintf('none unsettled for over %d minutes', $minutes))
             : $this->row('stuck records', self::WARN, sprintf('unsettled for over %d minutes: %s', $minutes, implode('; ', $parts)));
+    }
+
+    /**
+     * Records the submission job holds because their issuer cannot reach AEAT any more (an
+     * issuer moved to B2Brouter whose AEAT credentials are gone or broken), by issuer with the
+     * reason. They wait without blocking the key, so nothing else reports them.
+     */
+    private function checkHeldRecords(VerifactuEnvironment $environment): void
+    {
+        $held = VerifactuRecord::query()
+            ->where('environment', $environment->value)
+            ->where('error_code', SubmitVerifactuRecords::HELD_CODE)
+            ->whereIn('state', [VerifactuRecordState::Generated->value, VerifactuRecordState::Unconfirmed->value])
+            ->toBase()
+            ->selectRaw('issuer_nif, count(*) as aggregate, max(error_message) as reason')
+            ->groupBy('issuer_nif')
+            ->orderBy('issuer_nif')
+            ->get();
+
+        if ($held->isEmpty()) {
+            $this->row('held records', self::OK, 'none');
+
+            return;
+        }
+
+        $parts = [];
+        foreach ($held as $group) {
+            $count = is_numeric($group->aggregate ?? null) ? (int) $group->aggregate : 0;
+            $issuer = is_string($group->issuer_nif ?? null) ? $group->issuer_nif : '';
+            $reason = is_string($group->reason ?? null) ? $group->reason : '';
+            $parts[] = sprintf('%s: %d record%s (%s)', $issuer, $count, $count === 1 ? '' : 's', $reason);
+        }
+        $this->row('held records', self::WARN, implode('; ', $parts)
+            .'; restore the issuer\'s AEAT certificate and password (or move it back to the aeat driver), then run php artisan einvoicing:verifactu-submit');
     }
 
     /**
