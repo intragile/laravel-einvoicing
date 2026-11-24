@@ -17,13 +17,16 @@ use IntrAgile\EInvoicing\Laravel\Jobs\FetchInboundDocument;
 use IntrAgile\EInvoicing\Laravel\Jobs\MessageJob;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollDeliveryStatus;
 use IntrAgile\EInvoicing\Laravel\Jobs\PollKsefStatus;
+use IntrAgile\EInvoicing\Laravel\Jobs\PollVerifactuTaxReport;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendDocument;
 use IntrAgile\EInvoicing\Laravel\Jobs\SendKsefInvoice;
+use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
 use IntrAgile\EInvoicing\Laravel\Ksef\DatabaseKsefCursorStore;
 use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Models\InboundMessage;
 use IntrAgile\EInvoicing\Laravel\Models\OutboundMessage;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
+use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuDoctor;
 use IntrAgile\EInvoicing\Poland\KsefEnvironment;
 use IntrAgile\EInvoicing\Transport\B2Brouter\B2BrouterConfig;
 use IntrAgile\EInvoicing\Transport\EInvoiceBe\EInvoiceBeConfig;
@@ -36,11 +39,13 @@ use IntrAgile\EInvoicing\Validation\Exception\RulesNotInstalled;
 use IntrAgile\EInvoicing\Validation\Validator;
 use InvalidArgumentException;
 use SensitiveParameter;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 use Throwable;
 
 /**
  * Checks the configuration, the Peppol rules, the tables and the queue, and with --live asks each
- * transport's inbox once whether the credentials work.
+ * transport's inbox once whether the credentials work. The VERI*FACTU rows come from
+ * VerifactuDoctor; with --live they add a TLS handshake to the AEAT endpoint, never a request.
  *
  * Without --live no provider API is called. The one request made by default is the KSeF
  * availability status of Latarnia, a public, unauthenticated read, when einvoicing.ksef is in use;
@@ -54,7 +59,7 @@ use Throwable;
 final class DoctorCommand extends Command
 {
     protected $signature = 'einvoicing:doctor
-        {--live : Call each transport\'s API (its inbox) once to check the credentials; the public KSeF Latarnia status is read without it}';
+        {--live : Call each transport\'s API (its inbox) once to check the credentials, and make a TLS handshake (no request) to the AEAT VERI*FACTU endpoint with each issuer\'s certificate; the public KSeF Latarnia status is read without it}';
 
     protected $description = 'Check the e-invoicing transports, validation rules, tables and queue';
 
@@ -128,6 +133,7 @@ final class DoctorCommand extends Command
         }
         $this->checkFrance();
         $this->checkKsef();
+        $this->checkVerifactu();
         $this->checkValidation($manager);
         $this->checkCore();
         $this->checkRulePackages();
@@ -460,6 +466,17 @@ final class DoctorCommand extends Command
     }
 
     /**
+     * The VERI*FACTU rows: a single info row when no issuer is configured.
+     */
+    private function checkVerifactu(): void
+    {
+        foreach ((new VerifactuDoctor($this->laravel))->rows((bool) $this->option('live')) as [$check, $status, $detail]) {
+            // Stored AEAT messages are printed; they must not be read as console markup.
+            $this->row($check, $status, OutputFormatter::escape($detail));
+        }
+    }
+
+    /**
      * Fails a certificate that is expired or not yet valid; with $warnSoon, warns when it expires
      * within KSEF_EXPIRY_WARNING_DAYS.
      */
@@ -777,6 +794,11 @@ final class DoctorCommand extends Command
             $send = max($send, (int) (new SendKsefInvoice(0))->timeout);
             $timeouts[] = (int) (new SendKsefInvoice(0))->timeout;
             $timeouts[] = (int) (new PollKsefStatus(0))->timeout;
+        }
+        if ((new VerifactuDoctor($this->laravel))->configured()) {
+            // One AEAT submission, and one B2Brouter tax report poll of several reads.
+            $timeouts[] = (int) (new SubmitVerifactuRecords(''))->timeout;
+            $timeouts[] = (int) (new PollVerifactuTaxReport(0))->timeout;
         }
         $longest = max($timeouts);
 
