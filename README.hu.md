@@ -906,6 +906,10 @@ ellenőrzőösszeggel együtt az `einvoicing.verifactu.schemas_dir` mappába tes
 ellenőrzőösszegeket ugyanúgy ellenőrzi. A `register()`, `cancel()` és `correct()` nem fut, amíg a
 sémák nincsenek telepítve.
 
+A számlázási rekordokat meg kell őrizni (jogszabályi megőrzési kötelezettség), ezért a VERI\*FACTU
+migráció visszagörgetése elutasít, amíg az `einvoicing_verifactu_records` táblában bármilyen sor
+van: előbb exportáld vagy helyezd át a rekordokat, és tudatosan töröld őket.
+
 ### Beállítás
 
 ```dotenv
@@ -942,8 +946,9 @@ zónája), a `system.foreign_id` (spanyol NIF nélküli gyártónak: vagy `nif`,
 `aeat.port` (`personal` vagy `seal`, ez választja az AEAT hostot), az `aeat.timeout` (30 s) és az
 `aeat.connect_timeout` (10 s), a `b2brouter.poll_attempts` (10) és a `b2brouter.poll_delay`
 (30 s), a `submission` (`queue`, `connection`, `max_batch` 1–1000, `initial_wait` 60 s,
-`throttle_scope`), a `cross_check` (`strict` vagy `report`) és a `stuck_after_minutes` (60). A
-`system` blokknak nincs alapértéke: a telepítés gyártója maga nyilatkozik. Az AEAT driverhez
+`throttle_scope`), a `cross_check` (`strict` vagy `report`) és a `stuck_after_minutes` (60;
+legalább a beküldő job timeoutja percben, plusz egy, vagyis `aeat.timeout` + 60 s, így futó
+beküldést sosem tekintünk elakadtnak). A `system` blokknak nincs alapértéke: a telepítés gyártója maga nyilatkozik. Az AEAT driverhez
 kötelező; amíg minden kibocsátó a B2Brouteren megy, amely a saját `SistemaInformatico`-ját írja,
 üresen maradhat.
 
@@ -1056,9 +1061,10 @@ EInvoicing::verifactu()->record($id);                      // a legutóbbi rekor
   láncában, elutasítja.
 - **`cancel(InvoiceId $invoice, ?string $reference = null, AnulacionOperation $operation = Normal, bool $registeredByPreviousSystem = false)`**
   `RegistroAnulacion` rekordot fűz a lánchoz. Olyan számlához, amelyet az AEAT sosem kapott meg,
-  az `AnulacionOperation::WithoutPriorRecord` kell. A lánc beoltása előtt használt szoftverrel
-  rögzített számlának nincs helyi rekordja: add meg a `registeredByPreviousSystem: true`
-  argumentumot, amelyet csak beoltott lánc fogad el.
+  az `AnulacionOperation::WithoutPriorRecord` kell. A lánc kezdőpontjának beállítása előtt
+  használt szoftverrel rögzített számlának nincs helyi rekordja: add meg a
+  `registeredByPreviousSystem: true` argumentumot, amelyet csak kezdőponttal indított lánc fogad
+  el.
 - **`correct(Invoice $invoice, ?string $reference = null)`** új rögzítést fűz egy olyan
   számlához, amelynek már van ilyen: helyesbítéshez (`Subsanacion`) vagy elutasítás utáni
   újraküldéshez; a műveletet a `SpanishInvoice::$operation` adja.
@@ -1066,6 +1072,13 @@ EInvoicing::verifactu()->record($id);                      // a legutóbbi rekor
 
 Az AEAT által elutasított rekord előállítottként a láncban marad; a lánc sosem íródik át. Javítsd
 a számlát, és küldd be újra a `correct()` hívással.
+
+**Tranzakciók.** Az AEAT driveren a `register()`, a `cancel()` és a `correct()` futhat a saját
+adatbázis-tranzakciódon belül: a job és az esemény a commit után következik, visszagörgetéskor
+semmi nem kerül sorba. A láncsor a tranzakció commitjáig zárolva marad, így ugyanannak a láncnak a
+többi írója addig vár; a tranzakció legyen rövid. A B2Brouter driveren a `register()` nyitott
+tranzakción belül `LogicException` kivétellel elutasít: a B2Brouter akkor is megtartja az importot,
+ha a tranzakciód visszagördül, és az arról tudó sor elveszne. Hívd a commit után.
 
 ### Queue és AEAT forgalomszabályozás
 
@@ -1086,7 +1099,14 @@ duplikátum-válasza megerősíti őket. Az egészében elutasított beküldés 
 hiba vagy hitelesítési hiba) semmit nem rögzített: a rekordok állapota marad, a throttle sor
 blokkolt lesz, és `VerifactuSubmissionBlocked` esemény fut le; a hiba elhárítása után az
 `einvoicing:verifactu-submit` oldja fel a blokkot. A job timeoutja be van állítva, a doctor ezt a
-`retry_after` értékkel veti össze.
+`retry_after` értékkel veti össze (a `submission.connection` kapcsolatáéval is, ha az eltér).
+
+Egy kérés számlánként és fajtánként legfeljebb egy rekordot visz: a helyesbítés, amely azelőtt
+készült, hogy a számla első rekordja elment volna, a következő beküldésre vár, így minden rekord
+saját választ kap. Ha a beküldő jobot a lefoglalás és az AEAT válasza között leállítják (worker
+összeomlás, deploy), a rekordjai `sending` állapotban maradnak, és automatikusan nem küldjük újra
+őket. A `stuck_after_minutes` után a doctor jelzi őket, az `einvoicing:verifactu-submit
+--retry-unconfirmed` pedig ugyanazokkal a bájtokkal újraküldi őket.
 
 ### B2Brouter mód
 
@@ -1101,7 +1121,10 @@ egy saját B2Brouter-láncba fűzi, és `VerifactuRecordRegistered` esemény fut
 `registered_with_errors` (az AEAT *AceptadoConErrores* válasza) `accepted_with_errors` állapotként
 kerül a láncba. Ebben a módban a `cancel()` és a `correct()` nem érhető el; a sztornót a
 B2Brouterben kezeld. Az ismeretlen kimenetelű importot újraimportálás előtt szám szerint
-megkeressük (`einvoicing:verifactu-submit --retry-unconfirmed`).
+megkeressük (`einvoicing:verifactu-submit --retry-unconfirmed` vagy
+`VerifactuManager::retryB2BrouterImport()`); ha a B2Brouter az új importot elutasítja (például
+foglalt számra hivatkozva), a sor az indokkal `unconfirmed` marad, mert lehet, hogy a B2Brouternél
+mégis megvan a számla.
 
 Minden regisztrált rekordot **keresztellenőrzünk** a saját motorunkkal: az XML-t a séma szerint, a
 szövegéből újraszámolt `Huella`-t, a kapcsolódását az előző tárolt rekordhoz, szemantikailag a
@@ -1115,25 +1138,42 @@ pozitív összegeket tartalmaz, ahol az AEAT az előjeles különbséget várja.
 paraméterei alapján vetjük össze.
 
 A rekordok abban a sorrendben kerülnek a láncba, ahogy maguk a rekordok megnevezik az elődjüket:
-amelyiknek az elődje még függőben van, megvárja, a nem kapcsolódó rekord pedig hibás lesz és
-kimarad a láncból, amelyet a doctor ekkor blokkoltként jelez.
+amelyiknek az elődje még függőben (`pending`) vagy megerősítetlen (`unconfirmed`, ismeretlen
+kimenetelű import), megvárja, és újra lekérdezzük, amint az elődje rendeződik, akkor is, ha egy
+újrapróbálás átveszi vagy újra importálja. A nem kapcsolódó rekord hibás lesz és kimarad a
+láncból, amelyet a doctor ekkor blokkoltként jelez.
 
-### Lánc beoltása és driverváltás
+### Lánc folytatása és driverváltás
 
 A láncot a kibocsátó NIF-je, a telepítés száma és a környezet azonosítja, így a teszt és az éles
-rekordok sosem kerülnek egy láncba. Egy másik implementáció által kezdett lánc folytatásához oltsd
-be a láncot azzal az utolsó rekorddal, amelyet az a szoftver rögzített; ennek `Huella`-ja
-megbízható bemenet, az ellenőrzés utána kezdődik:
+rekordok sosem kerülnek egy láncba. Egy másik implementáció által kezdett lánc folytatásához
+állítsd be a lánc kezdőpontját arra az utolsó rekordra, amelyet az a szoftver rögzített; ennek
+`Huella`-ja megbízható bemenet, az ellenőrzés utána kezdődik:
 
 ```bash
 php artisan einvoicing:verifactu-seed-chain B12345674 F-2026-0999 2026-12-31 "$HUELLA"   # annak a rekordnak a 64 karakteres Huella-ja
 ```
 
+A kezdőpont a `system.installation_number` alá kerül, az egyetlen telepítés alá, amelybe ez a
+rendszer ír; a `--installation` csak megerősíti ezt a számot, mást elutasít.
+
 Ha egy kibocsátót az AEAT és a B2Brouter driver között váltasz, új lánc indul egy másik számlázó
-rendszeren, ezért a `register()` és a doctor elutasít, amíg a másik drivernek nyitott lánca van. Az
-átállás kifejezett lépés: rendezd a régi lánc rekordjait, majd zárd le az
-`einvoicing:verifactu-close-chain --issuer=B12345674` paranccsal, amely elutasít, amíg bármelyik
-rekordja `generated`, `sending`, `unconfirmed` vagy `pending` állapotú.
+rendszeren, ezért a `register()` és a doctor elutasít, amíg a másik drivernek nyitott lánca van
+(AEAT-ra váltáskor akkor is, ha a kibocsátónak még láncba nem került B2Brouter-importjai vannak).
+Az átállás sorrendje: **kiürítés → váltás → lezárás**:
+
+1. **Kiürítés:** hagyd, hogy a régi lánc rekordjai rendeződjenek (`einvoicing:verifactu-submit`,
+   `einvoicing:verifactu-status --lookup`, B2Brouter-importokhoz `--retry-unconfirmed`).
+2. **Váltás:** állítsd át a kibocsátó `driver` beállítását.
+3. **Lezárás:** zárd le a régi láncot az `einvoicing:verifactu-close-chain --issuer=B12345674`
+   paranccsal, amely elutasít, amíg bármelyik rekordja `generated`, `sending`, `unconfirmed` vagy
+   `pending` állapotú.
+
+A B2Brouterre váltás után az AEAT-láncon maradt rekordokat a kibocsátó AEAT-hitelesítőadataival
+küldjük be és kérdezzük le, amíg azok be vannak állítva: tartsd meg őket, amíg a lánc ki nem ürül.
+Nélkülük annak a kibocsátónak a rekordjai visszatartva maradnak (`error_code`: `aeat_credentials`),
+az ugyanazon a throttle kulcson lévő többi kibocsátó pedig tovább küld; állítsd vissza a
+hitelesítőadatokat, és futtasd az `einvoicing:verifactu-submit` parancsot.
 
 ### Események
 
@@ -1142,7 +1182,7 @@ rekordja `generated`, `sending`, `unconfirmed` vagy `pending` állapotú.
 | `VerifactuRecordGenerated(record)` | egy rekord elkészült és sorba állt (AEAT driver) |
 | `VerifactuRecordAccepted(record, withErrors, errorCode)` | az AEAT elfogadta, esetleg hibákkal (*AceptadoConErrores*) |
 | `VerifactuRecordRejected(record, errorCode, errorMessage)` | az AEAT elutasította, vagy a B2Brouter tax report hibával zárult |
-| `VerifactuRecordUnconfirmed(record)` | a kimenetele az automatikus újraküldések vagy lekérdezések után is ismeretlen |
+| `VerifactuRecordUnconfirmed(record)` | a kimenetele az automatikus újraküldések vagy lekérdezések után is ismeretlen; azonnal, ha az AEAT az első küldésre duplikátummal válaszolt (lekérdezésre vár), és ha egy B2Brouter-lekérdezés váratlanul hibára futott. Az ismeretlen kimenetelű B2Brouter-import nem vált ki eseményt: a `register()` `OutcomeUnknown` kivételt dob, a sor `unconfirmed` marad |
 | `VerifactuRecordRegistered(record)` | B2Brouter mód: az AEAT regisztrálta a B2Brouter rekordját; a QR URL és a hash a soron van |
 | `VerifactuCrossCheckFailed(record, result)` | a B2Brouter rekordja az ismert eltéréseken túl is eltér a miénktől |
 | `VerifactuSubmissionBlocked(throttleKey, code, message)` | az AEAT egy teljes beküldést elutasított; a küldés az `einvoicing:verifactu-submit` parancsra vár |
@@ -1152,10 +1192,10 @@ rekordja `generated`, `sending`, `unconfirmed` vagy `pending` állapotú.
 | Parancs | Mire való |
 |---|---|
 | `einvoicing:verifactu-install-schemas [--from=DIR]` | letölti (vagy átmásolja) és ellenőrzi az AEAT sémákat |
-| `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | feloldja a blokkolt beküldést, és most elküldi az esedékes rekordokat; a `--retry-unconfirmed` újra felveszi azokat a rekordokat, amelyeket már nem küldünk vagy kérdezünk le automatikusan, a leállított worker után `sending` állapotban maradt sorokat is |
+| `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | feloldja a blokkolt beküldést, és beütemez egy beküldési futást az esedékes rekordokra (a futás betartja az AEAT várakozását); a `--retry-unconfirmed` újra felveszi azokat a rekordokat, amelyeket már nem küldünk vagy kérdezünk le automatikusan, a leállított worker után `sending` állapotban maradt sorokat is |
 | `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup]` | a tárolt állapot, CSV és hibák; a `--lookup` az AEAT-tól (vagy a B2Broutertől) kérdezi le a legutóbbi rekordot, sosem küld be, és az `unconfirmed` rekordot elfogadottnak jelöli, ha az AEAT ugyanazt a `Huella`-t tartja nyilván (CSV nélkül, mert azt az AEAT később nem adja vissza) |
 | `einvoicing:verifactu-verify-chain [--issuer=]` | újraszámol minden tárolt hasht és kapcsolatot, és minden láncfejet összevet az utolsó rekordjával; csak integritási hibánál bukik |
-| `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | lánc folytatása egy másik implementációtól |
+| `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | lánc folytatása egy másik implementációtól (a `--installation` csak a `system.installation_number` értékét erősíti meg) |
 | `einvoicing:verifactu-close-chain [--issuer=] [--driver=]` | lezárja annak a drivernek a láncait, amelyet a kibocsátó már nem használ |
 
 ### Doctor
@@ -1164,7 +1204,7 @@ Ha van beállított kibocsátó, az `einvoicing:doctor` `verifactu` sorokat ad h
 a telepített sémák és ellenőrzőösszegeik, a deklarált rendszer, a resolver által felsorolt összes
 kibocsátó, minden AEAT-tanúsítvány (tulajdonos, napok a lejáratig; a lejárt hiba), a CA-csomag FNMT
 gyökere (figyelmeztetés), a B2Brouter-kulcs a környezethez mérve (`test_` az élesen kívül), a
-táblák, a driverváltások, a láncfejek az utolsó rekordjukhoz mérve, a beoltott láncok, a
+táblák, a driverváltások, a láncfejek az utolsó rekordjukhoz mérve, a kezdőponttal indított láncok, a
 `stuck_after_minutes` után is elakadt rekordok, a blokkolt vagy visszatartott B2Brouter-láncok, a
 sikertelen keresztellenőrzések és a blokkolt beküldések. A `--live` egy TLS-kézfogást ad hozzá a
 beállított AEAT végponttal, beküldést soha; ezt te futtasd, a saját tanúsítványoddal.
@@ -1336,7 +1376,7 @@ fake módban is a beállított kulccsal ellenőrzi.
 | `einvoicing:ksef-deadlines` | felsorolja a még nem kézbesített offline KSeF-számlákat a határidejükkel, és kiváltja a `KsefOfflineDeadlineApproaching` eseményt; óránként ütemezd |
 | `einvoicing:poll-inbound [--transport=] [--include-capped]` | rögzíti a várakozó bejövő dokumentumokat és sorba állítja a feldolgozásukat; ütemezd. A `--include-capped` minden, az `inbound.max_fetch_attempts` keretet elhasznált dokumentumnak még egy kísérletet ad. A `--transport=ksef` a KSeF postafiókot olvassa, legfeljebb `einvoicing.ksef.inbound_min_interval_minutes` percenként egyszer |
 | `einvoicing:resolve ID (--sent=DOKUMENTUM-ID \| --resend) [--force]` | rendez egy `unconfirmed` küldést, vagy újra sorba állít egy dokumentumot |
-| `einvoicing:verifactu-*` | az AEAT sémák telepítése, beküldés, állapot és lekérdezés, a VERI\*FACTU láncok ellenőrzése, beoltása és lezárása; lásd: [Parancsok](#parancsok) |
+| `einvoicing:verifactu-*` | az AEAT sémák telepítése, beküldés, állapot és lekérdezés, a VERI\*FACTU láncok ellenőrzése, folytatása és lezárása; lásd: [Parancsok](#parancsok) |
 
 ## Mi van ellenőrizve
 

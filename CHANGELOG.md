@@ -26,7 +26,7 @@ Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-
   core's `VerifactuIssuerResolver`; `ConfigIssuerResolver` is the default and an application may
   bind its own.
 - **Spain:** one migration adds `einvoicing_verifactu_chains`, `einvoicing_verifactu_throttles`
-  and `einvoicing_verifactu_records`. `DatabaseChainStore` serialises the writes of a chain (issuer
+  and `einvoicing_verifactu_records`; its rollback refuses while records exist (legal retention). `DatabaseChainStore` serialises the writes of a chain (issuer
   NIF, installation number and environment) with a row lock and a compare-and-set on the head,
   proven with forked writers on SQLite, MySQL and PostgreSQL.
 - **Spain:** `SubmitVerifactuRecords` submits the due records to AEAT under its flow control, one
@@ -38,8 +38,13 @@ Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-
   polls its tax report, attaches B2Brouter's registered record to a B2Brouter chain in the order
   the records name, cross-checks it against our own engine (`strict` or `report`; the exemption
   article and the credit-note sign are known divergences) and fires `VerifactuRecordRegistered`.
-  An import whose outcome is unknown is looked up by number before it is imported again. While
-  every issuer uses B2Brouter, no `SistemaInformatico` needs to be declared.
+  An import whose outcome is unknown is looked up by number before it is imported again, and the
+  records naming it wait for it. `register()` refuses to import inside an open database
+  transaction, which a rollback would leave without its row. While every issuer uses B2Brouter, no
+  `SistemaInformatico` needs to be declared.
+- **Spain:** driver cut-over is drain → switch → close: the records left on the AEAT chain of an
+  issuer moved to B2Brouter are still sent with its AEAT credentials while they stay configured;
+  without them that issuer's records are held and the shared throttle key is not blocked.
 - **Spain:** events `VerifactuRecordGenerated`, `VerifactuRecordAccepted`,
   `VerifactuRecordRejected`, `VerifactuRecordUnconfirmed`, `VerifactuRecordRegistered`,
   `VerifactuCrossCheckFailed` and `VerifactuSubmissionBlocked`.

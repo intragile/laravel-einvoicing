@@ -291,7 +291,9 @@ return [
     | 1000) records per request, "initial_wait" seconds between sends until the
     | AEAT answers with its own wait, and "throttle_scope" ("installation" or
     | "issuer"). "cross_check" is "strict" or "report" for B2Brouter results;
-    | records not settled after "stuck_after_minutes" are reported as stuck.
+    | records not settled after "stuck_after_minutes" are reported as stuck
+    | (at least the submission job's timeout, "aeat.timeout" + 60 s, in minutes
+    | plus one).
     |
     */
 

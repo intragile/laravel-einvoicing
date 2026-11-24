@@ -866,6 +866,10 @@ For an offline install, download them elsewhere and pass `--from=DIR`, the folde
 schema files by name; the checksums are checked the same way. `register()`, `cancel()` and
 `correct()` refuse to run until the schemas are installed.
 
+Billing records must be kept (legal retention), so rolling back the VERI\*FACTU migration refuses
+while `einvoicing_verifactu_records` holds any row: export or move the records first and delete
+them deliberately.
+
 ### Configuration
 
 ```dotenv
@@ -903,7 +907,8 @@ or `foreign_id`), `aeat.port` (`personal` or `seal`, which picks the AEAT host),
 (30 s) and `aeat.connect_timeout` (10 s), `b2brouter.poll_attempts` (10) and
 `b2brouter.poll_delay` (30 s), `submission` (`queue`, `connection`, `max_batch` 1 to 1000,
 `initial_wait` 60 s, `throttle_scope`), `cross_check` (`strict` or `report`) and
-`stuck_after_minutes` (60). The `system` block has no defaults: the producer of the installation
+`stuck_after_minutes` (60; at least the submission job's timeout in minutes plus one, that is
+`aeat.timeout` + 60 s, so a running submission is never taken as stuck). The `system` block has no defaults: the producer of the installation
 declares itself. It is needed for the AEAT driver; while every issuer uses B2Brouter, which writes
 its own `SistemaInformatico`, it may stay empty.
 
@@ -1024,6 +1029,13 @@ EInvoicing::verifactu()->record($id);                      // the latest record 
 A record that AEAT rejects stays in the chain as generated; the chain is never rewritten. Fix the
 invoice and submit it again with `correct()`.
 
+**Transactions.** On the AEAT driver, `register()`, `cancel()` and `correct()` may run inside your
+database transaction: the job and the event follow the commit, and nothing is queued on a
+rollback. The chain row stays locked until that transaction commits, so other writers of the same
+chain wait for it; keep the transaction short. On the B2Brouter driver, `register()` refuses with
+a `LogicException` inside an open transaction: B2Brouter keeps an import even if your transaction
+rolls back, and the row that knows of it would be lost. Call it after the commit.
+
 ### Queue and AEAT flow control
 
 Records are sent by `SubmitVerifactuRecords` on `submission.connection` / `submission.queue`
@@ -1041,7 +1053,14 @@ they are resent with the same bytes after the `einvoicing.sending.backoff` delay
 whole (a non-transient SOAP `Client` fault or an authentication fault) registered nothing: its
 records keep their state, the throttle row is blocked and `VerifactuSubmissionBlocked` fires;
 `einvoicing:verifactu-submit` clears the block once the cause is fixed. The job's timeout is set,
-and the doctor checks it against `retry_after`.
+and the doctor checks it against `retry_after` (of `submission.connection` too, when it differs).
+
+A request carries at most one record per invoice and kind: a correction written before the first
+record of its invoice left waits for the next submission, so each record gets its own answer. A
+submission job killed between its claim and AEAT's answer (a worker crash, a deploy) leaves its
+records in `sending`; they are not resent automatically. After `stuck_after_minutes`, the doctor
+reports them and `einvoicing:verifactu-submit --retry-unconfirmed` resends them with the same
+bytes.
 
 ### B2Brouter mode
 
@@ -1056,7 +1075,9 @@ B2Brouter chain of its own, and fires `VerifactuRecordRegistered`. `registered_w
 *AceptadoConErrores*) is stored as `accepted_with_errors` and attached. `cancel()` and `correct()`
 are refused in this mode; manage cancellations in B2Brouter. An import whose outcome is unknown is
 looked up by number before it is ever imported again (`einvoicing:verifactu-submit
---retry-unconfirmed`).
+--retry-unconfirmed`, or `VerifactuManager::retryB2BrouterImport()`); when B2Brouter refuses that
+new import (a taken number, for instance), the row stays `unconfirmed` with the reason, since
+B2Brouter may hold the invoice after all.
 
 Every registered record is **cross-checked** against our own engine: the XML against the schema,
 the `Huella` recomputed from its text, its link to the previous stored record, a semantic
@@ -1070,8 +1091,9 @@ positive amounts, where AEAT expects the signed difference. Reading the QR image
 parameters.
 
 Records attach in the order the records themselves state: a record whose predecessor is still
-pending waits for it, and a record that does not link is failed and left out of the chain, which
-the doctor then reports as blocked.
+pending or unconfirmed (an import whose outcome is unknown) waits for it, and is polled again once
+that predecessor settles, including when a retry adopts or imports it again. A record that does
+not link is failed and left out of the chain, which the doctor then reports as blocked.
 
 ### Seeding a chain and switching drivers
 
@@ -1084,11 +1106,25 @@ it:
 php artisan einvoicing:verifactu-seed-chain B12345674 F-2026-0999 2026-12-31 "$HUELLA"   # the 64-character Huella of that record
 ```
 
+The chain is seeded under `system.installation_number`, the only installation this system writes
+to; `--installation` merely confirms that number and refuses any other.
+
 Switching an issuer between the AEAT and B2Brouter drivers starts a new chain on a different
 billing system, so `register()` and the doctor refuse while an open chain of the other driver
-exists. The cut-over is explicit: settle the old chain's records, then close it with
-`einvoicing:verifactu-close-chain --issuer=B12345674`, which refuses while any of its records is
-`generated`, `sending`, `unconfirmed` or `pending`.
+exists (moving to AEAT, also while B2Brouter imports of the issuer are not attached to a chain
+yet). The cut-over is **drain → switch → close**:
+
+1. **Drain** the old chain: let its records settle (`einvoicing:verifactu-submit`,
+   `einvoicing:verifactu-status --lookup`, `--retry-unconfirmed` for B2Brouter imports).
+2. **Switch** the issuer's `driver`.
+3. **Close** the old chain with `einvoicing:verifactu-close-chain --issuer=B12345674`, which refuses
+   while any of its records is `generated`, `sending`, `unconfirmed` or `pending`.
+
+Records still left on the AEAT chain after a switch to B2Brouter are sent and looked up with the
+issuer's AEAT credentials, as long as they stay configured: keep them until the chain has drained.
+Without them, that issuer's records are held (`error_code` `aeat_credentials`) and the other
+issuers on the same throttle key go on sending; restore the credentials and run
+`einvoicing:verifactu-submit`.
 
 ### Events
 
@@ -1097,7 +1133,7 @@ exists. The cut-over is explicit: settle the old chain's records, then close it 
 | `VerifactuRecordGenerated(record)` | a record was generated and queued (AEAT driver) |
 | `VerifactuRecordAccepted(record, withErrors, errorCode)` | AEAT accepted it, possibly with errors (*AceptadoConErrores*) |
 | `VerifactuRecordRejected(record, errorCode, errorMessage)` | AEAT rejected it, or the B2Brouter tax report failed |
-| `VerifactuRecordUnconfirmed(record)` | its outcome is unknown after the automatic resends or polls |
+| `VerifactuRecordUnconfirmed(record)` | its outcome is unknown after the automatic resends or polls; at once for a first send AEAT answered as a duplicate (held for a lookup) and for a B2Brouter poll that failed unexpectedly. A B2Brouter import whose outcome is unknown fires nothing: `register()` throws `OutcomeUnknown` and the row stays `unconfirmed` |
 | `VerifactuRecordRegistered(record)` | B2Brouter mode: AEAT registered B2Brouter's record; QR URL and hash are on the row |
 | `VerifactuCrossCheckFailed(record, result)` | B2Brouter's record differs from ours beyond the known divergences |
 | `VerifactuSubmissionBlocked(throttleKey, code, message)` | AEAT refused a whole submission; sending waits for `einvoicing:verifactu-submit` |
@@ -1107,10 +1143,10 @@ exists. The cut-over is explicit: settle the old chain's records, then close it 
 | Command | Purpose |
 |---|---|
 | `einvoicing:verifactu-install-schemas [--from=DIR]` | download (or copy) and check the AEAT schemas |
-| `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | clear a blocked submission and send the due records now; `--retry-unconfirmed` takes again the records no longer resent or polled automatically, including `sending` rows left by a killed worker |
+| `einvoicing:verifactu-submit [--issuer=] [--retry-unconfirmed]` | clear a blocked submission and schedule a submission run for the due records (the run applies the AEAT wait); `--retry-unconfirmed` takes again the records no longer resent or polled automatically, including `sending` rows left by a killed worker |
 | `einvoicing:verifactu-status NUMBER [--date=] [--issuer=] [--lookup]` | the stored state, CSV and errors; `--lookup` asks AEAT (or B2Brouter) about the latest record, never submits, and marks an `unconfirmed` record accepted when AEAT holds the same `Huella` (without a CSV, which AEAT cannot return later) |
 | `einvoicing:verifactu-verify-chain [--issuer=]` | recompute every stored hash and link, and compare each head with its last record; fails only on integrity breaks |
-| `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | continue a chain from another implementation |
+| `einvoicing:verifactu-seed-chain ISSUER NUMBER DATE HASH [--installation=]` | continue a chain from another implementation (`--installation` only confirms `system.installation_number`) |
 | `einvoicing:verifactu-close-chain [--issuer=] [--driver=]` | close the chains of the driver an issuer no longer uses |
 
 ### Doctor
