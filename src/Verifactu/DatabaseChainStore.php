@@ -121,7 +121,8 @@ final class DatabaseChainStore implements ChainStore
 
     /**
      * Attaches a record written by another service (B2Brouter) to its chain, filling the given
-     * pending row; no row is inserted and no throttle is touched.
+     * pending row; no row is inserted and no throttle is touched. A row that is attached already, or
+     * no longer pending (settled by another run), is refused.
      *
      * On an empty chain, a record that carries a RegistroAnterior first seeds the chain from that
      * link; a first record (PrimerRegistro) starts it. $xml is stored as given. $attributes are
@@ -129,7 +130,7 @@ final class DatabaseChainStore implements ChainStore
      *
      * @param  array<string, mixed>  $attributes
      *
-     * @throws ChainConflict when the record does not link to the head, the row is already attached,
+     * @throws ChainConflict when the record does not link to the head, the row is already attached or not pending,
      *                       or the chain is closed or an AEAT chain
      * @throws InvalidArgumentException when the stored row belongs to another invoice, environment or driver
      */
@@ -141,9 +142,9 @@ final class DatabaseChainStore implements ChainStore
         $this->db->transaction(function () use ($key, $record, $xml, $row, $attributes): void {
             [$chainId, $current, $head] = $this->openChain($key, IssuerDriver::B2Brouter, null);
 
-            $target = $this->records()->whereKey($row->id)->whereNull('chain_id')->lockForUpdate()->first();
+            $target = $this->records()->whereKey($row->id)->whereNull('chain_id')->where('state', VerifactuRecordState::Pending->value)->lockForUpdate()->first();
             if ($target === null) {
-                throw new ChainConflict(sprintf('The VERI*FACTU record row %d is already attached to a chain.', $row->id));
+                throw new ChainConflict(sprintf('The VERI*FACTU record row %d is already attached to a chain, or no longer pending.', $row->id));
             }
             self::assertRowIsFor($target, $record->invoiceId(), $key);
 

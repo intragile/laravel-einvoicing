@@ -54,6 +54,9 @@ final class FakeB2BrouterVerifactuApi implements ClientInterface
     /** @var list<string> bodies of the import requests */
     private array $imported = [];
 
+    /** Whether the invoice list claims more matches than one page holds, so a lookup cannot decide. */
+    private bool $undecidable = false;
+
     /**
      * A real client that sends through this fake, polling without waiting.
      */
@@ -113,6 +116,16 @@ final class FakeB2BrouterVerifactuApi implements ClientInterface
             'qr' => $qr ? self::qr($xml) : null,
             'errors' => $errors,
         ];
+
+        return $this;
+    }
+
+    /**
+     * Makes the invoice list answer no exact match with a total of 501, more than one page holds.
+     */
+    public function undecidableListing(): self
+    {
+        $this->undecidable = true;
 
         return $this;
     }
@@ -180,6 +193,9 @@ final class FakeB2BrouterVerifactuApi implements ClientInterface
                 : self::json(404, ['error' => ['code' => 'resource_missing', 'message' => 'Not found']]);
         }
         if ($path === '/accounts/'.self::ACCOUNT.'/invoices') {
+            if ($this->undecidable) {
+                return self::json(200, ['invoices' => [], 'meta' => ['total_count' => 501]]);
+            }
             parse_str($uri->getQuery(), $query);
             $number = is_string($query['number'] ?? null) ? $query['number'] : '';
             $listed = [];

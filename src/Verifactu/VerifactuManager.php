@@ -10,6 +10,8 @@ use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Carbon;
+use IntrAgile\EInvoicing\Exception\UnsafeXml;
+use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordGenerated;
@@ -43,6 +45,8 @@ use IntrAgile\EInvoicing\Syntax\Ubl\UblWriter;
 use IntrAgile\EInvoicing\Syntax\Verifactu\RecordWriter;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleKey;
 use IntrAgile\EInvoicing\Transport\Aeat\ThrottleScope;
+use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\B2BrouterVerifactu;
+use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\IssuedInvoice;
 use IntrAgile\EInvoicing\Transport\Exception\DocumentRejected;
 use IntrAgile\EInvoicing\Transport\Exception\OutcomeUnknown;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
@@ -66,6 +70,8 @@ use LogicException;
  * For an issuer on the B2Brouter driver, register() imports the invoice into B2Brouter, which
  * generates, chains and submits the record; PollVerifactuTaxReport attaches that record to its
  * B2Brouter chain once AEAT registered it. Cancellations and corrections are managed in B2Brouter.
+ * The installation number of a B2Brouter chain is the one B2Brouter writes, derived from the
+ * account id; chain rows, error messages and logs that name the chain carry it.
  *
  * The chain key and the throttle key come from the resolved issuer's environment, which must be
  * einvoicing.verifactu.environment. The chain key is always derived from the computer system the
@@ -489,16 +495,22 @@ final class VerifactuManager
      * Settles a B2Brouter record whose import ended without an answer (state unconfirmed, no
      * B2Brouter invoice id), without importing the invoice twice.
      *
-     * The invoice is looked up by its number first. When B2Brouter holds it, its ids are stored,
-     * the row becomes pending and its tax report is polled. When B2Brouter holds none, the stored
-     * source is imported once more. When the lookup cannot decide, the row stays unconfirmed with
-     * the reason in error_message and nothing is imported.
+     * The row is claimed first with a conditional update (its attempts move on by one), so two
+     * concurrent retries cannot both import: the one that loses the claim is refused. The invoice is
+     * then looked up by its number:
+     * - B2Brouter holds an invoice with the number: it is adopted only when the record of its
+     *   current tax report names the same IDFactura (issuer, number, issue date); its ids are
+     *   stored, the row becomes pending and its tax report is polled. Without a tax report yet, or
+     *   with another IDFactura, the row stays unconfirmed with the reason in error_message;
+     * - B2Brouter holds none: the stored source is imported once more;
+     * - the lookup cannot decide: the row stays unconfirmed with the reason, nothing is imported.
      *
-     * @throws InvalidArgumentException when the row is not an unconfirmed B2Brouter import
+     * @throws InvalidArgumentException when the row is not an unconfirmed B2Brouter import, or
+     *                                  another retry claimed it first
      * @throws ConfigurationException when no B2Brouter transport is configured
      * @throws OutcomeUnknown when the new import ended without an answer; the row stays unconfirmed
      * @throws DocumentRejected when B2Brouter refused the new import; the row is failed
-     * @throws TransportException when a request failed otherwise; the row is unchanged
+     * @throws TransportException when a request failed otherwise; the row stays unconfirmed
      */
     public function retryB2BrouterImport(VerifactuRecord $row): VerifactuRecord
     {
@@ -506,6 +518,18 @@ final class VerifactuManager
             throw new InvalidArgumentException(sprintf('The VERI*FACTU record row %d is not a B2Brouter import whose outcome is unknown.', $row->id));
         }
         $client = $this->clients()->b2brouter();
+
+        $claimed = VerifactuRecord::query()
+            ->whereKey($row->id)
+            ->where('state', VerifactuRecordState::Unconfirmed->value)
+            ->whereNull('b2brouter_invoice_id')
+            ->where('attempts', $row->attempts)
+            ->toBase()
+            ->update(['attempts' => $row->attempts + 1, 'updated_at' => Carbon::now()]);
+        if ($claimed !== 1) {
+            throw new InvalidArgumentException(sprintf('The VERI*FACTU record row %d was settled or claimed by another retry meanwhile.', $row->id));
+        }
+        $row->refresh();
 
         try {
             $issued = $client->findByNumber($row->number);
@@ -515,11 +539,18 @@ final class VerifactuManager
             return $row;
         }
 
-        if ($issued === null) {
+        if ($issued !== null) {
+            $mismatch = $this->importedMismatch($client, $issued, $row);
+            if ($mismatch !== null) {
+                $row->forceFill(['error_message' => $mismatch])->save();
+
+                return $row;
+            }
+        } else {
             try {
                 $issued = $client->issue((string) $row->source);
             } catch (OutcomeUnknown $exception) {
-                $row->forceFill(['error_message' => $exception->getMessage(), 'attempts' => $row->attempts + 1, 'submitted_at' => Carbon::now()])->save();
+                $row->forceFill(['error_message' => $exception->getMessage(), 'submitted_at' => Carbon::now()])->save();
 
                 throw $exception;
             } catch (DocumentRejected $exception) {
@@ -528,7 +559,7 @@ final class VerifactuManager
 
                 throw $exception;
             }
-            $row->forceFill(['attempts' => $row->attempts + 1, 'submitted_at' => Carbon::now()]);
+            $row->forceFill(['submitted_at' => Carbon::now()]);
         }
 
         $row->forceFill([
@@ -540,6 +571,46 @@ final class VerifactuManager
         PollVerifactuTaxReport::schedule($row->id);
 
         return $row;
+    }
+
+    /**
+     * Why the invoice B2Brouter holds under the row's number cannot be taken as the row's import,
+     * or null when the record of its current tax report names the row's IDFactura.
+     *
+     * @throws TransportException when B2Brouter refused the request
+     */
+    private function importedMismatch(B2BrouterVerifactu $client, IssuedInvoice $issued, VerifactuRecord $row): ?string
+    {
+        $reportId = $issued->latestTaxReportId();
+        if ($reportId === null) {
+            return sprintf(
+                'B2Brouter holds invoice %s with number %s, but lists no tax report for it yet, so its issuer and issue date cannot be checked. Retry later.',
+                $issued->invoiceId,
+                $row->number,
+            );
+        }
+
+        try {
+            $theirs = $client->taxReport($reportId)->record()->invoiceId();
+        } catch (UnexpectedResponse|UnsupportedDocument|UnsafeXml|InvalidRecord $exception) {
+            return sprintf('The tax report %s of B2Brouter invoice %s cannot be read, so the invoice cannot be checked: %s', $reportId, $issued->invoiceId, $exception->getMessage());
+        }
+
+        $ours = $row->invoiceId();
+        if ($theirs->equals($ours)) {
+            return null;
+        }
+
+        return sprintf(
+            'B2Brouter holds invoice %s with number %s, but its record names issuer %s, number %s, issue date %s instead of issuer %s, issue date %s; it is not adopted.',
+            $issued->invoiceId,
+            $row->number,
+            $theirs->issuer->value,
+            $theirs->number,
+            $theirs->dateText(),
+            $ours->issuer->value,
+            $ours->dateText(),
+        );
     }
 
     /**

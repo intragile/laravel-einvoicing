@@ -8,6 +8,7 @@ use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Exception\UnsafeXml;
 use IntrAgile\EInvoicing\Exception\UnsupportedDocument;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
@@ -22,6 +23,8 @@ use IntrAgile\EInvoicing\Laravel\Verifactu\SourceInvoice;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuClients;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuSettings;
+use IntrAgile\EInvoicing\Spain\Verifactu\BillingRecord;
+use IntrAgile\EInvoicing\Spain\Verifactu\ChainHead;
 use IntrAgile\EInvoicing\Spain\Verifactu\ChainKey;
 use IntrAgile\EInvoicing\Spain\Verifactu\Exception\ChainConflict;
 use IntrAgile\EInvoicing\Spain\Verifactu\Exception\InvalidRecord;
@@ -30,8 +33,10 @@ use IntrAgile\EInvoicing\Spain\Verifactu\RecordMapper;
 use IntrAgile\EInvoicing\Spain\Verifactu\RegistrationRecord;
 use IntrAgile\EInvoicing\Spain\Verifactu\VerifactuQr;
 use IntrAgile\EInvoicing\Spain\VerifactuEnvironment;
+use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\CheckStatus;
 use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\ChillerlanQrDecoder;
 use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\CrossCheckResult;
+use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\CrossCheckStep;
 use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\Difference;
 use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\TaxReport;
 use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\VerifactuCrossCheck;
@@ -39,6 +44,8 @@ use IntrAgile\EInvoicing\Transport\DeliveryState;
 use IntrAgile\EInvoicing\Transport\Exception\TransportException;
 use IntrAgile\EInvoicing\Validation\Spain\VerifactuSchemas;
 use InvalidArgumentException;
+use Throwable;
+use UnexpectedValueException;
 
 /**
  * Polls the B2Brouter tax report of one imported VERI*FACTU record until it is final, then settles
@@ -58,14 +65,29 @@ use InvalidArgumentException;
  *   previous report of the check is rebuilt from the stored predecessor in the chain, never read
  *   through B2Brouter's opaque previous_id.
  *
+ * Records attach in chain order. A registered record that does not link to the chain head (or
+ * would seed an empty chain) while an older B2Brouter record of the same issuer and environment is
+ * still pending waits: it stays pending with error_code awaiting_predecessor, without using up its
+ * polls, and is polled again once an older record settles (attached, rejected or failed). Only a
+ * record that still does not link when no older record is pending is failed and left out of the
+ * chain; the chain then stays blocked until an operator acts.
+ *
  * The record is registered (accepted_with_errors for registered_with_errors) and
  * VerifactuRecordRegistered fires, unless the cross-check fails in the strict mode: the record is
  * then failed, but stays attached, since AEAT holds it and the next record links to it. A failed
- * cross-check fires VerifactuCrossCheckFailed in either mode. A record that cannot be read, or
- * does not link to its chain, is failed without being attached.
+ * cross-check fires VerifactuCrossCheckFailed in either mode. An invoice source that cannot be read
+ * back counts as a failed cross-check.
+ *
+ * Every final write is conditional on the row still being pending and unattached, so a duplicate
+ * or concurrent run of the same record changes nothing and fires no event. A run that fails with
+ * an unexpected exception stores the reason and fires VerifactuRecordUnconfirmed; the record stays
+ * pending and is not polled again automatically.
  *
  * B2Brouter prints the production ValidarQR host, in its sandbox too, so the cross-check and the
- * stored QR URL use the production host; the chain key keeps the record's environment.
+ * stored QR URL use the production host; the chain key keeps the record's environment. The
+ * installation number of a B2Brouter chain is the one B2Brouter writes into its records, which
+ * B2Brouter derives from the account id: chain rows, error messages and logs that name the chain
+ * carry it.
  *
  * The job is never retried by the queue: every later poll is a new delayed job.
  */
@@ -77,6 +99,9 @@ final class PollVerifactuTaxReport implements ShouldQueue
 
     /** Seconds the worker may run the job. */
     public ?int $timeout = null;
+
+    /** The error_code of a record that waits for an older record of its chain. */
+    public const AWAITING_PREDECESSOR = 'awaiting_predecessor';
 
     /** The longest delay, in seconds, that Amazon SQS accepts for a message. */
     private const SQS_MAX_DELAY = 900;
@@ -123,6 +148,7 @@ final class PollVerifactuTaxReport implements ShouldQueue
         if ($row === null
             || $row->driver !== IssuerDriver::B2Brouter
             || $row->state !== VerifactuRecordState::Pending
+            || $row->chain_id !== null
             || $row->b2brouter_invoice_id === null) {
             return;
         }
@@ -132,16 +158,13 @@ final class PollVerifactuTaxReport implements ShouldQueue
             $schemas = $manager->schemas();
             $report = $clients->b2brouter()->awaitRegistered($row->b2brouter_invoice_id);
         } catch (TransportException|UnsupportedDocument|InvalidArgumentException|ConfigurationException $exception) {
-            $this->later($row, $manager, 'Polling the B2Brouter tax report failed: '.$exception->getMessage());
+            $this->later($row, $manager, null, 'Polling the B2Brouter tax report failed: '.$exception->getMessage());
 
             return;
         }
 
         if ($report === null || ! $report->isFinal()) {
-            if ($report !== null) {
-                $row->b2brouter_report_id = $report->id;
-            }
-            $this->later($row, $manager, $report === null
+            $this->later($row, $manager, $report?->id, $report === null
                 ? 'B2Brouter lists no tax report for the invoice yet.'
                 : sprintf('The B2Brouter tax report %s is %s.', $report->id, $report->state));
 
@@ -159,9 +182,26 @@ final class PollVerifactuTaxReport implements ShouldQueue
     }
 
     /**
+     * Called by the queue when a run ended with an exception: the reason is stored and
+     * VerifactuRecordUnconfirmed fires, unless the record was settled meanwhile. The record stays
+     * pending; it is polled again only on request.
+     */
+    public function failed(Throwable $exception): void
+    {
+        $row = VerifactuRecord::query()->find($this->recordId);
+        if ($row === null) {
+            return;
+        }
+        $message = self::cut(sprintf('Polling the B2Brouter tax report failed unexpectedly (%s): %s', $exception::class, $exception->getMessage()));
+        if (self::settle($row, ['error_message' => $message])) {
+            VerifactuRecordUnconfirmed::dispatch($row);
+        }
+    }
+
+    /**
      * Polls again after the configured delay, or gives up after the last run.
      */
-    private function later(VerifactuRecord $row, VerifactuManager $manager, string $reason): void
+    private function later(VerifactuRecord $row, VerifactuManager $manager, ?string $reportId, string $reason): void
     {
         try {
             $settings = $manager->settings();
@@ -170,18 +210,20 @@ final class PollVerifactuTaxReport implements ShouldQueue
             [$attempts, $delay] = [1, 0];
         }
 
+        $columns = $reportId === null ? [] : ['b2brouter_report_id' => $reportId];
         $runs = $this->attempt + 1;
         if ($runs < $attempts) {
-            $row->error_message = self::cut($reason);
-            $row->save();
-            self::schedule($row->id, $delay, $runs);
+            if (self::settle($row, [...$columns, 'error_code' => null, 'error_message' => self::cut($reason)])) {
+                self::schedule($row->id, $delay, $runs);
+            }
 
             return;
         }
 
-        $row->error_message = self::cut(sprintf('The registration is not known after %d polls of B2Brouter: %s Poll it again later.', $runs, $reason));
-        $row->save();
-        VerifactuRecordUnconfirmed::dispatch($row);
+        $message = self::cut(sprintf('The registration is not known after %d polls of B2Brouter: %s Poll it again later.', $runs, $reason));
+        if (self::settle($row, [...$columns, 'error_code' => null, 'error_message' => $message])) {
+            VerifactuRecordUnconfirmed::dispatch($row);
+        }
     }
 
     private function rejected(VerifactuRecord $row, TaxReport $report, ?string $errors): void
@@ -192,18 +234,23 @@ final class PollVerifactuTaxReport implements ShouldQueue
             $report->state,
             $errors === null ? '.' : ': '.$errors,
         ));
-        $row->forceFill([
-            'state' => VerifactuRecordState::Failed,
+        $code = self::cut($report->state, 32);
+        $settled = self::settle($row, [
+            'state' => VerifactuRecordState::Failed->value,
             'b2brouter_report_id' => $report->id,
-            'error_code' => self::cut($report->state, 32),
+            'error_code' => $code,
             'error_message' => $message,
-        ])->save();
+        ]);
+        if (! $settled) {
+            return;
+        }
 
-        VerifactuRecordRejected::dispatch($row, $row->error_code, $message);
+        VerifactuRecordRejected::dispatch($row, $code, $message);
+        self::wakeSuccessors($row);
     }
 
     /**
-     * Cross-checks the registered record and attaches it to its B2Brouter chain.
+     * Cross-checks the registered record and attaches it to its B2Brouter chain, in chain order.
      */
     private function registered(VerifactuRecord $row, TaxReport $report, VerifactuSettings $settings, VerifactuSchemas $schemas, VerifactuManager $manager): void
     {
@@ -218,16 +265,21 @@ final class PollVerifactuTaxReport implements ShouldQueue
             $record = $report->record();
         } catch (UnsupportedDocument|UnsafeXml|InvalidRecord $exception) {
             // The schema step reports why; nothing can be attached.
-            $result = $check->verify($report, null, SourceInvoice::of($row));
-            $this->failed($row, $report, $result, 'unreadable_record', 'The record of the B2Brouter tax report cannot be read: '.$exception->getMessage());
+            $this->failedUnattached($row, $report, $this->crossCheck($check, $report, null, $row), 'unreadable_record', 'The record of the B2Brouter tax report cannot be read: '.$exception->getMessage());
 
             return;
         }
 
         $store = $manager->store();
         $key = new ChainKey($record->invoiceId()->issuer, $record->system()->installationNumber, $row->environment);
-        $result = $check->verify($report, $this->previous($store, $key), SourceInvoice::of($row));
+        $head = $store->head($key);
+        if (! self::links($record, $head) && ($older = self::olderPending($row)) !== null) {
+            $this->await($row, $report, $older);
 
+            return;
+        }
+
+        $result = $this->crossCheck($check, $report, $this->previous($store, $key, $head), $row);
         $strictFailure = $result->failsIn($settings->crossCheck);
         $withErrors = $report->state === self::REGISTERED_WITH_ERRORS;
         $state = match (true) {
@@ -241,12 +293,16 @@ final class PollVerifactuTaxReport implements ShouldQueue
                 'state' => $state,
                 'qr_url' => $record instanceof RegistrationRecord ? VerifactuQr::url($record, VerifactuEnvironment::Production) : null,
                 'b2brouter_report_id' => $report->id,
-                'cross_check' => self::crossCheck($result),
+                'cross_check' => self::crossCheckColumn($result),
                 'error_code' => $strictFailure ? 'cross_check' : ($withErrors ? self::REGISTERED_WITH_ERRORS : null),
                 'error_message' => $strictFailure ? self::failureText($result) : null,
             ]);
         } catch (ChainConflict|InvalidArgumentException $exception) {
-            $this->failed($row, $report, $result, 'chain_conflict', 'The record of the B2Brouter tax report cannot join its chain: '.$exception->getMessage());
+            if (! self::isOpen($row)) {
+                // Another run attached or settled the record meanwhile.
+                return;
+            }
+            $this->failedUnattached($row, $report, $result, 'chain_conflict', 'The record of the B2Brouter tax report cannot join its chain: '.$exception->getMessage());
 
             return;
         }
@@ -257,49 +313,169 @@ final class PollVerifactuTaxReport implements ShouldQueue
         if (! $result->passed()) {
             VerifactuCrossCheckFailed::dispatch($row, $result);
         }
+        self::wakeSuccessors($row);
+    }
+
+    /**
+     * Parks a registered record behind an older pending record of its issuer: it stays pending and
+     * keeps its polls until an older record settles. When none is pending any more by the time the
+     * mark is written, the record is polled again at once.
+     */
+    private function await(VerifactuRecord $row, TaxReport $report, VerifactuRecord $older): void
+    {
+        $parked = self::settle($row, [
+            'b2brouter_report_id' => $report->id,
+            'error_code' => self::AWAITING_PREDECESSOR,
+            'error_message' => sprintf(
+                'B2Brouter registered the record, but it does not link to the chain head yet: it waits for the older B2Brouter record row %d to settle.',
+                $older->id,
+            ),
+        ]);
+        if ($parked && self::olderPending($row) === null) {
+            self::schedule($row->id, 0, $this->attempt);
+        }
     }
 
     /**
      * Fails a delivered record that cannot be attached to its chain.
      */
-    private function failed(VerifactuRecord $row, TaxReport $report, CrossCheckResult $result, string $code, string $message): void
+    private function failedUnattached(VerifactuRecord $row, TaxReport $report, CrossCheckResult $result, string $code, string $message): void
     {
-        $row->forceFill([
-            'state' => VerifactuRecordState::Failed,
+        $settled = self::settle($row, [
+            'state' => VerifactuRecordState::Failed->value,
             'b2brouter_report_id' => $report->id,
-            'cross_check' => [...self::crossCheck($result), 'passed' => false, 'error' => $message],
+            'cross_check' => json_encode([...self::crossCheckColumn($result), 'passed' => false, 'error' => $message], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
             'error_code' => $code,
             'error_message' => self::cut($message),
-        ])->save();
+        ]);
+        if (! $settled) {
+            return;
+        }
 
         VerifactuCrossCheckFailed::dispatch($row, $result);
+        self::wakeSuccessors($row);
+    }
+
+    /**
+     * The cross-check result, or a failed semantics step when the invoice source of the row
+     * cannot be read back.
+     */
+    private function crossCheck(VerifactuCrossCheck $check, TaxReport $report, ?TaxReport $previous, VerifactuRecord $row): CrossCheckResult
+    {
+        try {
+            $invoice = SourceInvoice::of($row);
+        } catch (UnsupportedDocument|UnsafeXml|UnexpectedValueException $exception) {
+            $message = 'The invoice the record was imported from cannot be read back: '.$exception->getMessage();
+
+            return new CrossCheckResult(
+                $report->id,
+                [CrossCheckStep::Semantics->value => CheckStatus::Failed],
+                [new Difference(CrossCheckStep::Semantics, CheckStatus::Failed, 'invoice', '', '', $message)],
+                [],
+            );
+        }
+
+        return $check->verify($report, $previous, $invoice);
     }
 
     /**
      * The stored head record of the chain as a tax report, or null when the chain has no record
      * yet (or only a seed).
      */
-    private function previous(DatabaseChainStore $store, ChainKey $key): ?TaxReport
+    private function previous(DatabaseChainStore $store, ChainKey $key, ?ChainHead $head): ?TaxReport
     {
-        $chain = $store->chain($key);
-        if ($chain === null || $chain->sequence < 1) {
+        if ($head === null || $head->sequence < 1) {
             return null;
         }
-        $head = VerifactuRecord::query()
+        $chain = $store->chain($key);
+        $stored = $chain === null ? null : VerifactuRecord::query()
             ->where('chain_id', $chain->id)
-            ->where('sequence', $chain->sequence)
+            ->where('sequence', $head->sequence)
             ->first();
-        if ($head === null || $head->xml === null) {
+        if ($stored === null || $stored->xml === null) {
             return null;
         }
 
-        return new TaxReport((string) $head->b2brouter_report_id, 'registered', $head->hash, null, null, $head->xml, []);
+        return new TaxReport((string) $stored->b2brouter_report_id, 'registered', $stored->hash, null, null, $stored->xml, []);
+    }
+
+    /** Whether the record links to the head: the first record of an empty chain, or the head's successor. */
+    private static function links(BillingRecord $record, ?ChainHead $head): bool
+    {
+        return $head === null ? $record->chainLink()->isFirst() : $head->isLinkedBy($record);
+    }
+
+    /** The oldest B2Brouter record of the row's issuer and environment imported before it and still pending. */
+    private static function olderPending(VerifactuRecord $row): ?VerifactuRecord
+    {
+        return VerifactuRecord::query()
+            ->where('issuer_nif', $row->issuer_nif)
+            ->where('environment', $row->environment->value)
+            ->where('driver', IssuerDriver::B2Brouter->value)
+            ->where('state', VerifactuRecordState::Pending->value)
+            ->whereNull('chain_id')
+            ->where('id', '<', $row->id)
+            ->orderBy('id')
+            ->first();
+    }
+
+    /**
+     * Polls again the records of the row's issuer and environment that wait for an older record.
+     */
+    private static function wakeSuccessors(VerifactuRecord $row): void
+    {
+        $waiting = VerifactuRecord::query()
+            ->where('issuer_nif', $row->issuer_nif)
+            ->where('environment', $row->environment->value)
+            ->where('driver', IssuerDriver::B2Brouter->value)
+            ->where('state', VerifactuRecordState::Pending->value)
+            ->whereNull('chain_id')
+            ->where('error_code', self::AWAITING_PREDECESSOR)
+            ->where('id', '>', $row->id)
+            ->orderBy('id')
+            ->get();
+
+        foreach ($waiting as $successor) {
+            self::schedule($successor->id);
+        }
+    }
+
+    /** Whether the row is still pending and unattached in the database. */
+    private static function isOpen(VerifactuRecord $row): bool
+    {
+        return VerifactuRecord::query()
+            ->whereKey($row->id)
+            ->where('state', VerifactuRecordState::Pending->value)
+            ->whereNull('chain_id')
+            ->exists();
+    }
+
+    /**
+     * Writes the columns only while the row is still pending and unattached, then reloads it.
+     *
+     * @param  array<string, mixed>  $columns  raw column values
+     * @return bool whether this run wrote them
+     */
+    private static function settle(VerifactuRecord $row, array $columns): bool
+    {
+        $written = VerifactuRecord::query()
+            ->whereKey($row->id)
+            ->where('state', VerifactuRecordState::Pending->value)
+            ->whereNull('chain_id')
+            ->toBase()
+            ->update([...$columns, 'updated_at' => Carbon::now()]);
+        if ($written !== 1) {
+            return false;
+        }
+        $row->refresh();
+
+        return true;
     }
 
     /**
      * @return array{passed: bool, summary: string, failures: list<array<string, string>>, known_divergences: list<array<string, string>>}
      */
-    private static function crossCheck(CrossCheckResult $result): array
+    private static function crossCheckColumn(CrossCheckResult $result): array
     {
         return [
             'passed' => $result->passed(),

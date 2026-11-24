@@ -11,6 +11,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
+use IntrAgile\EInvoicing\CodeList\CountryCode;
 use IntrAgile\EInvoicing\CodeList\VatCategory;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
@@ -33,21 +34,37 @@ use IntrAgile\EInvoicing\Laravel\Verifactu\SourceInvoice;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
 use IntrAgile\EInvoicing\Model\Invoice;
 use IntrAgile\EInvoicing\Spain\BreakdownOverride;
+use IntrAgile\EInvoicing\Spain\CorrectionType;
+use IntrAgile\EInvoicing\Spain\EuroAmounts;
 use IntrAgile\EInvoicing\Spain\ExemptOperation;
+use IntrAgile\EInvoicing\Spain\ForeignIdType;
+use IntrAgile\EInvoicing\Spain\InvoiceType;
+use IntrAgile\EInvoicing\Spain\IssuedBy;
 use IntrAgile\EInvoicing\Spain\Nif;
+use IntrAgile\EInvoicing\Spain\OperationQualification;
+use IntrAgile\EInvoicing\Spain\RegimeKey;
 use IntrAgile\EInvoicing\Spain\SpanishInvoice;
 use IntrAgile\EInvoicing\Spain\Verifactu\AltaOperation;
+use IntrAgile\EInvoicing\Spain\Verifactu\Amount;
 use IntrAgile\EInvoicing\Spain\Verifactu\AnulacionOperation;
+use IntrAgile\EInvoicing\Spain\Verifactu\CorrectionAmounts;
+use IntrAgile\EInvoicing\Spain\Verifactu\ForeignId;
 use IntrAgile\EInvoicing\Spain\Verifactu\InvoiceId;
 use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
+use IntrAgile\EInvoicing\Spain\Verifactu\RecordMapper;
+use IntrAgile\EInvoicing\Spain\Verifactu\TaxParty;
+use IntrAgile\EInvoicing\Spain\Verifactu\TaxRate;
 use IntrAgile\EInvoicing\Spain\VerifactuEnvironment;
 use IntrAgile\EInvoicing\Syntax\Ubl\UblReader;
+use IntrAgile\EInvoicing\Syntax\Ubl\UblWriter;
 use IntrAgile\EInvoicing\Transport\B2Brouter\Spain\B2BrouterVerifactu;
 use IntrAgile\EInvoicing\Transport\Exception\DocumentRejected;
 use IntrAgile\EInvoicing\Transport\Exception\OutcomeUnknown;
 use InvalidArgumentException;
 use LogicException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
+use RuntimeException;
 use Throwable;
 use UnexpectedValueException;
 
@@ -187,8 +204,9 @@ final class VerifactuB2BrouterTest extends TestCase
         $this->api->onImport(new Response(503));
         $this->catch(fn () => $this->manager()->register(SpanishInvoices::domestic()));
         $row = VerifactuRecord::query()->sole();
-        // B2Brouter had imported it after all.
-        $this->api->invoice('24433033', SpanishInvoices::NUMBER, '1064493');
+        // B2Brouter had imported it after all; its tax report names this invoice.
+        $this->api->invoice('24433033', SpanishInvoices::NUMBER, '1064493')
+            ->report('1064493', VerifactuSamples::b2brouterFixture('record-1064493.xml'), ['signed']);
 
         $retried = $this->manager()->retryB2BrouterImport($row);
 
@@ -472,22 +490,329 @@ final class VerifactuB2BrouterTest extends TestCase
         $this->assertSame([], $this->api->requests());
     }
 
-    public function test_stored_extension_holding_another_class_is_refused(): void
+    public function test_stored_extension_is_explicit_json_and_refuses_anything_else(): void
     {
         Queue::fake();
         $this->api->invoice('24433050', 'PROBE-ES-UBL-E-0003', '1064500')->onImport('24433050');
         $row = $this->manager()->register($this->exemptProbe(ExemptOperation::E6));
         $this->assertNotNull($row->source_extension);
+        $stored = json_decode($row->source_extension, true, 32, JSON_THROW_ON_ERROR);
+        $this->assertIsArray($stored);
+        $this->assertSame(1, $stored['version']);
+        $this->assertSame('E6', $stored['breakdown']['E|-']['exemption']);
+        $this->assertSame('Initial', $stored['operation']);
         $this->assertSame([ExemptOperation::E6], array_map(
             static fn (BreakdownOverride $override): ?ExemptOperation => $override->exemption,
             array_values(SourceInvoice::of($row)->extensions()->get(SpanishInvoice::class)->breakdown ?? []),
         ));
 
-        $row->source_extension = serialize(new ArrayObject([1]));
-        $exception = $this->catch(static fn () => SourceInvoice::of($row));
+        foreach ([
+            serialize(new ArrayObject([1])) => 'Syntax error',
+            '{"version":2}' => 'version',
+            '{"version":1,"type":"Z9"}' => 'Z9',
+            '{"version":1,"operation":"Sideways"}' => 'Sideways',
+            '{"version":1,"breakdown":{"E|-":{"exemption":"E1","qualification":"S1"}}}' => 'either',
+        ] as $tampered => $needle) {
+            $row->source_extension = $tampered;
+            $exception = $this->catch(static fn () => SourceInvoice::of($row));
+            $this->assertInstanceOf(UnexpectedValueException::class, $exception, $tampered);
+            $this->assertStringContainsString($needle, $exception->getMessage(), $tampered);
+        }
+    }
 
-        $this->assertInstanceOf(UnexpectedValueException::class, $exception);
-        $this->assertStringContainsString('ArrayObject', $exception->getMessage());
+    /**
+     * @return iterable<string, array{Invoice}>
+     */
+    public static function invoicesWithExtensions(): iterable
+    {
+        yield 'exempt' => [SpanishInvoices::exempt(ExemptOperation::E1)];
+        yield 'R1 credit note' => [SpanishInvoices::creditNote()];
+        yield 'export' => [SpanishInvoices::export()];
+        yield 'every field' => [SpanishInvoices::domestic()->withExtension(new SpanishInvoice(
+            type: InvoiceType::R1,
+            correctionType: CorrectionType::Substitution,
+            correctionAmounts: new CorrectionAmounts(Amount::of('100.00'), Amount::of('21.00'), Amount::of('5.20')),
+            substituted: [new InvoiceId(Nif::parse(self::ISSUER), 'OLD-1', new DateTimeImmutable('2026-10-01'))],
+            description: 'Sustitución de la factura OLD-1',
+            simplifiedArt7273: false,
+            withoutRecipientArt61d: false,
+            issuedBy: IssuedBy::ThirdParty,
+            thirdParty: new TaxParty('Tercero S.L.', Nif::parse('A39200019'), null),
+            recipients: [new TaxParty('Buyer Inc.', null, new ForeignId(ForeignIdType::OfficialDocument, '123456789', CountryCode::US))],
+            coupon: true,
+            breakdown: ['S|21' => new BreakdownOverride(regime: RegimeKey::Key01, qualification: OperationQualification::S1, costBase: Amount::of('80.00'), equivalenceRate: TaxRate::of('5.2'), equivalenceQuota: Amount::of('5.20'))],
+            euroAmounts: new EuroAmounts(Amount::of('21.00'), Amount::of('121.00'), ['S|21' => ['base' => Amount::of('100.00'), 'quota' => Amount::of('21.00')]]),
+            externalReference: 'ext-1',
+            agreementNumber: 'agr-2',
+            systemAgreementId: 'sys-3',
+            operation: AltaOperation::CorrectionAfterRejection,
+        ))];
+    }
+
+    #[DataProvider('invoicesWithExtensions')]
+    public function test_extension_round_trips_through_json(Invoice $invoice): void
+    {
+        $original = $invoice->extensions()->get(SpanishInvoice::class);
+        $this->assertInstanceOf(SpanishInvoice::class, $original);
+
+        $stored = SourceInvoice::extensionOf($invoice);
+        $this->assertNotNull($stored);
+        $data = json_decode($stored, true, 32, JSON_THROW_ON_ERROR);
+        $this->assertIsArray($data);
+
+        $this->assertEquals($original, SourceInvoice::fromArray($data));
+    }
+
+    public function test_extension_keeps_the_mapping_of_the_source(): void
+    {
+        foreach ([SpanishInvoices::exempt(ExemptOperation::E1), SpanishInvoices::creditNote(), SpanishInvoices::export()] as $invoice) {
+            $row = new VerifactuRecord;
+            $row->forceFill(['source' => (new UblWriter)->write($invoice), 'source_extension' => SourceInvoice::extensionOf($invoice)]);
+
+            $this->assertEquals((new RecordMapper)->map($invoice), (new RecordMapper)->map(SourceInvoice::of($row)), $invoice->number);
+        }
+    }
+
+    public function test_out_of_order_polls_attach_in_chain_order(): void
+    {
+        Queue::fake();
+        Event::fake([VerifactuRecordRegistered::class, VerifactuCrossCheckFailed::class]);
+        $a = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+
+        // B is final first, but its predecessor A is still pending: B waits, the chain is not seeded.
+        $this->runPoll($b->id);
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Pending, $b->state);
+        $this->assertNull($b->chain_id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->error_code);
+        $this->assertStringContainsString((string) $a->id, (string) $b->error_message);
+        $this->assertSame(0, VerifactuChain::query()->count());
+        // Only the poll register() queued; waiting schedules nothing.
+        $pollsOfB = static fn (): int => Queue::pushed(PollVerifactuTaxReport::class, static fn (PollVerifactuTaxReport $job): bool => $job->recordId === $b->id)->count();
+        $this->assertSame(1, $pollsOfB());
+
+        // A attaches and wakes B.
+        $this->runPoll($a->id);
+        $this->assertSame(1, $a->refresh()->sequence);
+        $this->assertSame(2, $pollsOfB());
+
+        $this->runPoll($b->id);
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $b->state, (string) json_encode($b->cross_check));
+        $this->assertSame(2, $b->sequence);
+        $this->assertNull($b->error_code);
+        $this->assertSame($a->chain_id, $b->chain_id);
+        $chain = VerifactuChain::query()->sole();
+        $this->assertFalse($chain->seeded);
+        $this->assertSame(self::HUELLA_1064493, $chain->head_hash);
+        Event::assertNotDispatched(VerifactuCrossCheckFailed::class);
+    }
+
+    public function test_mid_chain_record_waits_for_its_predecessor(): void
+    {
+        $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        Queue::fake();
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+        $c = $this->import($this->exemptProbe(ExemptOperation::E6), '24433050', '1064500', 'record-1064500.xml');
+
+        $this->runPoll($c->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $c->refresh()->error_code);
+        $this->assertNull($c->chain_id);
+
+        $this->runPoll($b->id);
+        $this->assertSame(2, $b->refresh()->sequence);
+        Queue::assertPushed(PollVerifactuTaxReport::class, static fn (PollVerifactuTaxReport $job): bool => $job->recordId === $c->id);
+
+        $this->runPoll($c->id);
+        $c->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $c->state, (string) json_encode($c->cross_check));
+        $this->assertSame(3, $c->sequence);
+    }
+
+    public function test_successor_of_a_rejected_first_record_then_seeds_the_chain(): void
+    {
+        Queue::fake();
+        $a = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml', ['error']);
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml');
+
+        $this->runPoll($b->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $b->refresh()->error_code);
+
+        $this->runPoll($a->id);
+        $this->assertSame(VerifactuRecordState::Failed, $a->refresh()->state);
+        Queue::assertPushed(PollVerifactuTaxReport::class, static fn (PollVerifactuTaxReport $job): bool => $job->recordId === $b->id);
+
+        // No older record is pending any more: B starts the chain from its own link.
+        $this->runPoll($b->id);
+        $b->refresh();
+        $this->assertSame(VerifactuRecordState::Registered, $b->state, (string) json_encode($b->cross_check));
+        $this->assertSame(1, $b->sequence);
+        $this->assertTrue(VerifactuChain::query()->sole()->seeded);
+    }
+
+    public function test_successor_of_a_rejected_record_mid_chain_then_fails(): void
+    {
+        Event::fake([VerifactuCrossCheckFailed::class]);
+        $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        Queue::fake();
+        $b = $this->import($this->ubl2Invoice(), '24433033', '1064493', 'record-1064493.xml', ['error']);
+        $c = $this->import($this->exemptProbe(ExemptOperation::E6), '24433050', '1064500', 'record-1064500.xml');
+
+        $this->runPoll($c->id);
+        $this->assertSame(PollVerifactuTaxReport::AWAITING_PREDECESSOR, $c->refresh()->error_code);
+        $this->runPoll($b->id);
+        $this->assertSame(VerifactuRecordState::Failed, $b->refresh()->state);
+
+        // C links to B, which AEAT never registered: it cannot join the chain.
+        $this->runPoll($c->id);
+        $c->refresh();
+        $this->assertSame(VerifactuRecordState::Failed, $c->state);
+        $this->assertSame('chain_conflict', $c->error_code);
+        $this->assertNull($c->chain_id);
+        $this->assertSame(1, VerifactuChain::query()->sole()->sequence);
+        Event::assertDispatched(VerifactuCrossCheckFailed::class, static fn (VerifactuCrossCheckFailed $event): bool => $event->record->id === $c->id);
+    }
+
+    public function test_second_run_after_attach_changes_nothing(): void
+    {
+        Event::fake([VerifactuRecordRegistered::class, VerifactuCrossCheckFailed::class]);
+        $row = $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        $before = $row->getAttributes();
+
+        $this->runPoll($row->id);
+
+        $this->assertSame($before, $row->refresh()->getAttributes());
+        Event::assertDispatchedTimes(VerifactuRecordRegistered::class, 1);
+        Event::assertNotDispatched(VerifactuCrossCheckFailed::class);
+    }
+
+    public function test_stale_pending_run_changes_nothing(): void
+    {
+        Event::fake([VerifactuRecordRegistered::class, VerifactuCrossCheckFailed::class, VerifactuRecordRejected::class]);
+        $row = $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        $before = $row->getAttributes();
+        $this->staleOnce($row->id);
+
+        // A concurrent run that read the row while it was still pending.
+        $this->runPoll($row->id);
+
+        $this->assertSame($before, $row->refresh()->getAttributes());
+        $this->assertSame(1, VerifactuChain::query()->sole()->sequence);
+        Event::assertDispatchedTimes(VerifactuRecordRegistered::class, 1);
+        Event::assertNotDispatched(VerifactuCrossCheckFailed::class);
+        Event::assertNotDispatched(VerifactuRecordRejected::class);
+    }
+
+    public function test_stale_run_after_rejection_fires_no_second_event(): void
+    {
+        Event::fake([VerifactuRecordRejected::class]);
+        $row = $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml', ['error']);
+        $before = $row->getAttributes();
+        $this->staleOnce($row->id);
+
+        $this->runPoll($row->id);
+
+        $this->assertSame($before, $row->refresh()->getAttributes());
+        Event::assertDispatchedTimes(VerifactuRecordRejected::class, 1);
+    }
+
+    public function test_failed_run_stores_the_reason_and_fires_unconfirmed(): void
+    {
+        Event::fake([VerifactuRecordUnconfirmed::class]);
+        Queue::fake();
+        $row = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+
+        (new PollVerifactuTaxReport($row->id))->failed(new RuntimeException('worker lost'));
+
+        $row->refresh();
+        $this->assertSame(VerifactuRecordState::Pending, $row->state);
+        $this->assertStringContainsString('worker lost', (string) $row->error_message);
+        $this->assertStringContainsString('RuntimeException', (string) $row->error_message);
+        Event::assertDispatchedTimes(VerifactuRecordUnconfirmed::class, 1);
+        Queue::assertNotPushed(PollVerifactuTaxReport::class, static fn (PollVerifactuTaxReport $job): bool => $job->attempt > 0);
+
+        // A settled record is left alone.
+        $this->runPoll($row->id);
+        $settled = $row->refresh()->getAttributes();
+        (new PollVerifactuTaxReport($row->id))->failed(new RuntimeException('late'));
+        $this->assertSame($settled, $row->refresh()->getAttributes());
+        Event::assertDispatchedTimes(VerifactuRecordUnconfirmed::class, 1);
+    }
+
+    public function test_unreadable_source_extension_fails_the_cross_check_but_attaches(): void
+    {
+        Event::fake([VerifactuCrossCheckFailed::class, VerifactuRecordRegistered::class]);
+        Queue::fake();
+        $row = $this->import(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+        VerifactuRecord::query()->whereKey($row->id)->update(['source_extension' => '{"version":99}']);
+
+        $this->runPoll($row->id);
+
+        $row->refresh();
+        $this->assertSame(VerifactuRecordState::Failed, $row->state);
+        $this->assertSame('cross_check', $row->error_code);
+        $this->assertSame(1, $row->sequence);
+        $this->assertIsArray($row->cross_check);
+        $this->assertSame('invoice', $row->cross_check['failures'][0]['field']);
+        $this->assertStringContainsString('cannot be read back', $row->cross_check['failures'][0]['message']);
+        Event::assertDispatched(VerifactuCrossCheckFailed::class);
+        Event::assertNotDispatched(VerifactuRecordRegistered::class);
+    }
+
+    public function test_retry_when_lookup_cannot_decide_stays_unconfirmed(): void
+    {
+        Queue::fake();
+        $this->api->onImport(new Response(503));
+        $this->catch(fn () => $this->manager()->register(SpanishInvoices::domestic()));
+        $row = VerifactuRecord::query()->sole();
+        $this->api->undecidableListing();
+
+        $retried = $this->manager()->retryB2BrouterImport($row);
+
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $retried->state);
+        $this->assertNull($retried->b2brouter_invoice_id);
+        $this->assertStringContainsString('cannot decide', (string) $retried->error_message);
+        $this->assertCount(1, $this->api->imported());
+        $this->assertCount(1, $this->api->requests('POST '));
+        Queue::assertNotPushed(PollVerifactuTaxReport::class);
+    }
+
+    public function test_retry_does_not_adopt_an_invoice_of_another_idfactura(): void
+    {
+        Queue::fake();
+        $this->api->onImport(new Response(503));
+        $this->catch(fn () => $this->manager()->register(SpanishInvoices::domestic()));
+        $row = VerifactuRecord::query()->sole();
+        // An invoice with the number exists, but its record is of another invoice.
+        $this->api->invoice('24433099', SpanishInvoices::NUMBER, '1064490')
+            ->report('1064490', VerifactuSamples::b2brouterFixture('record-1064490.xml'));
+
+        $retried = $this->manager()->retryB2BrouterImport($row);
+
+        $this->assertSame(VerifactuRecordState::Unconfirmed, $retried->state);
+        $this->assertNull($retried->b2brouter_invoice_id);
+        $this->assertStringContainsString('not adopted', (string) $retried->error_message);
+        $this->assertCount(1, $this->api->imported());
+        Queue::assertNotPushed(PollVerifactuTaxReport::class);
+    }
+
+    public function test_concurrent_retries_import_once(): void
+    {
+        Queue::fake();
+        $this->api->onImport(new Response(503));
+        $this->catch(fn () => $this->manager()->register(SpanishInvoices::domestic()));
+        $first = VerifactuRecord::query()->sole();
+        $second = VerifactuRecord::query()->sole();
+        $this->api->importable('24433040', SpanishInvoices::NUMBER, '1064493')->onImport('24433040');
+
+        $this->manager()->retryB2BrouterImport($first);
+        $exception = $this->catch(fn () => $this->manager()->retryB2BrouterImport($second));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertCount(2, $this->api->imported());
+        $this->assertSame('24433040', $first->refresh()->b2brouter_invoice_id);
+        $this->assertSame(VerifactuRecordState::Pending, $first->state);
     }
 
     public function test_rows_events_and_jobs_carry_no_secret(): void
@@ -542,6 +867,33 @@ final class VerifactuB2BrouterTest extends TestCase
         }
 
         return $row->refresh();
+    }
+
+    /**
+     * Imports the invoice through register() with its B2Brouter invoice and report prepared, and
+     * returns the pending row. The queue must be faked.
+     *
+     * @param  list<string>  $states
+     */
+    private function import(Invoice $invoice, string $invoiceId, string $reportId, string $fixture, array $states = ['registered']): VerifactuRecord
+    {
+        $this->api->invoice($invoiceId, $invoice->number, $reportId)
+            ->report($reportId, VerifactuSamples::b2brouterFixture($fixture), $states)
+            ->onImport($invoiceId);
+
+        return $this->manager()->register($invoice);
+    }
+
+    /** Makes the next read of the row see it as still pending and unattached, as a concurrent run would. */
+    private function staleOnce(int $id): void
+    {
+        $stale = true;
+        VerifactuRecord::retrieved(static function (VerifactuRecord $model) use (&$stale, $id): void {
+            if ($stale && $model->id === $id) {
+                $stale = false;
+                $model->setRawAttributes(['state' => VerifactuRecordState::Pending->value, 'chain_id' => null, 'sequence' => null] + $model->getAttributes(), true);
+            }
+        });
     }
 
     private function runPoll(int $recordId, int $attempt = 0): void
