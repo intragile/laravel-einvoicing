@@ -172,6 +172,21 @@ final class DoctorVerifactuTest extends TestCase
         $this->assertStringContainsString('php artisan einvoicing:verifactu-install-schemas', $schemas[2]);
     }
 
+    public function test_system_is_not_needed_when_every_issuer_uses_b2brouter(): void
+    {
+        $this->configureComplete(schemas: false);
+        config()->set('einvoicing.verifactu.system.name', null);
+        config()->set('einvoicing.verifactu.issuers.'.self::ISSUER.'.driver', 'b2brouter');
+
+        $rows = $this->doctorRows();
+
+        $this->assertRowIn($rows, 'verifactu: system', 'info', 'B2Brouter');
+        $this->assertSame('verifactu: system', $rows[2][0]);
+
+        config()->set('einvoicing.verifactu.issuers.'.self::ISSUER.'.driver', 'aeat');
+        $this->assertRowIn($this->doctorRows(), 'verifactu: system', 'fail', 'einvoicing.verifactu.system.name');
+    }
+
     public function test_invalid_issuer_keys_fail_each(): void
     {
         $this->configureComplete(schemas: false);

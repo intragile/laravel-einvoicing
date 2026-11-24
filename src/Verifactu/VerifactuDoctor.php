@@ -144,11 +144,13 @@ final class VerifactuDoctor
         ));
 
         $this->checkSchemas($settings);
-        $this->checkSystem($settings);
+        $systemRow = count($this->rows);
         $contexts = $this->checkIssuers($issuers, $settings);
 
         $aeat = array_filter($contexts, static fn (IssuerContext $context): bool => $context->driver === IssuerDriver::Aeat);
         $b2brouter = array_filter($contexts, static fn (IssuerContext $context): bool => $context->driver === IssuerDriver::B2Brouter);
+        // B2Brouter acts as the billing software of its issuers, so only AEAT issuers need one.
+        array_splice($this->rows, $systemRow, 0, [$this->systemRow($settings, required: $b2brouter === [] || $aeat !== [] || count($contexts) < count($issuers))]);
         $bundle = $aeat === [] ? null : $this->checkCaBundle();
         if ($b2brouter !== []) {
             $this->checkB2BrouterKey($settings);
@@ -287,24 +289,30 @@ final class VerifactuDoctor
         }
     }
 
-    private function checkSystem(VerifactuSettings $settings): void
+    /**
+     * The row of the declared computer system; a missing one fails only when it is needed.
+     *
+     * @param  bool  $required  an issuer submits to AEAT directly, or an issuer did not resolve
+     * @return array{string, string, string}
+     */
+    private function systemRow(VerifactuSettings $settings, bool $required): array
     {
         try {
             $system = $settings->system();
         } catch (ConfigurationException $exception) {
-            $this->row('system', self::FAIL, $exception->getMessage());
-
-            return;
+            return $required
+                ? ['verifactu: system', self::FAIL, $exception->getMessage()]
+                : ['verifactu: system', self::INFO, 'not declared; not needed while every issuer uses the B2Brouter driver, whose records name B2Brouter as the billing software'];
         }
 
-        $this->row('system', self::OK, sprintf(
+        return ['verifactu: system', self::OK, sprintf(
             '%s %s (id %s) by %s, installation %s',
             $system->systemName,
             $system->version,
             $system->systemId,
             $system->name,
             $system->installationNumber,
-        ));
+        )];
     }
 
     /**

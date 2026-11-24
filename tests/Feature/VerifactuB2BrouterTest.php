@@ -236,6 +236,31 @@ final class VerifactuB2BrouterTest extends TestCase
         Queue::assertPushed(PollVerifactuTaxReport::class);
     }
 
+    public function test_b2brouter_only_setup_needs_no_computer_system(): void
+    {
+        // B2Brouter acts as the billing software and writes its own SistemaInformatico.
+        config()->set('einvoicing.verifactu.system', [
+            'name' => null,
+            'nif' => null,
+            'foreign_id' => ['type' => null, 'id' => null, 'country' => null],
+            'system_name' => null,
+            'system_id' => null,
+            'version' => null,
+            'installation_number' => null,
+            'verifactu_only' => null,
+            'multiple_taxpayers_possible' => null,
+            'multiple_taxpayers_indicator' => null,
+        ]);
+        Event::fake([VerifactuRecordRegistered::class]);
+
+        $row = $this->registerAndPoll(SpanishInvoices::domestic()->withNumber('PROBE-ES-0001'), '24433001', '1064490', 'record-1064490.xml');
+
+        $this->assertSame(VerifactuRecordState::Registered, $row->state, (string) $row->error_message);
+        $this->assertSame(self::HUELLA_1064490, $row->hash);
+        $this->assertSame('1-999999', VerifactuChain::query()->sole()->installation_number);
+        Event::assertDispatched(VerifactuRecordRegistered::class);
+    }
+
     public function test_registered_report_attaches_to_b2brouter_chain(): void
     {
         Event::fake([VerifactuRecordRegistered::class, VerifactuCrossCheckFailed::class]);

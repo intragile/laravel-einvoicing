@@ -131,14 +131,16 @@ final class VerifactuManager
     /**
      * The database chain store, writing records validated against the installed schemas.
      *
-     * @throws ConfigurationException when a setting is invalid, the computer system is not
-     *                                declared, or the schemas are not installed
+     * The computer system is read only when the store writes a chain of its own (append() and
+     * seed()), so B2Brouter records, whose system is B2Brouter's, are stored without one.
+     *
+     * @throws ConfigurationException when a setting is invalid or the schemas are not installed
      */
     public function store(): DatabaseChainStore
     {
         $settings = $this->settings();
 
-        return $this->storeFor($settings, $this->schemasFor($settings), $settings->system());
+        return $this->storeFor($settings, $this->schemasFor($settings));
     }
 
     /**
@@ -342,14 +344,18 @@ final class VerifactuManager
         return $this->schemas = $schemas;
     }
 
-    private function storeFor(VerifactuSettings $settings, VerifactuSchemas $schemas, ComputerSystem $system): DatabaseChainStore
+    /**
+     * @param  ComputerSystem|null  $system  the declared system; null reads it from the settings
+     *                                       when a chain of the store's own needs its throttle
+     */
+    private function storeFor(VerifactuSettings $settings, VerifactuSchemas $schemas, ?ComputerSystem $system = null): DatabaseChainStore
     {
         $scope = $settings->throttleScope;
 
         return new DatabaseChainStore(
             ($this->app)()->make('db')->connection(),
             new RecordWriter($schemas),
-            static fn (ChainKey $key): ThrottleKey => self::throttleKey($system, $key, $scope),
+            static fn (ChainKey $key): ThrottleKey => self::throttleKey($system ?? $settings->system(), $key, $scope),
         );
     }
 
