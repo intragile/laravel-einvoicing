@@ -32,6 +32,7 @@ use IntrAgile\EInvoicing\Spain\Nif;
 use IntrAgile\EInvoicing\Spain\Verifactu\AeatCredentials;
 use IntrAgile\EInvoicing\Spain\Verifactu\AltaOperation;
 use IntrAgile\EInvoicing\Spain\Verifactu\AnulacionOperation;
+use IntrAgile\EInvoicing\Spain\Verifactu\ChainKey;
 use IntrAgile\EInvoicing\Spain\Verifactu\ChainStore;
 use IntrAgile\EInvoicing\Spain\Verifactu\Exception\MappingRefused;
 use IntrAgile\EInvoicing\Spain\Verifactu\Exception\UnknownIssuer;
@@ -164,6 +165,7 @@ final class VerifactuManagerTest extends TestCase
         }
 
         $this->assertSame(0, VerifactuRecord::query()->count());
+        $this->assertNull(VerifactuChain::query()->first()?->head_hash);
         $this->assertSame(0, DB::table('jobs')->count());
         $this->assertSame(0, $fired);
 
@@ -286,6 +288,136 @@ final class VerifactuManagerTest extends TestCase
         // The rejected record stays in the chain as it was.
         $this->assertSame(VerifactuRecordState::Rejected, $alta->fresh()?->state);
         Queue::assertPushed(SubmitVerifactuRecords::class);
+    }
+
+    public function test_cancel_after_rejection_without_prior_record_is_refused(): void
+    {
+        $exception = $this->catch(fn () => $this->manager()->cancel($this->invoiceId(), operation: AnulacionOperation::AfterRejection));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('AnulacionOperation::WithoutPriorRecord', $exception->getMessage());
+        $this->assertSame(0, VerifactuRecord::query()->count());
+    }
+
+    public function test_cancel_of_a_previous_systems_invoice_on_a_seeded_chain_is_allowed_when_asked(): void
+    {
+        $this->seedChain();
+
+        // Without the option the missing local registration record is refused, naming the option.
+        $exception = $this->catch(fn () => $this->manager()->cancel($this->invoiceId()));
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('registeredByPreviousSystem', $exception->getMessage());
+
+        $row = $this->manager()->cancel($this->invoiceId(), registeredByPreviousSystem: true);
+        $this->assertSame(VerifactuRecordKind::Cancellation, $row->kind);
+        $this->assertSame(1, $row->sequence);
+        $this->assertSame(str_repeat('B', 64), $row->previous_hash);
+        $this->assertNotNull($row->xml);
+        $this->assertSame([], $this->texts($row->xml, 'SinRegistroPrevio'));
+
+        $this->travel(1)->seconds();
+        $row->forceFill(['state' => VerifactuRecordState::Rejected])->save();
+        $this->assertSame(2, $this->manager()->cancel($this->invoiceId(), operation: AnulacionOperation::AfterRejection, registeredByPreviousSystem: true)->sequence);
+    }
+
+    public function test_previous_system_option_is_refused_on_an_unseeded_chain(): void
+    {
+        $exception = $this->catch(fn () => $this->manager()->cancel($this->invoiceId(), registeredByPreviousSystem: true));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('registeredByPreviousSystem', $exception->getMessage());
+        $this->assertStringContainsString('not seeded', $exception->getMessage());
+        $this->assertSame(0, VerifactuRecord::query()->count());
+    }
+
+    public function test_normal_cancel_whose_only_registration_was_rejected_is_refused(): void
+    {
+        $alta = $this->manager()->register(SpanishInvoices::domestic());
+        $alta->forceFill(['state' => VerifactuRecordState::Rejected])->save();
+        $this->travel(1)->seconds();
+
+        $exception = $this->catch(fn () => $this->manager()->cancel($this->invoiceId()));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('rejected', $exception->getMessage());
+        $this->assertStringContainsString('AnulacionOperation::WithoutPriorRecord', $exception->getMessage());
+        $this->assertSame(2, $this->manager()->cancel($this->invoiceId(), operation: AnulacionOperation::WithoutPriorRecord)->sequence);
+    }
+
+    public function test_cancel_without_prior_record_is_refused_while_an_accepted_registration_exists(): void
+    {
+        $alta = $this->manager()->register(SpanishInvoices::domestic());
+        $this->travel(1)->seconds();
+        // Not settled yet: AEAT may still reject it, so the flag is the caller's call.
+        $this->assertSame(2, $this->manager()->cancel($this->invoiceId(), operation: AnulacionOperation::WithoutPriorRecord)->sequence);
+        VerifactuRecord::query()->where('sequence', 2)->update(['state' => VerifactuRecordState::Rejected->value]);
+        $alta->forceFill(['state' => VerifactuRecordState::AcceptedWithErrors])->save();
+        $this->travel(1)->seconds();
+
+        $exception = $this->catch(fn () => $this->manager()->cancel($this->invoiceId(), operation: AnulacionOperation::WithoutPriorRecordAfterRejection));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('accepted', $exception->getMessage());
+        $this->assertSame(2, VerifactuRecord::query()->count());
+    }
+
+    public function test_second_cancel_after_an_accepted_cancellation_is_refused(): void
+    {
+        $this->manager()->register(SpanishInvoices::domestic())->forceFill(['state' => VerifactuRecordState::Accepted])->save();
+        $this->travel(1)->seconds();
+        $cancellation = $this->manager()->cancel($this->invoiceId());
+        $this->travel(1)->seconds();
+        // A pending cancellation does not settle anything yet.
+        $this->assertSame(3, $this->manager()->cancel($this->invoiceId(), operation: AnulacionOperation::AfterRejection)->sequence);
+        $cancellation->forceFill(['state' => VerifactuRecordState::Accepted])->save();
+        $this->travel(1)->seconds();
+
+        $exception = $this->catch(fn () => $this->manager()->cancel($this->invoiceId()));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('already cancelled', $exception->getMessage());
+        $this->assertSame(3, VerifactuRecord::query()->count());
+    }
+
+    public function test_correct_after_rejection_is_refused_while_the_latest_registration_is_accepted(): void
+    {
+        $this->manager()->register(SpanishInvoices::domestic())->forceFill(['state' => VerifactuRecordState::Accepted])->save();
+        $this->travel(1)->seconds();
+
+        $exception = $this->catch(fn () => $this->manager()->correct(SpanishInvoices::domesticAs(AltaOperation::AfterRejection)));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('accepted', $exception->getMessage());
+        $this->assertStringContainsString('AltaOperation::Correction', $exception->getMessage());
+        $this->assertSame(1, VerifactuRecord::query()->count());
+    }
+
+    public function test_correction_is_refused_while_the_latest_registration_is_rejected(): void
+    {
+        $this->manager()->register(SpanishInvoices::domestic())->forceFill(['state' => VerifactuRecordState::Rejected])->save();
+        $this->travel(1)->seconds();
+
+        $exception = $this->catch(fn () => $this->manager()->correct(SpanishInvoices::domesticAs(AltaOperation::Correction)));
+
+        $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+        $this->assertStringContainsString('rejected', $exception->getMessage());
+        $this->assertStringContainsString('AltaOperation::AfterRejection', $exception->getMessage());
+        $this->assertSame(1, VerifactuRecord::query()->count());
+    }
+
+    public function test_correction_of_an_accepted_registration_writes_s_without_rechazo_previo(): void
+    {
+        $alta = $this->manager()->register(SpanishInvoices::domestic());
+        $alta->forceFill(['state' => VerifactuRecordState::Accepted])->save();
+        $this->travel(1)->seconds();
+
+        $row = $this->manager()->correct(SpanishInvoices::domesticAs(AltaOperation::Correction));
+
+        $this->assertSame(2, $row->sequence);
+        $this->assertSame($alta->hash, $row->previous_hash);
+        $this->assertNotNull($row->xml);
+        $this->assertSame(['S'], $this->texts($row->xml, 'Subsanacion'));
+        $this->assertSame([], $this->texts($row->xml, 'RechazoPrevio'));
     }
 
     public function test_correct_without_prior_alta_is_refused(): void
@@ -441,6 +573,13 @@ final class VerifactuManagerTest extends TestCase
     private function invoiceId(): InvoiceId
     {
         return new InvoiceId(Nif::parse(self::ISSUER), SpanishInvoices::NUMBER, new DateTimeImmutable(SpanishInvoices::ISSUE_DATE));
+    }
+
+    private function seedChain(): void
+    {
+        $settings = $this->manager()->settings();
+        $key = ChainKey::for(Nif::parse(self::ISSUER), $settings->system(), VerifactuEnvironment::Test);
+        $this->manager()->store()->seed($key, new InvoiceId(Nif::parse(self::ISSUER), 'OLD-9', new DateTimeImmutable('2026-11-20')), str_repeat('B', 64));
     }
 
     private function b2brouterChain(int $sequence, ?string $headHash): VerifactuChain

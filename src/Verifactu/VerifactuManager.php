@@ -8,8 +8,10 @@ use Closure;
 use DateTimeImmutable;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Carbon;
 use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordKind;
+use IntrAgile\EInvoicing\Laravel\Enums\VerifactuRecordState;
 use IntrAgile\EInvoicing\Laravel\Events\VerifactuRecordGenerated;
 use IntrAgile\EInvoicing\Laravel\Exceptions\ConfigurationException;
 use IntrAgile\EInvoicing\Laravel\Jobs\SubmitVerifactuRecords;
@@ -147,6 +149,7 @@ final class VerifactuManager
      * @throws UnknownIssuer when the resolver has no data for the invoice's issuer
      * @throws InvalidArgumentException when the invoice carries a correction operation, or its
      *                                  IDFactura already has a registration record in the chain
+     * @throws LogicException for an issuer on the B2Brouter driver, until that path is available
      * @throws InvalidRecord when the written record fails the schema
      * @throws ChainConflict when the chain is closed or the head moved during the write
      */
@@ -156,6 +159,8 @@ final class VerifactuManager
         $schemas = $this->schemasFor($settings);
         $draft = (new RecordMapper)->map($invoice);
         $context = $this->contextFor($draft->id->issuer, $settings);
+        // Runs outside the chain lock: a driver switch racing this call is still refused by the
+        // store, which takes no record into a chain of the other driver.
         $this->assertNoOpenChainOfOtherDriver($context);
 
         if ($draft->operation !== AltaOperation::Initial) {
@@ -171,7 +176,7 @@ final class VerifactuManager
         }
 
         return $this->appendAeat($settings, $schemas, $context, $draft, $reference, function (ChainKey $key) use ($draft): void {
-            if ($this->hasRegistration($key, $draft->id)) {
+            if ($this->chainRows($key, $draft->id)->contains(static fn (VerifactuRecord $row): bool => $row->kind === VerifactuRecordKind::Registration)) {
                 throw new InvalidArgumentException(sprintf(
                     'Invoice %s of %s already has a registration record in chain %s. Use correct() to submit a correction or a new submission after a rejection.',
                     $draft->id->number,
@@ -185,19 +190,34 @@ final class VerifactuManager
     /**
      * Generates, chains and stores a cancellation record (RegistroAnulacion) of an invoice.
      *
-     * A Normal cancellation needs a stored registration record of the invoice in the chain; for an
-     * invoice AEAT never received, pass AnulacionOperation::WithoutPriorRecord.
+     * The stored records of the invoice in the chain are checked where they settle the answer;
+     * records AEAT has not answered yet (generated, sending, unconfirmed) never refuse a call:
+     * - a cancellation of a record AEAT holds (Normal, AfterRejection) needs a registration record
+     *   that AEAT has not rejected; for an invoice AEAT never received, pass
+     *   AnulacionOperation::WithoutPriorRecord;
+     * - a cancellation of a record AEAT never received is refused while AEAT accepted one;
+     * - nothing is cancelled again once AEAT accepted a cancellation after the latest registration.
+     *
+     * An invoice registered by the software used before the chain was seeded has no local record:
+     * pass $registeredByPreviousSystem = true to cancel it (Normal or AfterRejection), which is
+     * accepted only on a seeded chain.
      *
      * @param  string|null  $reference  the application's own reference, stored on the row
+     * @param  bool  $registeredByPreviousSystem  the invoice was registered by the previous software
+     *                                            of a seeded chain, so no local registration exists
      *
      * @throws ConfigurationException as register()
      * @throws UnknownIssuer when the resolver has no data for the issuer
-     * @throws InvalidArgumentException when a Normal cancellation finds no registration record
+     * @throws InvalidArgumentException when the stored records refuse the operation (see above)
      * @throws LogicException for an issuer on the B2Brouter driver
      * @throws ChainConflict when the chain is closed or the head moved during the write
      */
-    public function cancel(InvoiceId $invoice, ?string $reference = null, AnulacionOperation $operation = AnulacionOperation::Normal): VerifactuRecord
-    {
+    public function cancel(
+        InvoiceId $invoice,
+        ?string $reference = null,
+        AnulacionOperation $operation = AnulacionOperation::Normal,
+        bool $registeredByPreviousSystem = false,
+    ): VerifactuRecord {
         $settings = $this->settings();
         $schemas = $this->schemasFor($settings);
         $context = $this->contextFor($invoice->issuer, $settings);
@@ -206,15 +226,8 @@ final class VerifactuManager
 
         $draft = CancellationDraft::of($invoice, $operation);
 
-        return $this->appendAeat($settings, $schemas, $context, $draft, $reference, function (ChainKey $key) use ($invoice, $operation): void {
-            if ($operation === AnulacionOperation::Normal && ! $this->hasRegistration($key, $invoice)) {
-                throw new InvalidArgumentException(sprintf(
-                    'Invoice %s of %s has no registration record in chain %s. To cancel an invoice AEAT never received, pass AnulacionOperation::WithoutPriorRecord.',
-                    $invoice->number,
-                    $invoice->dateText(),
-                    $key->toString(),
-                ));
-            }
+        return $this->appendAeat($settings, $schemas, $context, $draft, $reference, function (ChainKey $key) use ($invoice, $operation, $registeredByPreviousSystem): void {
+            $this->assertCancellable($key, $invoice, $operation, $registeredByPreviousSystem);
         });
     }
 
@@ -228,8 +241,10 @@ final class VerifactuManager
      * @throws ConfigurationException as register()
      * @throws MappingRefused when the invoice cannot be mapped; nothing is stored
      * @throws UnknownIssuer when the resolver has no data for the invoice's issuer
-     * @throws InvalidArgumentException when the operation is Initial, or the IDFactura has no
-     *                                  earlier registration record in the chain
+     * @throws InvalidArgumentException when the operation is Initial, the IDFactura has no earlier
+     *                                  registration record in the chain, or the latest one settles
+     *                                  the operation otherwise (a new submission after a rejection
+     *                                  while AEAT accepted it, a correction while AEAT rejected it)
      * @throws LogicException for an issuer on the B2Brouter driver
      * @throws InvalidRecord when the written record fails the schema
      * @throws ChainConflict when the chain is closed or the head moved during the write
@@ -251,14 +266,7 @@ final class VerifactuManager
         $this->assertAeatDriver($context, 'Corrections');
 
         return $this->appendAeat($settings, $schemas, $context, $draft, $reference, function (ChainKey $key) use ($draft): void {
-            if (! $this->hasRegistration($key, $draft->id)) {
-                throw new InvalidArgumentException(sprintf(
-                    'Invoice %s of %s has no earlier registration record in chain %s to correct. Use register() for a first submission.',
-                    $draft->id->number,
-                    $draft->id->dateText(),
-                    $key->toString(),
-                ));
-            }
+            $this->assertCorrectable($key, $draft);
         });
     }
 
@@ -446,15 +454,133 @@ final class VerifactuManager
         return $row;
     }
 
-    /** Whether the chain holds a registration record of the invoice. */
-    private function hasRegistration(ChainKey $key, InvoiceId $invoice): bool
+    /**
+     * Refuses a cancellation the stored records of the invoice settle against.
+     *
+     * @throws InvalidArgumentException
+     */
+    private function assertCancellable(ChainKey $key, InvoiceId $invoice, AnulacionOperation $operation, bool $registeredByPreviousSystem): void
+    {
+        $rows = $this->chainRows($key, $invoice);
+        $registrations = $rows->filter(static fn (VerifactuRecord $row): bool => $row->kind === VerifactuRecordKind::Registration);
+        $latest = $registrations->last()->sequence ?? 0;
+        $name = sprintf('Invoice %s of %s', $invoice->number, $invoice->dateText());
+
+        $cancelled = $rows->contains(static fn (VerifactuRecord $row): bool => $row->kind === VerifactuRecordKind::Cancellation
+            && $row->sequence > $latest
+            && self::isAccepted($row));
+        if ($cancelled) {
+            throw new InvalidArgumentException(sprintf('%s is already cancelled: AEAT accepted its cancellation record in chain %s.', $name, $key->toString()));
+        }
+
+        if ($operation->sinRegistroPrevio() !== null) {
+            if ($registrations->contains(self::isAccepted(...))) {
+                throw new InvalidArgumentException(sprintf(
+                    '%s has a registration record AEAT accepted in chain %s; cancel it with AnulacionOperation::Normal, not AnulacionOperation::%s.',
+                    $name,
+                    $key->toString(),
+                    $operation->name,
+                ));
+            }
+
+            return;
+        }
+
+        if ($registrations->isEmpty()) {
+            if (! $registeredByPreviousSystem) {
+                throw new InvalidArgumentException(sprintf(
+                    '%s has no registration record in chain %s. To cancel an invoice AEAT never received, pass AnulacionOperation::WithoutPriorRecord; for an invoice the previous software registered before the chain was seeded, pass registeredByPreviousSystem: true.',
+                    $name,
+                    $key->toString(),
+                ));
+            }
+            if (! $this->isSeeded($key)) {
+                throw new InvalidArgumentException(sprintf(
+                    '%s has no registration record in chain %s, and the chain is not seeded, so no previous software registered it: registeredByPreviousSystem applies only to a seeded chain. To cancel an invoice AEAT never received, pass AnulacionOperation::WithoutPriorRecord.',
+                    $name,
+                    $key->toString(),
+                ));
+            }
+
+            return;
+        }
+
+        if ($registrations->every(static fn (VerifactuRecord $row): bool => $row->state === VerifactuRecordState::Rejected)) {
+            throw new InvalidArgumentException(sprintf(
+                '%s has only registration records AEAT rejected in chain %s, so AEAT holds none. Pass AnulacionOperation::WithoutPriorRecord.',
+                $name,
+                $key->toString(),
+            ));
+        }
+    }
+
+    /**
+     * Refuses a correction without an earlier registration record, or one its latest registration
+     * record settles against.
+     *
+     * @throws InvalidArgumentException
+     */
+    private function assertCorrectable(ChainKey $key, RegistrationDraft $draft): void
+    {
+        $latest = $this->chainRows($key, $draft->id)
+            ->filter(static fn (VerifactuRecord $row): bool => $row->kind === VerifactuRecordKind::Registration)
+            ->last();
+        $name = sprintf('Invoice %s of %s', $draft->id->number, $draft->id->dateText());
+
+        if ($latest === null) {
+            throw new InvalidArgumentException(sprintf(
+                '%s has no earlier registration record in chain %s to correct. Use register() for a first submission.',
+                $name,
+                $key->toString(),
+            ));
+        }
+
+        $afterRejection = $draft->operation->rechazoPrevio() !== null;
+        if ($afterRejection && self::isAccepted($latest)) {
+            throw new InvalidArgumentException(sprintf(
+                '%s: AEAT accepted its latest registration record, so AltaOperation::%s does not apply. Use AltaOperation::Correction.',
+                $name,
+                $draft->operation->name,
+            ));
+        }
+        if (! $afterRejection && $latest->state === VerifactuRecordState::Rejected) {
+            throw new InvalidArgumentException(sprintf(
+                '%s: AEAT rejected its latest registration record, so AltaOperation::%s does not apply. Use AltaOperation::AfterRejection (or CorrectionAfterRejection after a rejected correction).',
+                $name,
+                $draft->operation->name,
+            ));
+        }
+    }
+
+    /**
+     * The records of the invoice in the AEAT chain of the key, in chain order.
+     *
+     * @return Collection<int, VerifactuRecord>
+     */
+    private function chainRows(ChainKey $key, InvoiceId $invoice): Collection
     {
         return self::invoiceRows($invoice, $key->environment->value)
-            ->where('kind', VerifactuRecordKind::Registration->value)
             ->whereHas('chain', static fn (Builder $query) => $query
                 ->where('installation_number', $key->installationNumber)
                 ->where('driver', IssuerDriver::Aeat->value))
+            ->orderBy('sequence')
+            ->get();
+    }
+
+    /** Whether the chain of the key was started from a seed (read under the chain lock). */
+    private function isSeeded(ChainKey $key): bool
+    {
+        return VerifactuChain::query()
+            ->where('issuer_nif', $key->issuer->value)
+            ->where('installation_number', $key->installationNumber)
+            ->where('environment', $key->environment->value)
+            ->where('seeded', true)
             ->exists();
+    }
+
+    private static function isAccepted(VerifactuRecord $row): bool
+    {
+        return $row->state === VerifactuRecordState::Accepted || $row->state === VerifactuRecordState::AcceptedWithErrors;
     }
 
     /**
