@@ -72,6 +72,9 @@ Verifactu live-verified on the B2Brouter sandbox (registered; hash and QR cross-
   `1.3.x-dev`.
 - **CI:** the `tests` job also runs on PHP 8.6 × Laravel 12 and 13; the `next-versions` rows
   move to the PHP 8.7 nightly (Laravel 13) and to PHP 8.6 (Laravel `dev-master`).
+- **Docs:** the French flow rows of the README no longer call an accepted Flux 10 deposit
+  offline-only: the core live-verified it on the B2Brouter sandbox (2026-11-24, ledger state
+  `new`).
 
 ### Fixed
 
