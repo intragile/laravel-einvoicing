@@ -20,6 +20,7 @@ use IntrAgile\EInvoicing\Laravel\Ksef\KsefManager;
 use IntrAgile\EInvoicing\Laravel\Support\ConfigFlag;
 use IntrAgile\EInvoicing\Laravel\Verifactu\ConfigIssuerResolver;
 use IntrAgile\EInvoicing\Laravel\Verifactu\DatabaseChainStore;
+use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuClients;
 use IntrAgile\EInvoicing\Laravel\Verifactu\VerifactuManager;
 use IntrAgile\EInvoicing\Spain\Verifactu\ChainKey;
 use IntrAgile\EInvoicing\Spain\Verifactu\ChainStore;
@@ -50,6 +51,8 @@ final class EInvoicingServiceProvider extends ServiceProvider
         $this->app->singleton(FranceManager::class, fn (Application $app): FranceManager => new FranceManager($app));
         $this->app->singleton(KsefManager::class, fn (Application $app): KsefManager => new KsefManager($app));
         $this->app->singleton(VerifactuManager::class, fn (Application $app): VerifactuManager => new VerifactuManager($app));
+        // One instance per process, so the AEAT clients are cached per credential set.
+        $this->app->singleton(VerifactuClients::class, fn (Application $app): VerifactuClients => new VerifactuClients($app));
         // An application may bind its own issuer resolver; the configuration resolver is the default.
         $this->app->bindIf(VerifactuIssuerResolver::class, fn (Application $app): VerifactuIssuerResolver => new ConfigIssuerResolver($app->make('config')), true);
         // An application may bind its own store; the database store is the default.

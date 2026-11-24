@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace IntrAgile\EInvoicing\Laravel\Enums;
 
+use IntrAgile\EInvoicing\Transport\Aeat\RecordOutcome;
+use IntrAgile\EInvoicing\Transport\DeliveryState;
+
 /**
  * Where a VERI*FACTU billing record is on its way to AEAT, directly or through B2Brouter.
  */
@@ -34,6 +37,32 @@ enum VerifactuRecordState: string
         return match ($this) {
             self::Accepted, self::AcceptedWithErrors, self::Rejected, self::Registered, self::Failed => true,
             self::Generated, self::Sending, self::Unconfirmed, self::Pending => false,
+        };
+    }
+
+    /**
+     * The state a record reaches through an AEAT outcome, from the outcome's delivery state:
+     * delivered is accepted (accepted with errors when AEAT registered it with errors), failed is
+     * rejected and unknown is unconfirmed. An invoice that is already cancelled therefore accepts a
+     * cancellation and rejects a registration.
+     *
+     * AEAT matches a duplicate by the invoice id, not by the Huella, so AlreadyRegistered proves
+     * that it holds this very record only when the answer is to a resend of bytes sent before. On
+     * a first send it leaves the record unconfirmed, to be settled with a lookup.
+     *
+     * @param  bool  $cancellation  whether the record is a RegistroAnulacion
+     * @param  bool  $resend  whether the same bytes had been sent before this submission
+     */
+    public static function fromOutcome(RecordOutcome $outcome, bool $cancellation, bool $resend): self
+    {
+        if ($outcome === RecordOutcome::AlreadyRegistered && ! $resend) {
+            return self::Unconfirmed;
+        }
+
+        return match ($outcome->deliveryState($cancellation)) {
+            DeliveryState::Delivered => $outcome === RecordOutcome::AcceptedWithErrors ? self::AcceptedWithErrors : self::Accepted,
+            DeliveryState::Failed => self::Rejected,
+            DeliveryState::Unknown, DeliveryState::Pending => self::Unconfirmed,
         };
     }
 }
