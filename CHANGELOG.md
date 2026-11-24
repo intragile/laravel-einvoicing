@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-24
+
 ### Added
 
 - **Spain:** `einvoicing:verifactu-status --abandon` marks the latest record of an invoice

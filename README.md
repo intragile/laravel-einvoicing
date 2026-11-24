@@ -14,7 +14,7 @@ application.
 
 [Magyar nyelvű leírás → README.hu.md](README.hu.md)
 
-> **Status:** version 1.3.0, released 2026-11-24. What is verified, and how, is in
+> **Status:** version 1.4.0, released 2026-11-24. What is verified, and how, is in
 > [What is verified](#what-is-verified) and [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 - **Configured transports.** Named connections in `config/einvoicing.php`; the built-in drivers

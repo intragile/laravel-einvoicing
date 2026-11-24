@@ -14,7 +14,7 @@ nyilvántartási rekordok, Laravel alkalmazásból.
 
 [English documentation → README.md](README.md)
 
-> **Állapot:** 1.3.0-s verzió, kiadva 2026-11-24-én. Mit és hogyan ellenőriztünk:
+> **Állapot:** 1.4.0-s verzió, kiadva 2026-11-24-én. Mit és hogyan ellenőriztünk:
 > [Mi van ellenőrizve](#mi-van-ellenőrizve) és [docs/VERIFICATION.md](docs/VERIFICATION.md) (angolul).
 
 - **Konfigurált transportok.** Névvel ellátott kapcsolatok a `config/einvoicing.php`-ban; a
