@@ -14,13 +14,15 @@ use IntrAgile\EInvoicing\Spain\Verifactu\Exception\UnknownIssuer;
 use IntrAgile\EInvoicing\Spain\Verifactu\InvoiceId;
 use IntrAgile\EInvoicing\Spain\Verifactu\IssuerDriver;
 use InvalidArgumentException;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 
 /**
  * Starts the AEAT chain of an issuer from the last record that the software used before this one
  * registered with AEAT, so the first record written here links to it (RegistroAnterior).
  *
  * The chain is that of the issuer, the installation (einvoicing.verifactu.system
- * .installation_number unless --installation is given) and the configured environment. The given
+ * .installation_number) and the configured environment. --installation only confirms that number:
+ * any other value is refused, since the records of this system never chain under it. The given
  * invoice and Huella are trusted as stated: take them from the previous software or from an AEAT
  * lookup. A chain that holds a record or a seed already is refused, as is an issuer on the
  * B2Brouter driver, whose chain B2Brouter starts itself.
@@ -34,7 +36,7 @@ final class VerifactuSeedChainCommand extends Command
         {number : The invoice number of the last record the previous software registered}
         {date : Its issue date, Y-m-d}
         {hash : Its Huella: 64 upper-case hexadecimal characters}
-        {--installation= : The installation number of the chain; defaults to einvoicing.verifactu.system.installation_number}';
+        {--installation= : Confirms the installation number of the chain; it must be einvoicing.verifactu.system.installation_number}';
 
     protected $description = 'Seed a VERI*FACTU chain with the last record registered by the previous software';
 
@@ -63,21 +65,28 @@ final class VerifactuSeedChainCommand extends Command
                 ));
             }
 
-            $installation = $this->option('installation');
-            $installation = is_string($installation) && $installation !== '' ? $installation : $settings->system()->installationNumber;
+            $installation = $settings->system()->installationNumber;
+            $option = $this->option('installation');
+            if (is_string($option) && $option !== '' && $option !== $installation) {
+                throw new InvalidArgumentException(sprintf(
+                    '--installation "%s" is not the installation number of this system (einvoicing.verifactu.system.installation_number is "%s"); its records chain under that number only, so a chain of another installation would never be continued.',
+                    $option,
+                    $installation,
+                ));
+            }
             $key = new ChainKey($issuer, $installation, $settings->environment);
 
             $verifactu->store()->seed($key, $last, $hash);
         } catch (InvalidArgumentException|InvalidRecord|ConfigurationException|UnknownIssuer|ChainConflict $exception) {
-            $this->components->error($exception->getMessage());
+            $this->components->error(OutputFormatter::escape($exception->getMessage()));
 
             return self::FAILURE;
         }
 
         $this->components->info(sprintf(
             'Chain %s is seeded: its first record will link to invoice %s of %s (Huella %s).',
-            $key->toString(),
-            $last->number,
+            OutputFormatter::escape($key->toString()),
+            OutputFormatter::escape($last->number),
             $date->format('Y-m-d'),
             $hash,
         ));

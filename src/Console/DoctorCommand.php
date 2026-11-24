@@ -670,6 +670,57 @@ final class DoctorCommand extends Command
         $this->row('job settings', self::OK, 'http timeouts, attempts and the inbound cap are numbers');
 
         $this->checkQueueConnection();
+        $this->checkVerifactuConnection();
+    }
+
+    /**
+     * The queue connection of the VERI*FACTU jobs, when einvoicing.verifactu.submission.connection
+     * names another one than the other jobs use: it must exist, should not run jobs in the calling
+     * process (a submission run then schedules no successor, a B2Brouter poll no later poll), and
+     * its retry_after must outlast the VERI*FACTU job timeouts.
+     */
+    private function checkVerifactuConnection(): void
+    {
+        $connection = config('einvoicing.verifactu.submission.connection');
+        if (! is_string($connection) || $connection === '' || $connection === MessageJob::connectionName()
+            || ! (new VerifactuDoctor($this->laravel))->configured()) {
+            return;
+        }
+
+        $driver = config("queue.connections.{$connection}.driver");
+        if (! is_string($driver) || $driver === '') {
+            $this->row('verifactu queue', self::FAIL, sprintf('einvoicing.verifactu.submission.connection names %s, which is not configured in queue.connections', $connection));
+
+            return;
+        }
+        if (in_array($driver, ['sync', 'deferred', 'background'], true)) {
+            $this->row('verifactu queue', self::WARN, sprintf(
+                '%s (driver %s) runs the VERI*FACTU jobs in the calling process: a submission run schedules no successor and a B2Brouter poll no later poll; run einvoicing:verifactu-submit on a schedule, or use a queue with workers',
+                $connection,
+                $driver,
+            ));
+
+            return;
+        }
+        $this->row('verifactu queue', self::OK, sprintf('%s (driver %s)', $connection, $driver));
+
+        $retryAfter = config("queue.connections.{$connection}.retry_after");
+        if (! is_numeric($retryAfter)) {
+            return;
+        }
+        $retryAfter = (int) $retryAfter;
+        $longest = max((int) (new SubmitVerifactuRecords(''))->timeout, (int) (new PollVerifactuTaxReport(0))->timeout);
+
+        $retryAfter > $longest
+            ? $this->row('verifactu queue retry_after', self::OK, sprintf('%d s, longer than the longest VERI*FACTU job timeout of %d s', $retryAfter, $longest))
+            : $this->row('verifactu queue retry_after', self::WARN, sprintf(
+                'queue.connections.%s.retry_after is %d s, not longer than the VERI*FACTU job timeouts (longest %d s): '
+                .'a submission or poll still running then is reserved again and marked failed; set it above %d',
+                $connection,
+                $retryAfter,
+                $longest,
+                $longest,
+            ));
     }
 
     private function checkQueueConnection(): void

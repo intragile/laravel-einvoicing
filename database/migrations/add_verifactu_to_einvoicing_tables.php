@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    // Index names are given explicitly: the generated ones exceed MySQL's 64 characters. Each
-    // stays within 54, leaving room for a 10-character table prefix.
+    // Index names are given explicitly: the generated ones exceed MySQL's 64 characters. Laravel
+    // uses an explicit name as given, without the table prefix, so each stays within 54
+    // characters whatever the prefix.
 
     public function up(): void
     {
@@ -71,7 +73,7 @@ return new class extends Migration
                 $table->string('generated_at', 32)->nullable();
                 $table->longText('xml')->nullable();
                 $table->longText('source')->nullable();
-                // The serialized SpanishInvoice extension of a B2Brouter source invoice, which UBL cannot carry.
+                // The SpanishInvoice extension of a B2Brouter source invoice as JSON, which UBL cannot carry.
                 $table->longText('source_extension')->nullable();
                 $table->text('qr_url')->nullable();
                 $table->string('state', 24)->index('einv_vf_records_state_index');
@@ -94,8 +96,16 @@ return new class extends Migration
         }
     }
 
+    /**
+     * Refuses while billing records exist: Spanish law requires them to be kept, and a dropped
+     * chain cannot be continued. Export or move them first, then delete them deliberately.
+     */
     public function down(): void
     {
+        if (Schema::hasTable('einvoicing_verifactu_records') && DB::table('einvoicing_verifactu_records')->exists()) {
+            throw new RuntimeException('The einvoicing_verifactu_records table holds VERI*FACTU billing records, which must be kept (legal retention); it is not dropped. Export or move the records first and delete them deliberately before rolling back.');
+        }
+
         Schema::dropIfExists('einvoicing_verifactu_records');
         Schema::dropIfExists('einvoicing_verifactu_throttles');
         Schema::dropIfExists('einvoicing_verifactu_chains');

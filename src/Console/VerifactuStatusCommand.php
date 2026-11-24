@@ -67,7 +67,7 @@ final class VerifactuStatusCommand extends Command
             $dateOption = $this->option('date');
             $date = is_string($dateOption) && $dateOption !== '' ? self::date($dateOption, '--date')->format('Y-m-d') : null;
         } catch (ConfigurationException|InvalidArgumentException $exception) {
-            $this->components->error($exception->getMessage());
+            $this->components->error(self::escape($exception->getMessage()));
 
             return self::FAILURE;
         }
@@ -82,19 +82,19 @@ final class VerifactuStatusCommand extends Command
             ->get();
 
         if ($rows->isEmpty()) {
-            $this->components->error(sprintf(
+            $this->components->error(self::escape(sprintf(
                 'No VERI*FACTU record of invoice %s%s of issuer %s in the %s environment.',
                 $number,
                 $date === null ? '' : ' of '.$date,
                 $issuer->value,
                 $settings->environment->value,
-            ));
+            )));
 
             return self::FAILURE;
         }
         $dates = $rows->pluck('issue_date')->unique()->values();
         if ($dates->count() > 1) {
-            $this->components->error(sprintf('Invoice %s of issuer %s has records for the issue dates %s; pass --date=<Y-m-d>.', $number, $issuer->value, $dates->implode(', ')));
+            $this->components->error(self::escape(sprintf('Invoice %s of issuer %s has records for the issue dates %s; pass --date=<Y-m-d>.', $number, $issuer->value, $dates->implode(', '))));
 
             return self::FAILURE;
         }
@@ -165,7 +165,7 @@ final class VerifactuStatusCommand extends Command
             }
             $status = $clients->aeat($context)->lookup(new LookupRequest($issuer, $context->name, $row->invoiceId()));
         } catch (TransportException|InvalidRecord|ConfigurationException|UnknownIssuer $exception) {
-            $this->components->error('The AEAT lookup failed; the record is unchanged. '.$exception->getMessage());
+            $this->components->error(self::escape('The AEAT lookup failed; the record is unchanged. '.$exception->getMessage()));
 
             return self::FAILURE;
         }
@@ -199,7 +199,7 @@ final class VerifactuStatusCommand extends Command
         try {
             $record = (new RecordReader)->read((string) $row->xml);
         } catch (InvalidRecord|UnsupportedDocument|UnsafeXml $exception) {
-            $this->components->error('The stored record cannot be read, so it cannot be compared: '.$exception->getMessage());
+            $this->components->error(self::escape('The stored record cannot be read, so it cannot be compared: '.$exception->getMessage()));
 
             return self::FAILURE;
         }
@@ -208,11 +208,11 @@ final class VerifactuStatusCommand extends Command
             ? $status->confirmsCancellation()
             : $record instanceof RegistrationRecord && $status->matches($record);
         if (! $held) {
-            $this->components->warn(sprintf(
+            $this->components->warn(self::escape(sprintf(
                 'AEAT holds another record for the invoice (Huella %s, state %s); the record stays unconfirmed.',
                 $status->fingerprint ?? 'none',
                 $status->state->value,
-            ));
+            )));
 
             return self::SUCCESS;
         }
@@ -237,7 +237,7 @@ final class VerifactuStatusCommand extends Command
 
         $row->refresh();
         VerifactuRecordAccepted::dispatch($row, $withErrors, $code);
-        $this->components->info(sprintf('AEAT holds this record: it is now %s (without a CSV, which AEAT does not return later).', $row->state->value));
+        $this->components->info(self::escape(sprintf('AEAT holds this record: it is now %s (without a CSV, which AEAT does not return later).', $row->state->value)));
 
         return self::SUCCESS;
     }
@@ -254,7 +254,7 @@ final class VerifactuStatusCommand extends Command
         try {
             $report = $clients->b2brouter()->taxReport($row->b2brouter_report_id);
         } catch (TransportException|UnsupportedDocument|InvalidArgumentException|ConfigurationException $exception) {
-            $this->components->error('Reading the B2Brouter tax report failed; the record is unchanged. '.$exception->getMessage());
+            $this->components->error(self::escape('Reading the B2Brouter tax report failed; the record is unchanged. '.$exception->getMessage()));
 
             return self::FAILURE;
         }
@@ -277,5 +277,10 @@ final class VerifactuStatusCommand extends Command
         }
 
         $this->line(sprintf('  %-18s %s', $label, OutputFormatter::escape($value)));
+    }
+
+    private static function escape(string $text): string
+    {
+        return OutputFormatter::escape($text);
     }
 }

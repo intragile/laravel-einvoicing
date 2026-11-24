@@ -414,6 +414,27 @@ final class DoctorVerifactuTest extends TestCase
         $this->assertRowIn($this->doctorRows(), 'verifactu: b2brouter chains', 'ok');
     }
 
+    public function test_unconfirmed_b2brouter_predecessor_warns_like_a_pending_one(): void
+    {
+        $this->configureComplete(schemas: false);
+        config()->set('einvoicing.verifactu.issuers.'.self::ISSUER.'.driver', 'b2brouter');
+        // An import whose outcome is unknown never settles on its own, whatever its age.
+        $unknown = $this->pending('B-1', age: 1, attributes: [
+            'state' => VerifactuRecordState::Unconfirmed,
+            'b2brouter_invoice_id' => null,
+            'error_message' => 'The B2Brouter request ended without an answer.',
+        ]);
+        $this->pending('B-2', age: 1, attributes: ['error_code' => PollVerifactuTaxReport::AWAITING_PREDECESSOR]);
+
+        $row = $this->row($this->doctorRows(), 'verifactu: b2brouter chains');
+        $this->assertSame('warn', $row[1]);
+        $this->assertStringContainsString('row '.$unknown->id, $row[2]);
+        $this->assertStringContainsString('B-1', $row[2]);
+        $this->assertStringContainsString('outcome is unknown', $row[2]);
+        $this->assertStringContainsString('1 record waits', $row[2]);
+        $this->assertStringContainsString('php artisan einvoicing:verifactu-submit --retry-unconfirmed', $row[2]);
+    }
+
     #[Group('verifactu-databases')]
     public function test_failed_cross_checks_are_counted_in_sql_and_listed_up_to_the_limit(): void
     {
@@ -585,6 +606,41 @@ final class DoctorVerifactuTest extends TestCase
         [, $output] = $this->doctor();
         // SubmitVerifactuRecords: the AEAT timeout of 300 s plus its margin.
         $this->assertRow($output, 'queue retry_after', 'warn', 'longest 360 s');
+    }
+
+    public function test_the_verifactu_submission_connection_is_checked_when_it_differs(): void
+    {
+        config()->set('queue.default', 'db');
+        config()->set('queue.connections.db', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'default', 'retry_after' => 900]);
+        $this->configureComplete(schemas: false);
+
+        // A connection that does not exist.
+        config()->set('einvoicing.verifactu.submission.connection', 'verifactu');
+        [$code, $output] = $this->doctor();
+        $this->assertRow($output, 'verifactu queue', 'fail', 'queue.connections');
+        $this->assertSame(1, $code);
+
+        // A synchronous one: no run is ever scheduled from inside a run.
+        config()->set('queue.connections.verifactu', ['driver' => 'sync']);
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'verifactu queue', 'warn', 'sync');
+
+        // A retry_after within the job timeouts: the AEAT timeout of 300 s plus its margin.
+        config()->set('einvoicing.verifactu.aeat.timeout', 300);
+        config()->set('queue.connections.verifactu', ['driver' => 'database', 'table' => 'jobs', 'queue' => 'verifactu', 'retry_after' => 200]);
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'verifactu queue', 'ok');
+        $this->assertRow($output, 'verifactu queue retry_after', 'warn', 'queue.connections.verifactu.retry_after is 200 s');
+        $this->assertRow($output, 'queue retry_after', 'ok');
+
+        config()->set('queue.connections.verifactu.retry_after', 400);
+        [, $output] = $this->doctor();
+        $this->assertRow($output, 'verifactu queue retry_after', 'ok');
+
+        // The same connection as the other jobs is checked once, with them.
+        config()->set('einvoicing.verifactu.submission.connection', 'db');
+        [, $output] = $this->doctor();
+        $this->assertStringNotContainsString('verifactu queue', $output);
     }
 
     /**

@@ -655,8 +655,8 @@ final class VerifactuDoctor
 
     /**
      * B2Brouter chains: a record AEAT registered that could not join its chain blocks the records
-     * after it until an operator acts; a predecessor still pending after its polls holds back the
-     * records waiting for it.
+     * after it until an operator acts; a predecessor still pending after its polls, or an import
+     * whose outcome is unknown, holds back the records waiting for it.
      */
     private function checkB2BrouterChains(VerifactuEnvironment $environment, VerifactuSettings $settings): void
     {
@@ -690,12 +690,19 @@ final class VerifactuDoctor
         // One poll run lasts up to the job timeout and the next starts poll_delay seconds later.
         $quiet = $settings->pollDelay + (int) (new PollVerifactuTaxReport(0))->timeout + self::POLL_SETTLE_MARGIN;
         $stalled = [];
+        // A pending record still polled is not stalled; an import whose outcome is unknown never
+        // settles on its own, so it holds back the records naming it whatever its age.
         $predecessors = $b2brouter()
-            ->where('state', VerifactuRecordState::Pending->value)
-            ->where(static fn ($query) => $query->whereNull('error_code')->orWhere('error_code', '!=', PollVerifactuTaxReport::AWAITING_PREDECESSOR))
-            ->where('updated_at', '<', Carbon::now()->subSeconds($quiet))
+            ->where(static fn ($query) => $query
+                ->where(static fn ($pending) => $pending
+                    ->where('state', VerifactuRecordState::Pending->value)
+                    ->where(static fn ($code) => $code->whereNull('error_code')->orWhere('error_code', '!=', PollVerifactuTaxReport::AWAITING_PREDECESSOR))
+                    ->where('updated_at', '<', Carbon::now()->subSeconds($quiet)))
+                ->orWhere(static fn ($unknown) => $unknown
+                    ->where('state', VerifactuRecordState::Unconfirmed->value)
+                    ->whereNull('b2brouter_invoice_id')))
             ->orderBy('id')
-            ->get(['id', 'issuer_nif', 'number']);
+            ->get(['id', 'issuer_nif', 'number', 'state']);
         foreach ($predecessors->groupBy('issuer_nif') as $issuer => $rows) {
             $waiting = $b2brouter()
                 ->where('issuer_nif', $issuer)
@@ -706,7 +713,9 @@ final class VerifactuDoctor
                 $stalled[] = sprintf(
                     'issuer %s: %s, and %d %s for a predecessor',
                     $issuer,
-                    $rows->map(static fn (VerifactuRecord $row): string => sprintf('record row %d (%s) is still pending after its polls', $row->id, $row->number))->implode(', '),
+                    $rows->map(static fn (VerifactuRecord $row): string => $row->state === VerifactuRecordState::Unconfirmed
+                        ? sprintf('record row %d (%s) is an import whose outcome is unknown', $row->id, $row->number)
+                        : sprintf('record row %d (%s) is still pending after its polls', $row->id, $row->number))->implode(', '),
                     $waiting,
                     $waiting === 1 ? 'record waits' : 'records wait',
                 );

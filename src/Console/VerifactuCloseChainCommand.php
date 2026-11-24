@@ -30,7 +30,10 @@ use Symfony\Component\Console\Formatter\OutputFormatter;
  *
  * A chain is closed only while none of its records waits for AEAT or B2Brouter (generated,
  * sending, unconfirmed or pending; for B2Brouter, also the imports not attached to a chain yet).
- * Settle those first: einvoicing:verifactu-submit, einvoicing:verifactu-status --lookup. A chain
+ * Settle those first: einvoicing:verifactu-submit, einvoicing:verifactu-status --lookup. The
+ * records left on the AEAT chain of an issuer moved to B2Brouter are sent with its AEAT
+ * credentials, so the cut-over is: drain the AEAT chain, switch the driver, close the chain (or
+ * switch first and keep the AEAT credentials configured until the chain has drained). A chain
  * row that never held a record or a seed is no chain and is left as it is. The exit code is 1 when
  * a chain is refused.
  */
@@ -57,7 +60,7 @@ final class VerifactuCloseChainCommand extends Command
             $issuer = $this->requiredIssuer($verifactu);
             $driver = $this->driver($verifactu, $issuer);
         } catch (ConfigurationException|InvalidArgumentException $exception) {
-            $this->components->error($exception->getMessage());
+            $this->components->error(self::escape($exception->getMessage()));
 
             return self::FAILURE;
         }
@@ -70,7 +73,7 @@ final class VerifactuCloseChainCommand extends Command
             ->orderBy('id')
             ->get();
         if ($chains->isEmpty()) {
-            $this->components->info(sprintf('Issuer %s has no open %s chain in the %s environment.', $issuer->value, $driver->value, $environment->value));
+            $this->components->info(self::escape(sprintf('Issuer %s has no open %s chain in the %s environment.', $issuer->value, $driver->value, $environment->value)));
 
             return self::SUCCESS;
         }
@@ -106,7 +109,7 @@ final class VerifactuCloseChainCommand extends Command
             }
             if ($closed !== []) {
                 $refused = true;
-                $this->components->error(sprintf('Chain %s is not closed: %d %s not settled yet.', $name, $closed['count'], $closed['count'] === 1 ? 'record is' : 'records are'));
+                $this->components->error(self::escape(sprintf('Chain %s is not closed: %d %s not settled yet.', $name, $closed['count'], $closed['count'] === 1 ? 'record is' : 'records are')));
                 foreach ($closed['open'] as $row) {
                     $this->line(sprintf(
                         '  row %d: invoice %s of %s, %s%s',
@@ -117,10 +120,13 @@ final class VerifactuCloseChainCommand extends Command
                         $row->sequence === null ? '' : ', sequence '.$row->sequence,
                     ));
                 }
+                $this->line($chain->driver === IssuerDriver::Aeat
+                    ? '  Settle them first: php artisan einvoicing:verifactu-submit sends them with the issuer\'s AEAT credentials, which must stay configured until the chain has drained.'
+                    : '  Settle them first: php artisan einvoicing:verifactu-submit --retry-unconfirmed polls them again.');
 
                 continue;
             }
-            $this->components->info(sprintf('Chain %s is closed.', $name));
+            $this->components->info(self::escape(sprintf('Chain %s is closed.', $name)));
         }
 
         return $refused ? self::FAILURE : self::SUCCESS;
@@ -184,5 +190,10 @@ final class VerifactuCloseChainCommand extends Command
                 }
             })
             ->orderBy('id');
+    }
+
+    private static function escape(string $text): string
+    {
+        return OutputFormatter::escape($text);
     }
 }

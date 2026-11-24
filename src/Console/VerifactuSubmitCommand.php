@@ -66,7 +66,7 @@ final class VerifactuSubmitCommand extends Command
             $settings = $verifactu->settings();
             $issuer = $this->issuerFilter();
         } catch (ConfigurationException|InvalidArgumentException $exception) {
-            $this->components->error($exception->getMessage());
+            $this->components->error(self::escape($exception->getMessage()));
 
             return self::FAILURE;
         }
@@ -91,7 +91,7 @@ final class VerifactuSubmitCommand extends Command
         $chains = $this->openAeatChains($environment, $issuer)->get(['id', 'throttle_key']);
         $keys = $chains->pluck('throttle_key')->filter(static fn (mixed $key): bool => is_string($key) && $key !== '')->unique()->sort()->values();
         if ($keys->isEmpty()) {
-            $this->components->info(sprintf('No open AEAT chain in the %s environment%s.', $environment->value, $issuer === null ? '' : ' for issuer '.$issuer->value));
+            $this->components->info(self::escape(sprintf('No open AEAT chain in the %s environment%s.', $environment->value, $issuer === null ? '' : ' for issuer '.$issuer->value)));
 
             return;
         }
@@ -205,7 +205,7 @@ final class VerifactuSubmitCommand extends Command
         if ($count === 0) {
             return;
         }
-        $this->components->warn(sprintf('%d %s answered as a duplicate on the first send; only a lookup can tell whose record AEAT holds:', $count, $count === 1 ? 'record was' : 'records were'));
+        $this->components->warn(self::escape(sprintf('%d %s answered as a duplicate on the first send; only a lookup can tell whose record AEAT holds:', $count, $count === 1 ? 'record was' : 'records were')));
         foreach ($held->limit(self::HINT_LIMIT)->get(['id', 'issuer_nif', 'number', 'issue_date']) as $row) {
             $this->line(sprintf(
                 '  php artisan einvoicing:verifactu-status %s --date=%s --issuer=%s --lookup',
@@ -242,7 +242,7 @@ final class VerifactuSubmitCommand extends Command
             try {
                 $retried = $verifactu->retryB2BrouterImport($row);
             } catch (TransportException|ConfigurationException|InvalidArgumentException $exception) {
-                $this->components->error(sprintf('%s: %s', $name, $exception->getMessage()));
+                $this->components->error(self::escape(sprintf('%s: %s', $name, $exception->getMessage())));
                 $settled = false;
 
                 continue;
@@ -251,7 +251,7 @@ final class VerifactuSubmitCommand extends Command
             if ($retried->state === VerifactuRecordState::Pending) {
                 $this->line(sprintf('  %s: B2Brouter invoice %s; its tax report is polled.', self::escape($name), self::escape((string) $retried->b2brouter_invoice_id)));
             } else {
-                $this->components->warn(sprintf('%s is still unconfirmed: %s', $name, (string) $retried->error_message));
+                $this->components->warn(self::escape(sprintf('%s is still unconfirmed: %s', $name, (string) $retried->error_message)));
                 $settled = false;
             }
         }

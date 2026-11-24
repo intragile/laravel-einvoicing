@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use IntrAgile\EInvoicing\Laravel\Tests\TestCase;
 use PDO;
+use RuntimeException;
 
 final class VerifactuMigrationTest extends TestCase
 {
@@ -57,6 +58,34 @@ final class VerifactuMigrationTest extends TestCase
         ]));
     }
 
+    public function test_rollback_refuses_while_records_exist(): void
+    {
+        DB::table('einvoicing_verifactu_records')->insert([
+            'kind' => 'alta',
+            'issuer_nif' => 'B64829179',
+            'number' => 'F-1',
+            'issue_date' => '2026-11-24',
+            'environment' => 'test',
+            'driver' => 'aeat',
+            'state' => 'accepted',
+            'attempts' => 1,
+        ]);
+
+        $refused = null;
+        try {
+            $this->migration()->down();
+        } catch (RuntimeException $exception) {
+            $refused = $exception;
+        }
+
+        $this->assertNotNull($refused, 'The rollback must refuse while records exist.');
+        $this->assertStringContainsString('einvoicing_verifactu_records', $refused->getMessage());
+
+        // The billing records must be kept: nothing was dropped.
+        $this->assertTablesPresent(true);
+        $this->assertSame(1, DB::table('einvoicing_verifactu_records')->count());
+    }
+
     public function test_index_names_fit_mysql_with_a_table_prefix(): void
     {
         $names = [];
@@ -81,7 +110,8 @@ final class VerifactuMigrationTest extends TestCase
             'einv_vf_throttles_key_unique',
         ], $names);
 
-        // MySQL allows 64 characters; 54 leaves room for a 10-character table prefix.
+        // MySQL allows 64 characters. Explicit index names are used as given, never prefixed;
+        // 54 is the limit the package keeps to.
         $mysql = $this->mysqlStatements();
         $this->assertNotSame([], $mysql);
         preg_match_all('/(?:constraint|index|unique)\s+`([^`]+)`/i', implode("\n", $mysql), $matches);

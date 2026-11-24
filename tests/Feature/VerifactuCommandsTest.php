@@ -454,8 +454,11 @@ final class VerifactuCommandsTest extends TestCase
         $this->assertStringContainsString('cannot be seeded', Artisan::output());
         $this->assertSame('PREV-1', $chain->fresh()?->head_number);
 
-        $this->assertSame(0, Artisan::call('einvoicing:verifactu-seed-chain', ['issuer' => self::ISSUER, 'number' => 'PREV-1', 'date' => '2023-12-31', 'hash' => self::SEED_HASH, '--installation' => '384']));
-        $this->assertSame(['383', '384'], VerifactuChain::query()->orderBy('installation_number')->pluck('installation_number')->all());
+        // A chain of another installation would never be written to: the records of this
+        // system chain under its own installation number.
+        $this->assertSame(1, Artisan::call('einvoicing:verifactu-seed-chain', ['issuer' => self::ISSUER, 'number' => 'PREV-1', 'date' => '2023-12-31', 'hash' => self::SEED_HASH, '--installation' => '384']));
+        $this->assertStringContainsString('383', Artisan::output());
+        $this->assertSame(['383'], VerifactuChain::query()->pluck('installation_number')->all());
 
         config()->set('einvoicing.verifactu.issuers', [self::ISSUER => ['name' => 'Test Issuer S.L.'], self::OTHER => ['name' => 'Other Issuer S.L.']]);
         $this->official(1, self::OTHER);
@@ -479,6 +482,9 @@ final class VerifactuCommandsTest extends TestCase
         $this->assertSame(1, Artisan::call('einvoicing:verifactu-close-chain', ['--issuer' => SpanishInvoices::SELLER_NIF]));
         $output = Artisan::output();
         $this->assertStringContainsString('generated', $output);
+        // Drain, switch, close: the records left are still sent with the AEAT credentials.
+        $this->assertStringContainsString('einvoicing:verifactu-submit', $output);
+        $this->assertStringContainsString('AEAT credentials', $output);
         $this->assertSame(0, VerifactuChain::query()->whereNotNull('closed_at')->count());
 
         $aeatRow->forceFill(['state' => VerifactuRecordState::Accepted, 'csv' => 'A-CSV-0002'])->save();
@@ -531,6 +537,37 @@ final class VerifactuCommandsTest extends TestCase
         $this->assertSame(1, Artisan::call('einvoicing:verifactu-close-chain', ['--issuer' => self::ISSUER]));
         $this->assertStringContainsString('pending', Artisan::output());
         $this->assertSame(0, VerifactuChain::query()->whereNotNull('closed_at')->count());
+    }
+
+    public function test_invoice_numbers_and_messages_are_printed_as_text_not_console_markup(): void
+    {
+        $tagged = 'F<comment>1';
+
+        // Status of an invoice without records: the number appears as given.
+        $this->assertSame(1, Artisan::call('einvoicing:verifactu-status', ['number' => $tagged]));
+        $this->assertStringContainsString('invoice F<comment>1', Artisan::output());
+
+        // Seed chain: the error message quotes the invalid hash as given.
+        $this->assertSame(1, Artisan::call('einvoicing:verifactu-seed-chain', ['issuer' => self::ISSUER, 'number' => 'PREV-1', 'date' => '2023-12-31', 'hash' => '<info>x']));
+        $this->assertStringContainsString('"<info>x"', Artisan::output());
+
+        // Close chain: the error message quotes the option as given.
+        $this->assertSame(1, Artisan::call('einvoicing:verifactu-close-chain', ['--driver' => '<comment>x']));
+        $this->assertStringContainsString('"<comment>x"', Artisan::output());
+
+        // Submit: a B2Brouter import that cannot be settled names its invoice as given.
+        VerifactuRecord::query()->forceCreate([
+            'kind' => 'alta',
+            'issuer_nif' => self::ISSUER,
+            'number' => $tagged,
+            'issue_date' => '2024-01-01',
+            'environment' => VerifactuEnvironment::Test,
+            'driver' => IssuerDriver::B2Brouter,
+            'state' => VerifactuRecordState::Unconfirmed,
+            'attempts' => 1,
+        ]);
+        $this->assertSame(1, Artisan::call('einvoicing:verifactu-submit', ['--retry-unconfirmed' => true]));
+        $this->assertStringContainsString('invoice F<comment>1', Artisan::output());
     }
 
     /**
