@@ -203,7 +203,10 @@ final class DatabaseChainStore implements ChainStore
     {
         $this->prepareChain($key, $driver, $throttle);
 
-        return $this->db->transaction(function () use ($key, $driver, $throttle, $build, $attributes): array {
+        // ConnectionInterface::transaction() is untyped (mixed) on Laravel 12 and generic over the
+        // closure's return type on Laravel 13; the closure below returns exactly this shape.
+        /** @var array{BillingRecord, VerifactuRecord} $appended */
+        $appended = $this->db->transaction(function () use ($key, $driver, $throttle, $build, $attributes): array {
             [$chainId, $current, $head] = $this->openChain($key, $driver, $throttle);
 
             $record = $build($head);
@@ -226,6 +229,8 @@ final class DatabaseChainStore implements ChainStore
 
             return [$record, $row];
         }, 3);
+
+        return $appended;
     }
 
     /** Inserts the chain row unless it exists. */
